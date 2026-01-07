@@ -4,6 +4,7 @@ import torch.nn as nn
 from ncps.torch import CfC
 from ncps.wirings import AutoNCP
 from typing import Tuple
+import math
 
 
 class PhysicsAwareIMUImputer(nn.Module):
@@ -167,10 +168,109 @@ class AdaptiveLoss(nn.Module):
         return total, components
 
 
+class ReconstructionOnlyLoss(nn.Module):
+    """
+    Reconstruction-only loss used for non-CfC baselines (GRU/Transformer).
+    Computes MSE only on the missing positions indicated by mask.
+    """
+    def __init__(self, w_recon: float = 1.0):
+        super().__init__()
+        self.w_recon = w_recon
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        uncertainty: torch.Tensor = None,
+        dt: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        recon = ((pred - target) ** 2 * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
+        total = self.w_recon * recon
+        components = {"recon": recon.item(), "consistency": 0.0, "smooth": 0.0}
+        return total, components
+
+
 # Legacy compatibility: keep old model names but use new implementation
 class LNNImputer(PhysicsAwareIMUImputer):
     """Alias for backward compatibility."""
     pass
+
+
+class GRUImputer(nn.Module):
+    """GRU baseline for IMU imputation with an uncertainty head."""
+
+    def __init__(self, input_dim: int = 13, hidden_dim: int = 128, output_dim: int = 6):
+        super().__init__()
+        self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, output_dim),
+            nn.Softplus(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h, _ = self.rnn(x)
+        pred = self.head(h)
+        uncert = self.uncertainty_head(h)
+        return pred, uncert
+
+
+class PositionalEncoding(nn.Module):
+    """Sine-cosine positional encoding using cumulative time (from dt channel)."""
+
+    def __init__(self, d_model: int, max_len: int = 1000):
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D); assume last channel of x is dt
+        dt = x[:, :, -1]  # (B, T)
+        t = torch.cumsum(dt, dim=1)  # (B, T)
+        B, T = t.shape
+        device = t.device
+        pe = torch.zeros(B, T, self.d_model, device=device)
+        position = t.unsqueeze(-1)  # (B, T, 1)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, device=device) * (-math.log(10000.0) / self.d_model))
+        pe[:, :, 0::2] = torch.sin(position * div_term)
+        pe[:, :, 1::2] = torch.cos(position * div_term)
+        return pe
+
+
+class TransformerImputer(nn.Module):
+    """Transformer baseline using dt-aware positional encoding and uncertainty head."""
+
+    def __init__(self, input_dim: int = 13, hidden_dim: int = 128, output_dim: int = 6, nhead: int = 4, nlayers: int = 2):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dim_feedforward=hidden_dim * 4, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
+        self.posenc = PositionalEncoding(hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, output_dim),
+            nn.Softplus(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = self.input_proj(x)
+        z = z + self.posenc(x)
+        h = self.encoder(z)
+        pred = self.head(h)
+        uncert = self.uncertainty_head(h)
+        return pred, uncert
 
 
 def build_model(
@@ -191,12 +291,18 @@ def build_model(
     Returns:
         Initialized model
     """
-    if model_name.lower() in ["lnn", "cfc", "physics"]:
+    name = model_name.lower()
+    if name in ["lnn", "cfc", "physics"]:
         return PhysicsAwareIMUImputer(
             input_dim=input_dim,
             hidden_units=hidden_dim,
             output_dim=output_dim,
             use_physics_prior=True,
         )
+    if name in ["gru"]:
+        return GRUImputer(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
+    if name in ["transformer", "tfm"]:
+        # Use hidden_dim as d_model
+        return TransformerImputer(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
     else:
         raise ValueError(f"Unknown model: {model_name}")

@@ -8,7 +8,7 @@ from tqdm import tqdm
 import numpy as np
 
 from dataset import CfCIMUDataset
-from models import PhysicsAwareIMUImputer, AdaptiveLoss
+from models import AdaptiveLoss, ReconstructionOnlyLoss, build_model
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoch):
@@ -80,7 +80,7 @@ def evaluate(model, loader, criterion, device):
 def evaluate_multi_missing_rates(model, root_dir, device, seq_len=50):
     """Evaluate model on multiple missing patterns and rates."""
     patterns = ["random", "block", "channel"]
-    rates = [0.3, 0.5, 0.7]
+    rates = [0.1, 0.2, 0.3, 0.4, 0.5]
     
     results = {}
     print("\n" + "="*60)
@@ -138,6 +138,7 @@ def train(
     epochs: int = 50,
     lr: float = 1e-3,
     device: str = "cuda",
+    model_name: str = "cfc",
     hidden_units: int = 64,
     w_recon: float = 1.0,
     w_consistency: float = 0.5,
@@ -200,19 +201,22 @@ def train(
     )
     
     # Model & Optimizer
-    print("\n[Model] Initializing PhysicsAwareIMUImputer...")
-    model = PhysicsAwareIMUImputer(
+    print(f"\n[Model] Initializing '{model_name}'...")
+    model = build_model(
+        model_name=model_name,
         input_dim=13,
-        hidden_units=hidden_units,
+        hidden_dim=hidden_units,
         output_dim=6,
-        use_physics_prior=True,
     ).to(device)
     
-    criterion = AdaptiveLoss(
-        w_recon=w_recon,
-        w_consistency=w_consistency,
-        w_smooth=w_smooth,
-    )
+    if model_name.lower() in ["cfc", "lnn", "physics"]:
+        criterion = AdaptiveLoss(
+            w_recon=w_recon,
+            w_consistency=w_consistency,
+            w_smooth=w_smooth,
+        )
+    else:
+        criterion = ReconstructionOnlyLoss(w_recon=w_recon)
     
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     

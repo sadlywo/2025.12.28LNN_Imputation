@@ -25,8 +25,11 @@ def parse_args():
                        help="Number of DataLoader workers")
     
     # Model arguments
+    parser.add_argument("--model_name", type=str, default="cfc",
+                       choices=["cfc", "lnn", "physics", "gru", "transformer"],
+                       help="Model to train: cfc/lnn/physics/gru/transformer")
     parser.add_argument("--hidden_units", type=int, default=64,
-                       help="CfC hidden units")
+                       help="Hidden units / d_model for the chosen model")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=50,
@@ -59,7 +62,7 @@ def main():
     print(f"Dataset: {args.root_dir}")
     print(f"Sequence Length: {args.seq_len}")
     print(f"Missing Pattern: {args.missing_mode} @ {args.mask_rate*100:.0f}%")
-    print(f"Model: PhysicsAwareIMUImputer (hidden_units={args.hidden_units})")
+    print(f"Model: {args.model_name} (hidden_units={args.hidden_units})")
     print(f"Training: {args.epochs} epochs, lr={args.lr}")
     print(f"Loss Weights: recon={args.w_recon}, consistency={args.w_consistency}, smooth={args.w_smooth}")
     print("="*60 + "\n")
@@ -74,6 +77,7 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         device=args.device,
+        model_name=args.model_name,
         hidden_units=args.hidden_units,
         w_recon=args.w_recon,
         w_consistency=args.w_consistency,
