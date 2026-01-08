@@ -192,7 +192,11 @@ class CfCIMUDataset(Dataset):
         imu = seq["imu"]  # (seq_len, 6)
         dt = seq["dt"]    # (seq_len,)
         
-        # Apply missing pattern
+        # Apply missing pattern (fixed seed in eval mode for reproducibility)
+        if self.eval_mode:
+            rng_state = torch.get_rng_state()
+            torch.manual_seed(idx)  # Deterministic mask based on idx
+        
         mask = torch.ones_like(imu)
         if self.missing_mode == "random":
             drop = torch.rand_like(imu) < self.mask_rate
@@ -205,6 +209,9 @@ class CfCIMUDataset(Dataset):
             n_mask = max(1, int(6 * self.mask_rate))
             channels = torch.randperm(6)[:n_mask]
             mask[:, channels] = 0.0
+        
+        if self.eval_mode:
+            torch.set_rng_state(rng_state)  # Restore RNG state
         
         imu_masked = imu * mask
         

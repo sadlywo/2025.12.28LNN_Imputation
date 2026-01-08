@@ -45,9 +45,9 @@ def parse_args():
     # Loss weights
     parser.add_argument("--w_recon", type=float, default=1.0,
                        help="Reconstruction loss weight")
-    parser.add_argument("--w_consistency", type=float, default=0.5,
+    parser.add_argument("--w_consistency", type=float, default=0.1,
                        help="Temporal consistency loss weight")
-    parser.add_argument("--w_smooth", type=float, default=0.1,
+    parser.add_argument("--w_smooth", type=float, default=0.01,
                        help="Smoothness loss weight")
     
     return parser.parse_args()

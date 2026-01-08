@@ -96,6 +96,7 @@ def evaluate_multi_missing_rates(model, root_dir, device, seq_len=50):
                     mask_rate=rate,
                     missing_mode=pattern,
                     split="val",
+                    eval_mode=True,  # Fixed mask for reproducible evaluation
                 )
                 test_loader = DataLoader(test_ds, batch_size=16, shuffle=False)
                 
@@ -141,8 +142,8 @@ def train(
     model_name: str = "cfc",
     hidden_units: int = 64,
     w_recon: float = 1.0,
-    w_consistency: float = 0.5,
-    w_smooth: float = 0.1,
+    w_consistency: float = 0.1,
+    w_smooth: float = 0.01,
     num_workers: int = 4,
     use_scheduler: bool = True,
 ):

@@ -40,9 +40,11 @@ class PhysicsAwareIMUImputer(nn.Module):
         """
         super().__init__()
         self.use_physics_prior = use_physics_prior
+        self.hidden_units = hidden_units
         
         # CfC backbone with NCP wiring (sparse + interpretable)
-        wiring = AutoNCP(hidden_units, output_dim)
+        # AutoNCP outputs to hidden layer, not directly to output
+        wiring = AutoNCP(hidden_units, hidden_units)
         self.cfc = CfC(
             input_dim,
             wiring,
@@ -50,27 +52,17 @@ class PhysicsAwareIMUImputer(nn.Module):
             mixed_memory=mixed_memory,
         )
         
-        # Physics-aware projection heads
+        # Simple output projection (reduced parameters)
         if use_physics_prior:
-            # Separate heads for gyro and acc (different physical properties)
-            self.gyro_head = nn.Sequential(
-                nn.Linear(output_dim, 32),
-                nn.Tanh(),
-                nn.Linear(32, 3),
-            )
-            self.acc_head = nn.Sequential(
-                nn.Linear(output_dim, 32),
-                nn.Tanh(),
-                nn.Linear(32, 3),
-            )
+            # Separate heads for gyro and acc (lightweight)
+            self.gyro_head = nn.Linear(hidden_units, 3)
+            self.acc_head = nn.Linear(hidden_units, 3)
         else:
-            self.output_proj = nn.Linear(output_dim, output_dim)
+            self.output_proj = nn.Linear(hidden_units, output_dim)
         
-        # Learnable uncertainty estimation
+        # Lightweight uncertainty estimation
         self.uncertainty_head = nn.Sequential(
-            nn.Linear(output_dim, 16),
-            nn.ReLU(),
-            nn.Linear(16, 6),
+            nn.Linear(hidden_units, output_dim),
             nn.Softplus(),  # Ensure positive uncertainty
         )
     
@@ -84,7 +76,7 @@ class PhysicsAwareIMUImputer(nn.Module):
             uncertainty: (B, T, 6) prediction uncertainty
         """
         # CfC processes irregular time automatically via input
-        cfc_out, _ = self.cfc(x)  # (B, T, output_dim)
+        cfc_out, _ = self.cfc(x)  # (B, T, hidden_units)
         
         if self.use_physics_prior:
             gyro = self.gyro_head(cfc_out)  # (B, T, 3)
