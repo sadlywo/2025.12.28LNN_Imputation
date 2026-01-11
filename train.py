@@ -8,24 +8,36 @@ from tqdm import tqdm
 import numpy as np
 
 from dataset import CfCIMUDataset
-from models import AdaptiveLoss, ReconstructionOnlyLoss, build_model
+from models import (
+    AdaptiveLoss, ReconstructionOnlyLoss, PhysicsInformedLoss,
+    build_model, count_parameters
+)
 
 
-def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoch):
+def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, use_physics=False):
     """Train for one epoch."""
     model.train()
     losses = {"total": [], "recon": [], "consistency": [], "smooth": []}
+    if use_physics:
+        losses["integration"] = []
+        losses["energy"] = []
     
     pbar = tqdm(loader, desc=f"Epoch {epoch:03d}")
     for inputs, targets, mask in pbar:
         inputs = inputs.to(device)
         targets = targets.to(device)
         mask = mask.to(device)
-        dt = inputs[:, :, -1:]  # Extract dt from input
+        dt = inputs[:, :, -1:]
         
         optimizer.zero_grad()
-        pred, uncertainty = model(inputs)
-        loss, comps = criterion(pred, targets, mask, uncertainty, dt)
+        
+        # 根据模型类型调整前向传播
+        if use_physics:
+            pred, uncertainty, physics_info = model(inputs)
+            loss, comps = criterion(pred, targets, mask, uncertainty, dt, physics_info)
+        else:
+            pred, uncertainty = model(inputs)
+            loss, comps = criterion(pred, targets, mask, uncertainty, dt)
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -33,46 +45,63 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
         if scheduler is not None:
             scheduler.step()
         
-        # Accumulate losses
         losses["total"].append(loss.item())
         for k, v in comps.items():
-            losses[k].append(v)
+            if k in losses:
+                losses[k].append(v)
         
-        # Update progress bar
         avg_losses = {k: np.mean(v) for k, v in losses.items()}
         pbar.set_postfix(avg_losses)
     
     return {k: np.mean(v) for k, v in losses.items()}
 
 
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, use_physics=False):
     """Evaluate on validation set."""
     model.eval()
     losses = {"total": [], "recon": [], "consistency": [], "smooth": []}
+    if use_physics:
+        losses["integration"] = []
+        losses["energy"] = []
     mse_all, mse_masked = [], []
     
+    # 保存样本用于可视化
+    sample_inputs, sample_targets, sample_preds, sample_masks = None, None, None, None
+    
     with torch.no_grad():
-        for inputs, targets, mask in loader:
+        for batch_idx, (inputs, targets, mask) in enumerate(loader):
             inputs = inputs.to(device)
             targets = targets.to(device)
             mask = mask.to(device)
             dt = inputs[:, :, -1:]
             
-            pred, uncertainty = model(inputs)
-            loss, comps = criterion(pred, targets, mask, uncertainty, dt)
+            if use_physics:
+                pred, uncertainty, physics_info = model(inputs)
+                loss, comps = criterion(pred, targets, mask, uncertainty, dt, physics_info)
+            else:
+                pred, uncertainty = model(inputs)
+                loss, comps = criterion(pred, targets, mask, uncertainty, dt)
             
             losses["total"].append(loss.item())
             for k, v in comps.items():
-                losses[k].append(v)
+                if k in losses:
+                    losses[k].append(v)
             
-            # Imputation metrics
             mse_all.append(F.mse_loss(pred, targets).item())
             missing_err = ((pred - targets) ** 2 * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
             mse_masked.append(missing_err.item())
+            
+            # 保存第一个batch用于可视化
+            if batch_idx == 0:
+                sample_inputs = inputs[:3].cpu()
+                sample_targets = targets[:3].cpu()
+                sample_preds = pred[:3].cpu()
+                sample_masks = mask[:3].cpu()
     
     metrics = {k: np.mean(v) for k, v in losses.items()}
     metrics["mse_all"] = np.mean(mse_all)
     metrics["mse_masked"] = np.mean(mse_masked)
+    metrics["samples"] = (sample_inputs, sample_targets, sample_preds, sample_masks)
     
     return metrics
 
@@ -144,28 +173,18 @@ def train(
     w_recon: float = 1.0,
     w_consistency: float = 0.1,
     w_smooth: float = 0.01,
+    w_physics_integration: float = 0.2,
+    w_physics_energy: float = 0.1,
     num_workers: int = 4,
     use_scheduler: bool = True,
+    output_dir: str = "results",
 ):
     """
-    Main training function.
-    
-    Args:
-        root_dir: Dataset root directory
-        seq_len: Sequence length
-        mask_rate: Missing rate
-        missing_mode: Missing pattern
-        batch_size: Batch size
-        epochs: Number of epochs
-        lr: Learning rate
-        device: "cuda" or "cpu"
-        hidden_units: CfC hidden units
-        w_recon: Reconstruction loss weight
-        w_consistency: Consistency loss weight
-        w_smooth: Smoothness loss weight
-        num_workers: DataLoader workers
-        use_scheduler: Use OneCycleLR scheduler
+    主训练函数,增加物理约束和可视化
     """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"[Device] {device}")
     
@@ -177,6 +196,7 @@ def train(
         mask_rate=mask_rate,
         missing_mode=missing_mode,
         split="train",
+        eval_mode=False,  # Random masking for training
     )
     val_ds = CfCIMUDataset(
         root_dir=root_dir,
@@ -184,6 +204,7 @@ def train(
         mask_rate=mask_rate,
         missing_mode=missing_mode,
         split="val",
+        eval_mode=True,  # Deterministic masking for validation
     )
     
     train_loader = DataLoader(
@@ -210,14 +231,31 @@ def train(
         output_dim=6,
     ).to(device)
     
-    if model_name.lower() in ["cfc", "lnn", "physics"]:
+    # 统计参数量
+    num_params = count_parameters(model)
+    print(f"[Model] Total parameters: {num_params:,}")
+    
+    # 根据模型选择损失函数
+    use_physics = model_name.lower() in ["physics", "pinn", "pi"]
+    if use_physics:
+        criterion = PhysicsInformedLoss(
+            w_recon=w_recon,
+            w_consistency=w_consistency,
+            w_smooth=w_smooth,
+            w_physics_integration=w_physics_integration,
+            w_physics_energy=w_physics_energy,
+        )
+        print(f"[Loss] Using PhysicsInformedLoss")
+    elif model_name.lower() in ["cfc", "lnn"]:
         criterion = AdaptiveLoss(
             w_recon=w_recon,
             w_consistency=w_consistency,
             w_smooth=w_smooth,
         )
+        print(f"[Loss] Using AdaptiveLoss")
     else:
         criterion = ReconstructionOnlyLoss(w_recon=w_recon)
+        print(f"[Loss] Using ReconstructionOnlyLoss")
     
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     
@@ -229,10 +267,6 @@ def train(
             epochs=epochs,
             steps_per_epoch=len(train_loader),
         )
-        print(f"[Scheduler] OneCycleLR with max_lr={lr}")
-    
-    print(f"\n[Training] Starting for {epochs} epochs...")
-    print(f"[Loss] w_recon={w_recon}, w_consistency={w_consistency}, w_smooth={w_smooth}")
     
     # Training loop
     best_val_loss = float("inf")
@@ -243,20 +277,28 @@ def train(
         "val_mse_masked": [],
     }
     
+    from visualization import plot_training_curves, plot_imputation_samples
+    
     for epoch in range(1, epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch)
-        val_metrics = evaluate(model, val_loader, criterion, device)
+        train_metrics = train_one_epoch(
+            model, train_loader, criterion, optimizer, scheduler, device, epoch, use_physics
+        )
+        val_metrics = evaluate(model, val_loader, criterion, device, use_physics)
         
         # Logging
         print(f"\n[Epoch {epoch:03d}/{epochs:03d}]")
-        print(f"  Train: loss={train_metrics['total']:.4f} | "
-              f"recon={train_metrics['recon']:.4f} | "
-              f"cons={train_metrics['consistency']:.4f} | "
-              f"smooth={train_metrics['smooth']:.4f}")
-        print(f"  Val:   loss={val_metrics['total']:.4f} | "
-              f"recon={val_metrics['recon']:.4f} | "
-              f"cons={val_metrics['consistency']:.4f} | "
-              f"smooth={val_metrics['smooth']:.4f}")
+        log_str = f"  Train: loss={train_metrics['total']:.4f}"
+        for k in ['recon', 'consistency', 'smooth', 'integration', 'energy']:
+            if k in train_metrics:
+                log_str += f" | {k}={train_metrics[k]:.4f}"
+        print(log_str)
+        
+        log_str = f"  Val:   loss={val_metrics['total']:.4f}"
+        for k in ['recon', 'consistency', 'smooth', 'integration', 'energy']:
+            if k in val_metrics:
+                log_str += f" | {k}={val_metrics[k]:.4f}"
+        print(log_str)
+        
         print(f"  Imputation: MSE(all)={val_metrics['mse_all']:.4f} | "
               f"MSE(masked)={val_metrics['mse_masked']:.4f}")
         
@@ -269,12 +311,28 @@ def train(
         # Save best model
         if val_metrics["total"] < best_val_loss:
             best_val_loss = val_metrics["total"]
-            torch.save(model.state_dict(), "best_model.pt")
-            print("  ✓ Model saved to best_model.pt")
+            save_path = os.path.join(output_dir, f"best_model_{model_name}.pt")
+            torch.save(model.state_dict(), save_path)
+            print(f"  ✓ Model saved to {save_path}")
+        
+        # 每10个epoch可视化一次
+        if epoch % 10 == 0:
+            sample_inputs, sample_targets, sample_preds, sample_masks = val_metrics["samples"]
+            plot_imputation_samples(
+                sample_inputs, sample_targets, sample_preds, sample_masks,
+                num_samples=3,
+                save_path=os.path.join(output_dir, f"samples_epoch{epoch:03d}_{model_name}.png")
+            )
+    
+    # 绘制训练曲线
+    plot_training_curves(
+        history,
+        save_path=os.path.join(output_dir, f"training_curves_{model_name}.png")
+    )
     
     # Final evaluation
     print("\n[Final] Evaluating on multiple missing patterns...")
-    model.load_state_dict(torch.load("best_model.pt"))
-    multi_results = evaluate_multi_missing_rates(model, root_dir, device, seq_len)
+    model.load_state_dict(torch.load(os.path.join(output_dir, f"best_model_{model_name}.pt")))
+    multi_results = evaluate_multi_missing_rates(model, root_dir, device, seq_len, use_physics)
     
-    return model, history, multi_results
+    return model, history, multi_results, num_params

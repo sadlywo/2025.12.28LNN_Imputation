@@ -26,10 +26,10 @@ def parse_args():
     
     # Model arguments
     parser.add_argument("--model_name", type=str, default="cfc",
-                       choices=["cfc", "lnn", "physics", "gru", "transformer"],
-                       help="Model to train: cfc/lnn/physics/gru/transformer")
+                       choices=["cfc", "lnn", "physics", "pinn", "gru", "transformer"],
+                       help="Model to train")
     parser.add_argument("--hidden_units", type=int, default=64,
-                       help="Hidden units / d_model for the chosen model")
+                       help="Hidden units")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=50,
@@ -50,6 +50,16 @@ def parse_args():
     parser.add_argument("--w_smooth", type=float, default=0.01,
                        help="Smoothness loss weight")
     
+    # Physics loss weights (新增)
+    parser.add_argument("--w_physics_integration", type=float, default=0.2,
+                       help="Physics integration loss weight")
+    parser.add_argument("--w_physics_energy", type=float, default=0.1,
+                       help="Physics energy loss weight")
+    
+    # Output directory (新增)
+    parser.add_argument("--output_dir", type=str, default="results",
+                       help="Output directory for results")
+    
     return parser.parse_args()
 
 
@@ -60,15 +70,12 @@ def main():
     print("CfC-IMU Imputation Training")
     print("="*60)
     print(f"Dataset: {args.root_dir}")
-    print(f"Sequence Length: {args.seq_len}")
-    print(f"Missing Pattern: {args.missing_mode} @ {args.mask_rate*100:.0f}%")
     print(f"Model: {args.model_name} (hidden_units={args.hidden_units})")
-    print(f"Training: {args.epochs} epochs, lr={args.lr}")
-    print(f"Loss Weights: recon={args.w_recon}, consistency={args.w_consistency}, smooth={args.w_smooth}")
+    print(f"Output: {args.output_dir}")
     print("="*60 + "\n")
     
     # Train
-    model, history, multi_results = train(
+    model, history, multi_results, num_params = train(
         root_dir=args.root_dir,
         seq_len=args.seq_len,
         mask_rate=args.mask_rate,
@@ -82,23 +89,20 @@ def main():
         w_recon=args.w_recon,
         w_consistency=args.w_consistency,
         w_smooth=args.w_smooth,
+        w_physics_integration=args.w_physics_integration,
+        w_physics_energy=args.w_physics_energy,
         num_workers=args.num_workers,
         use_scheduler=args.use_scheduler,
+        output_dir=args.output_dir,
     )
     
     print("\n" + "="*60)
     print("Training Complete!")
     print("="*60)
-    print(f"Best model saved to: best_model.pt")
-    print(f"Final validation MSE (masked): {history['val_mse_masked'][-1]:.4f}")
-    
-    # Save training history
-    torch.save({
-        "history": history,
-        "multi_results": multi_results,
-        "args": vars(args),
-    }, "training_results.pt")
-    print(f"Training history saved to: training_results.pt")
+    print(f"Model: {args.model_name}")
+    print(f"Parameters: {num_params:,}")
+    print(f"Best val MSE (masked): {min(history['val_mse_masked']):.4f}")
+    print(f"Results saved to: {args.output_dir}/")
 
 
 if __name__ == "__main__":
