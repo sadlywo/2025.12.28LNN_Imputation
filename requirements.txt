@@ -1,0 +1,14 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Neural CPS (Closed-form Continuous-time) for CfC models
+ncps>=0.0.9
+
+# Training utilities
+tqdm>=4.65.0
+
+# Optional but recommended
+matplotlib>=3.7.0
+scikit-learn>=1.3.0
