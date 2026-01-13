@@ -106,8 +106,16 @@ def evaluate(model, loader, criterion, device, use_physics=False):
     return metrics
 
 
-def evaluate_multi_missing_rates(model, root_dir, device, seq_len=50):
-    """Evaluate model on multiple missing patterns and rates."""
+def evaluate_multi_missing_rates(model, root_dir, device, seq_len=50, use_physics: bool = False):
+    """Evaluate model on multiple missing patterns and rates.
+
+    Args:
+        model: trained model (may return pred,uncertainty or pred,uncertainty,physics_info)
+        root_dir: dataset root
+        device: torch device
+        seq_len: sequence length
+        use_physics: whether model returns physics_info as third output
+    """
     patterns = ["random", "block", "channel"]
     rates = [0.1, 0.2, 0.3, 0.4, 0.5]
     
@@ -137,9 +145,13 @@ def evaluate_multi_missing_rates(model, root_dir, device, seq_len=50):
                         inputs = inputs.to(device)
                         targets = targets.to(device)
                         mask = mask.to(device)
-                        
-                        pred, _ = model(inputs)
-                        
+
+                        # Handle models with/without physics_info output
+                        if use_physics:
+                            pred, _unc, _phys = model(inputs)
+                        else:
+                            pred, _unc = model(inputs)
+
                         mse_all_list.append(F.mse_loss(pred, targets).item())
                         missing_err = ((pred - targets) ** 2 * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
                         mse_masked_list.append(missing_err.item())
