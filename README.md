@@ -86,12 +86,31 @@ python main.py \
 - `best_model.pt`: 最佳模型权重
 - `training_results.pt`: 训练历史和多模式评估结果
 
+## ONNX 导出
+
+使用 `Change_pt_to_onnx.py` 可以将 `best_model.pt` 导出为 ONNX，并自动根据权重结构识别模型类型（CfC/Physics/GRU/Transformer）。
+
+```bash
+python Change_pt_to_onnx.py --checkpoint best_model.pt --output best_model.onnx
+```
+
+如需手动指定模型类型或导出参数：
+
+```bash
+python Change_pt_to_onnx.py \
+  --checkpoint best_model.pt \
+  --output best_model.onnx \
+  --model-name transformer \
+  --hidden-units 64 \
+  --seq-len 50
+```
+
 ## 核心改进
 
 ### vs 原始版本
 
 | 方面 | 原版本 | 新版本 |
-|-----|-------|-------|
+| --- | --- | --- |
 | 时间处理 | 固定间隔 | **保留真实间隔** |
 | 归一化 | Z-score | **MAD（更鲁棒）** |
 | 物理约束 | 手动积分层 | **CfC 内置 ODE** |
@@ -102,17 +121,19 @@ python main.py \
 ## 依赖
 
 ```bash
-pip install torch numpy pandas tqdm ncps
+pip install torch onnx numpy pandas tqdm ncps
 ```
 
 ## 理论基础
 
 CfC 的核心优势：
+
 1. **连续时间动力系统**：天然处理不规则采样
 2. **闭式解**：数值稳定性好
 3. **长期依赖建模**：优于 LSTM/GRU
 
 物理先验设计：
+
 - 陀螺仪（角速度）和加速度计（线性加速度）物理特性不同
 - 分离处理头更符合物理直觉
 - 不确定性估计帮助模型识别难以预测的区域
