@@ -44,7 +44,6 @@ class CfCIMUDataset(Dataset):
             missing_mode: "random", "block", or "channel"
             split: "train" or "val"
             split_ratio: Fraction of files for training
-            eval_mode: If True, use deterministic masking for reproducibility
         """
         self.root_dir = root_dir
         self.seq_len = seq_len
