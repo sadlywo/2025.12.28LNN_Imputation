@@ -94,7 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-units", type=int, default=model_cfg.hidden_units, help="Hidden units")
     parser.add_argument("--seq-len", type=int, default=data_cfg.seq_len, help="Sequence length")
     parser.add_argument("--input-dim", type=int, default=model_cfg.input_dim, help="Input feature dim")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Export device")
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"], help="Export device")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     return parser
 
