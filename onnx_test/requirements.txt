@@ -1,4 +1,0 @@
-onnxruntime
-numpy
-pandas
-torch
