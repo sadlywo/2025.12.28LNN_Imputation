@@ -35,6 +35,7 @@ class CfCIMUDataset(Dataset):
         split: str = "train",
         split_ratio: float = 0.8,
         eval_mode: bool = False,
+        drift_scale: float = 0.0,
     ):
         """
         Args:
@@ -44,12 +45,14 @@ class CfCIMUDataset(Dataset):
             missing_mode: "random", "block", or "channel"
             split: "train" or "val"
             split_ratio: Fraction of files for training
+            drift_scale: Scale of random walk drift to add (data augmentation)
         """
         self.root_dir = root_dir
         self.seq_len = seq_len
         self.mask_rate = mask_rate
         self.missing_mode = missing_mode
         self.eval_mode = eval_mode
+        self.drift_scale = drift_scale
         
         self.sequences: List[dict] = []
         self._load_all_sequences(split, split_ratio)

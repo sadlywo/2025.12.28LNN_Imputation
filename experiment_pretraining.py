@@ -34,7 +34,7 @@ def run_pretraining_experiment():
     # 预训练配置 (Pre-training)
     # 目标：学习物理动力学和去噪
     pretrain_config = {
-        "epochs": 20,
+        "epochs": 2,            # 快速验证: 20 -> 2
         "lr": 1e-3,
         "mask_rate": 0.0,       # 几乎无缺失，专注重建
         "drift_scale": 0.05,    # 强噪声/漂移，迫使模型学习去噪
@@ -44,7 +44,7 @@ def run_pretraining_experiment():
     # 微调/下游任务配置 (Fine-tuning / Downstream)
     # 目标：完成补缺任务
     finetune_config = {
-        "epochs": 30,
+        "epochs": 3,            # 快速验证: 30 -> 3
         "lr": 5e-4,             # 较低的学习率用于微调
         "mask_rate": 0.3,       # 标准缺失率
         "drift_scale": 0.01,    # 弱噪声用于正则化
