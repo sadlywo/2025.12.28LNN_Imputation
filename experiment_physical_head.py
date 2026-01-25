@@ -28,7 +28,7 @@ def experiment_physical_head():
         "batch_size": 16,
         "epochs": 50,
         "lr": 1e-3,
-        "hidden_units": 64,
+        "hidden_units": 128,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "output_dir": "results/physical_head_experiment",
         "num_workers": 4,
@@ -55,6 +55,7 @@ def experiment_physical_head():
         missing_mode=config["missing_mode"],
         split="train",
         eval_mode=False,
+        drift_scale=0.01,
     )
     
     val_ds = CfCIMUDataset(

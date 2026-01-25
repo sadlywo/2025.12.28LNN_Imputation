@@ -413,15 +413,25 @@ class PhysicsInformedLoss(nn.Module):
         
         # 4. 物理约束
         if physics_info is not None:
-            gyro_pred = physics_info['gyro']
-            gyro_integral = gyro_pred[:, :-1] * dt_expanded
+            # 修正: 比较预测的动力学特征(导数)与目标的动力学特征，而不是错误的积分对比
+            # 原始代码试图比较积分(角度)与差分(角加速度)，这是量纲不匹配的
+            # 新逻辑: 强化动力学一致性，要求预测的变化率与真实变化率一致
             
-            gyro_diff_target = target[:, 1:, :3] - target[:, :-1, :3]
-            gyro_diff_mask = mask[:, 1:, :3] * mask[:, :-1, :3]
+            # 计算预测的角速度变化率 (近似角加速度)
+            pred_gyro = physics_info['gyro']
+            pred_gyro_diff = pred_gyro[:, 1:] - pred_gyro[:, :-1]
+            pred_gyro_accel = pred_gyro_diff / (dt_expanded + 1e-6)
             
-            integration_err = ((gyro_integral - gyro_diff_target) ** 2 * gyro_diff_mask).sum()
-            loss_integration = integration_err / (gyro_diff_mask.sum() + 1e-8)
+            # 计算目标的角速度变化率
+            target_gyro = target[:, :, :3]
+            target_gyro_diff = target_gyro[:, 1:] - target_gyro[:, :-1]
+            target_gyro_accel = target_gyro_diff / (dt_expanded + 1e-6)
             
+            # 只在观测点计算此损失(或者在全序列计算以利用物理先验)
+            # 这里我们选择在全序列计算，作为物理约束
+            loss_integration = ((pred_gyro_accel - target_gyro_accel) ** 2).mean()
+            
+            # 能量约束: 限制加速度模长
             acc_pred = physics_info['acc']
             acc_magnitude = torch.norm(acc_pred, dim=-1)
             loss_energy = F.relu(acc_magnitude - 20.0).mean()

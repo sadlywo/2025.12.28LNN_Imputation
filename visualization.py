@@ -7,7 +7,7 @@ import torch
 from pathlib import Path
 
 sns.set_style("whitegrid")
-plt.rcParams['font.family'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial', 'DejaVu Sans', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 

@@ -194,6 +194,13 @@ class CfCIMUDataset(Dataset):
         imu = seq["imu"]  # (seq_len, 6)
         dt = seq["dt"]    # (seq_len,)
         
+        # Apply physical drift augmentation (Random Walk)
+        # Drift is applied to both inputs and targets to simulate sensor bias drift
+        if self.drift_scale > 0 and not self.eval_mode:
+            drift_noise = torch.randn_like(imu) * self.drift_scale
+            drift = torch.cumsum(drift_noise, dim=0)
+            imu = imu + drift
+        
         # Apply missing pattern (fixed seed in eval mode for reproducibility)
         if self.eval_mode:
             rng_state = torch.get_rng_state()

@@ -127,7 +127,7 @@ def experiment_multi_methods():
         "batch_size": 16,
         "epochs": 50,
         "lr": 1e-3,
-        "hidden_units": 64,
+        "hidden_units": 128,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "output_dir": "results/multi_methods_experiment",
         "num_workers": 4,

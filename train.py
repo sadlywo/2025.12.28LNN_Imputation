@@ -187,6 +187,7 @@ def train(
     w_smooth: float = 0.01,
     w_physics_integration: float = 0.2,
     w_physics_energy: float = 0.1,
+    drift_scale: float = 0.0,
     num_workers: int = 4,
     use_scheduler: bool = True,
     output_dir: str = "results",
@@ -209,6 +210,7 @@ def train(
         missing_mode=missing_mode,
         split="train",
         eval_mode=False,  # Random masking for training
+        drift_scale=drift_scale,
     )
     val_ds = CfCIMUDataset(
         root_dir=root_dir,
@@ -217,6 +219,7 @@ def train(
         missing_mode=missing_mode,
         split="val",
         eval_mode=True,  # Deterministic masking for validation
+        drift_scale=0.0, # No drift in validation
     )
     
     train_loader = DataLoader(
