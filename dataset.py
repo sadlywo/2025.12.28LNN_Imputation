@@ -191,24 +191,27 @@ class CfCIMUDataset(Dataset):
             mask: (seq_len, 6) = 1 for observed, 0 for missing
         """
         seq = self.sequences[idx]
-        imu = seq["imu"]  # (seq_len, 6)
+        target_imu = seq["imu"]  # (seq_len, 6) - Clean target
         dt = seq["dt"]    # (seq_len,)
         
-        # Apply physical drift augmentation (Random Walk)
-        # Drift is applied to both inputs and targets to simulate sensor bias drift
+        # Clone for input modification
+        input_imu = target_imu.clone()
+        
+        # Apply physical drift augmentation (Random Walk) to INPUT ONLY
+        # This creates a denoising task: Dirty Input -> Clean Target
         if self.drift_scale > 0 and not self.eval_mode:
-            drift_noise = torch.randn_like(imu) * self.drift_scale
+            drift_noise = torch.randn_like(input_imu) * self.drift_scale
             drift = torch.cumsum(drift_noise, dim=0)
-            imu = imu + drift
+            input_imu = input_imu + drift
         
         # Apply missing pattern (fixed seed in eval mode for reproducibility)
         if self.eval_mode:
             rng_state = torch.get_rng_state()
             torch.manual_seed(idx)  # Deterministic mask based on idx
         
-        mask = torch.ones_like(imu)
+        mask = torch.ones_like(input_imu)
         if self.missing_mode == "random":
-            drop = torch.rand_like(imu) < self.mask_rate
+            drop = torch.rand_like(input_imu) < self.mask_rate
             mask[drop] = 0.0
         elif self.missing_mode == "block":
             block_len = max(1, int(self.seq_len * self.mask_rate))
@@ -222,9 +225,9 @@ class CfCIMUDataset(Dataset):
         if self.eval_mode:
             torch.set_rng_state(rng_state)  # Restore RNG state
         
-        imu_masked = imu * mask
+        imu_masked = input_imu * mask
         
         # Construct input: [masked_imu(6), mask(6), dt(1)]
         inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1)], dim=-1)
         
-        return inputs, imu, mask
+        return inputs, target_imu, mask
