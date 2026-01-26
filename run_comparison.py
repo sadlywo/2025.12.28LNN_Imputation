@@ -67,7 +67,7 @@ def run_comparison_experiment(
             if model_name in ["cfc", "lnn", "physics"]:
                 w_recon = 1.0
                 w_consistency = 0.1
-                w_smooth = 0.01
+                w_smooth = 0.00
             else:
                 w_recon = 1.0
                 w_consistency = 0.0
