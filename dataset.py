@@ -218,8 +218,10 @@ class CfCIMUDataset(Dataset):
             mask[drop] = 0.0
         elif self.missing_mode == "block":
             block_len = max(1, int(self.seq_len * self.mask_rate))
-            start = torch.randint(0, max(1, self.seq_len - block_len + 1), (1,)).item()
-            mask[start:start + block_len] = 0.0
+            max_start = max(1, self.seq_len - block_len + 1)
+            for channel in range(6):
+                start = torch.randint(0, max_start, (1,)).item()
+                mask[start:start + block_len, channel] = 0.0
         elif self.missing_mode == "channel":
             n_mask = max(1, int(6 * self.mask_rate))
             channels = torch.randperm(6)[:n_mask]

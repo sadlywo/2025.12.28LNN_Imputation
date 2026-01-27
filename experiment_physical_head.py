@@ -26,7 +26,7 @@ def experiment_physical_head():
         "mask_rate": 0.3,
         "missing_mode": "random",
         "batch_size": 16,
-        "epochs": 50,
+        "epochs": 30,
         "lr": 1e-3,
         "hidden_units": 128,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -114,7 +114,7 @@ def experiment_physical_head():
         # 定义损失函数和优化器
         criterion = AdaptiveLoss(
             w_recon=1.0,
-            w_consistency=0.1,
+            w_consistency=0.0,
             w_smooth=0.00,
         )
         

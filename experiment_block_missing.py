@@ -1,4 +1,4 @@
-"""实验4：块状丢失模式下的性能对比实验"""
+"""Experiment: LNN training under different missing modes, evaluated on block missingness."""
 import torch
 import numpy as np
 import pandas as pd
@@ -8,30 +8,29 @@ from datetime import datetime
 # 导入项目模块
 from dataset import CfCIMUDataset
 from models import build_model
-from models import AdaptiveLoss, ReconstructionOnlyLoss
-from train import train_one_epoch, evaluate, evaluate_multi_missing_rates
+from models import AdaptiveLoss
+from train import train_one_epoch, evaluate
 from visualization import plot_training_curves, plot_imputation_samples
-from experiment_multi_methods import SimpleImputer
 
 
 def experiment_block_missing():
     """
-    对比不同方法在块状丢失模式下的性能
-    - 块状丢失：一个通道内连续丢失数据
-    - 比较方法：LNN（提出的方法）、GRU、LOCF、均值插补
+    Compare LNN trained with different missing modes and evaluate on block missingness.
+    Block missingness here means a continuous missing segment within a single channel.
     """
     # 实验配置
     config = {
         "root_dir": "Oxford Dataset",
         "seq_len": 50,
         "mask_rate": 0.3,
-        "missing_mode": "block",  # 块状丢失模式
+        "train_missing_modes": ["random", "block"],
+        "eval_missing_mode": "block",
         "batch_size": 16,
         "epochs": 50,
         "lr": 1e-3,
         "hidden_units": 128,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "output_dir": "results/block_missing_experiment",
+        "output_dir": "results/block_missing_training_comparison",
         "num_workers": 4,
     }
     
@@ -41,281 +40,171 @@ def experiment_block_missing():
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"\n{'='*80}")
-    print(f"开始实验：块状丢失模式性能对比")
+    print("START EXPERIMENT: TRAINING MODE COMPARISON (EVAL ON BLOCK MISSINGNESS)")
     print(f"{'='*80}")
-    print(f"设备: {config['device']}")
-    print(f"输出目录: {config['output_dir']}")
-    print(f"缺失模式: {config['missing_mode']}")
+    print(f"Device: {config['device']}")
+    print(f"Output: {config['output_dir']}")
+    print(f"Train modes: {', '.join(config['train_missing_modes'])}")
+    print(f"Eval mode: {config['eval_missing_mode']}")
     print(f"{'='*80}\n")
     
-    # 加载数据集
-    print("加载数据集...")
-    train_ds = CfCIMUDataset(
+    eval_ds = CfCIMUDataset(
         root_dir=config["root_dir"],
         seq_len=config["seq_len"],
         mask_rate=config["mask_rate"],
-        missing_mode=config["missing_mode"],  # 块状丢失模式
-        split="train",
-        eval_mode=False,
-        drift_scale=0.01,
-    )
-    
-    val_ds = CfCIMUDataset(
-        root_dir=config["root_dir"],
-        seq_len=config["seq_len"],
-        mask_rate=config["mask_rate"],
-        missing_mode=config["missing_mode"],  # 块状丢失模式
+        missing_mode=config["eval_missing_mode"],
         split="val",
         eval_mode=True,
+        drift_scale=0.0,
     )
-    
-    test_ds = CfCIMUDataset(
-        root_dir=config["root_dir"],
-        seq_len=config["seq_len"],
-        mask_rate=config["mask_rate"],
-        missing_mode=config["missing_mode"],  # 块状丢失模式
-        split="val",
-        eval_mode=True,
-    )
-    
-    train_loader = torch.utils.data.DataLoader(
-        train_ds,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        num_workers=config["num_workers"],
-        pin_memory=True if config["device"] == "cuda" else False,
-    )
-    
-    val_loader = torch.utils.data.DataLoader(
-        val_ds,
+    eval_loader = torch.utils.data.DataLoader(
+        eval_ds,
         batch_size=config["batch_size"],
         shuffle=False,
         num_workers=config["num_workers"],
         pin_memory=True if config["device"] == "cuda" else False,
     )
-    
-    test_loader = torch.utils.data.DataLoader(
-        test_ds,
-        batch_size=config["batch_size"],
-        shuffle=False,
-        num_workers=config["num_workers"],
-        pin_memory=True if config["device"] == "cuda" else False,
-    )
-    
-    # 深度学习模型列表
-    models_to_test = ["lnn", "gru"]
+
     model_results = {}
-    
-    # 训练和评估深度学习模型
-    print(f"\n{'='*80}")
-    print("训练深度学习模型...")
-    print(f"{'='*80}")
-    
-    for model_name in models_to_test:
+    for train_missing_mode in config["train_missing_modes"]:
+        exp_key = f"lnn_train_{train_missing_mode}"
         print(f"\n{'='*80}")
-        print(f"训练模型: {model_name}")
+        print(f"Training LNN with missing_mode='{train_missing_mode}'")
         print(f"{'='*80}")
-        
-        # 构建模型
+
+        train_ds = CfCIMUDataset(
+            root_dir=config["root_dir"],
+            seq_len=config["seq_len"],
+            mask_rate=config["mask_rate"],
+            missing_mode=train_missing_mode,
+            split="train",
+            eval_mode=False,
+            drift_scale=0.01,
+        )
+        val_ds = CfCIMUDataset(
+            root_dir=config["root_dir"],
+            seq_len=config["seq_len"],
+            mask_rate=config["mask_rate"],
+            missing_mode=config["eval_missing_mode"],
+            split="val",
+            eval_mode=True,
+            drift_scale=0.0,
+        )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_ds,
+            batch_size=config["batch_size"],
+            shuffle=True,
+            num_workers=config["num_workers"],
+            pin_memory=True if config["device"] == "cuda" else False,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_ds,
+            batch_size=config["batch_size"],
+            shuffle=False,
+            num_workers=config["num_workers"],
+            pin_memory=True if config["device"] == "cuda" else False,
+        )
+
         model = build_model(
-            model_name=model_name,
+            model_name="lnn",
             input_dim=13,
             hidden_dim=config["hidden_units"],
             output_dim=6,
         ).to(config["device"])
-        
-        # 定义损失函数和优化器
-        if model_name == "lnn":
-            criterion = AdaptiveLoss(
-                w_recon=1.0,
-                w_consistency=0.1,
-                w_smooth=0.01,
-            )
-        else:
-            criterion = ReconstructionOnlyLoss(w_recon=1.0)
-        
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config["lr"],
-            weight_decay=1e-5
-        )
-        
+
+        criterion = AdaptiveLoss(w_recon=1.0, w_consistency=0.1, w_smooth=0.01)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=config["lr"],
             epochs=config["epochs"],
             steps_per_epoch=len(train_loader),
         )
-        
-        # 训练历史记录
-        history = {
-            "train_loss": [],
-            "val_loss": [],
-            "val_mse_all": [],
-            "val_mse_masked": [],
-        }
-        
+
+        history = {"train_loss": [], "val_loss": [], "val_mse_all": [], "val_mse_masked": []}
         best_val_loss = float("inf")
-        
-        # 训练循环
+
         for epoch in range(1, config["epochs"] + 1):
             train_metrics = train_one_epoch(
-                model, train_loader, criterion, optimizer, scheduler, 
-                config["device"], epoch, use_physics=False
+                model, train_loader, criterion, optimizer, scheduler, config["device"], epoch, use_physics=False
             )
-            
-            val_metrics = evaluate(
-                model, val_loader, criterion, config["device"], use_physics=False
-            )
-            
-            # 保存历史记录
+            val_metrics = evaluate(model, val_loader, criterion, config["device"], use_physics=False)
+
             history["train_loss"].append(train_metrics["total"])
             history["val_loss"].append(val_metrics["total"])
             history["val_mse_all"].append(val_metrics["mse_all"])
             history["val_mse_masked"].append(val_metrics["mse_masked"])
-            
-            # 保存最佳模型
+
             if val_metrics["total"] < best_val_loss:
                 best_val_loss = val_metrics["total"]
-                model_path = output_path / f"best_model_{model_name}.pt"
+                model_path = output_path / f"best_model_{exp_key}.pt"
                 torch.save(model.state_dict(), model_path)
-            
-            # 每10个epoch可视化一次
+
             if epoch % 10 == 0:
                 sample_inputs, sample_targets, sample_preds, sample_masks = val_metrics["samples"]
                 plot_imputation_samples(
-                    sample_inputs, sample_targets, sample_preds, sample_masks,
+                    sample_inputs,
+                    sample_targets,
+                    sample_preds,
+                    sample_masks,
                     num_samples=3,
-                    save_path=output_path / f"samples_epoch{epoch:03d}_{model_name}.png"
+                    save_path=output_path / f"samples_epoch{epoch:03d}_{exp_key}.png",
                 )
-        
-        # 保存训练曲线
-        plot_training_curves(
-            history,
-            save_path=output_path / f"training_curves_{model_name}.png"
-        )
-        
-        # 加载最佳模型进行最终评估
+
+        plot_training_curves(history, save_path=output_path / f"training_curves_{exp_key}.png")
+
         model.load_state_dict(torch.load(model_path))
-        final_metrics = evaluate(
-            model, test_loader, criterion, config["device"], use_physics=False
-        )
-        
-        # 保存模型结果
-        model_results[model_name] = {
+        final_metrics = evaluate(model, eval_loader, criterion, config["device"], use_physics=False)
+
+        model_results[exp_key] = {
+            "train_missing_mode": train_missing_mode,
             "history": history,
             "best_val_loss": best_val_loss,
-            "final_mse_masked": final_metrics["mse_masked"],
-            "final_mse_all": final_metrics["mse_all"],
+            "final_mse_masked": float(final_metrics["mse_masked"]),
+            "final_mse_all": float(final_metrics["mse_all"]),
         }
-        
-        print(f"\n[{model_name}] 训练完成")
-        print(f"最佳验证损失: {best_val_loss:.4f}")
-        print(f"最终MSE (masked): {final_metrics['mse_masked']:.4f}")
-        print(f"最终MSE (all): {final_metrics['mse_all']:.4f}")
-    
-    # 评估简单插补方法
-    print(f"\n{'='*80}")
-    print("评估简单插补方法...")
-    print(f"{'='*80}")
-    
-    # 准备测试数据用于简单插补方法评估
-    test_data = []
-    test_targets = []
-    test_masks = []
-    
-    for i in range(len(test_ds)):
-        inputs, targets, mask = test_ds[i]
-        test_data.append(inputs.numpy())
-        test_targets.append(targets.numpy())
-        test_masks.append(mask.numpy())
-    
-    test_data = np.array(test_data)  # (N, T, 13)
-    test_targets = np.array(test_targets)  # (N, T, 6)
-    test_masks = np.array(test_masks)  # (N, T, 6)
-    
-    # 提取IMU数据（前6个通道）
-    imu_data = test_data[:, :, :6]  # (N, T, 6) - 带缺失值的IMU数据
-    
-    # 评估LOCF方法
-    locf_imputed = SimpleImputer.locf(imu_data.copy(), test_masks)
-    locf_mse = np.mean(((locf_imputed - test_targets) ** 2 * (1 - test_masks)).sum() / ((1 - test_masks).sum() + 1e-8))
-    print(f"LOCF MSE (masked): {locf_mse:.4f}")
-    
-    # 评估均值插补方法
-    mean_imputed = SimpleImputer.mean_imputation(imu_data.copy(), test_masks)
-    mean_mse = np.mean(((mean_imputed - test_targets) ** 2 * (1 - test_masks)).sum() / ((1 - test_masks).sum() + 1e-8))
-    print(f"均值插补 MSE (masked): {mean_mse:.4f}")
-    
-    # 保存简单方法结果
-    simple_results = {
-        "locf": {
-            "final_mse_masked": locf_mse,
-            "final_mse_all": np.mean(((locf_imputed - test_targets) ** 2).sum() / (test_targets.size + 1e-8)),
-        },
-        "mean": {
-            "final_mse_masked": mean_mse,
-            "final_mse_all": np.mean(((mean_imputed - test_targets) ** 2).sum() / (test_targets.size + 1e-8)),
-        },
-    }
+
+        print(f"[{exp_key}] Best val loss: {best_val_loss:.6f}")
+        print(f"[{exp_key}] Final eval MSE (masked): {final_metrics['mse_masked']:.6f}")
+        print(f"[{exp_key}] Final eval MSE (all): {final_metrics['mse_all']:.6f}")
     
     # 在不同块大小下评估模型性能
     print(f"\n{'='*80}")
-    print("在不同块大小下评估模型性能...")
+    print("Evaluating different block lengths...")
     print(f"{'='*80}")
     
     # 不同块大小配置
     block_sizes = [5, 10, 15, 20]  # 连续丢失的时间步数
     block_results = {}
     
-    for model_name in models_to_test:
-        print(f"\n评估 {model_name} 在不同块大小下的性能...")
-        
-        # 加载最佳模型
+    for exp_key, info in model_results.items():
+        train_missing_mode = info["train_missing_mode"]
+        print(f"\nEvaluating {exp_key} across block sizes...")
+
         model = build_model(
-            model_name=model_name,
+            model_name="lnn",
             input_dim=13,
             hidden_dim=config["hidden_units"],
             output_dim=6,
         ).to(config["device"])
-        model_path = output_path / f"best_model_{model_name}.pt"
+        model_path = output_path / f"best_model_{exp_key}.pt"
         model.load_state_dict(torch.load(model_path))
         
         model_block_results = {}
         
         for block_size in block_sizes:
-            # 创建自定义块状丢失数据集
+            mask_rate = float(block_size) / float(config["seq_len"])
             custom_test_ds = CfCIMUDataset(
                 root_dir=config["root_dir"],
                 seq_len=config["seq_len"],
-                mask_rate=config["mask_rate"],
+                mask_rate=mask_rate,
                 missing_mode="block",
                 split="val",
                 eval_mode=True,
+                drift_scale=0.0,
             )
-            
-            # 重写缺失模式生成函数，使用固定块大小
-            original___getitem__ = custom_test_ds.__getitem__
-            
-            def custom_getitem(idx):
-                inputs, targets, mask = original___getitem__(idx)
-                # 重新生成块状丢失掩码
-                new_mask = torch.ones_like(mask)
-                B, T, C = new_mask.shape
-                
-                for c in range(C):
-                    # 每个通道随机生成一个连续块
-                    start = torch.randint(0, max(1, T - block_size + 1), (1,)).item()
-                    new_mask[:, start:start + block_size, c] = 0.0
-                
-                # 重新生成输入数据
-                masked_imu = targets * new_mask
-                new_inputs = torch.cat([masked_imu, new_mask, inputs[:, :, -1:]], dim=-1)
-                
-                return new_inputs, targets, new_mask
-            
-            custom_test_ds.__getitem__ = custom_getitem
-            
+
             # 创建数据加载器
             custom_test_loader = torch.utils.data.DataLoader(
                 custom_test_ds,
@@ -340,33 +229,31 @@ def experiment_block_missing():
             
             mse_masked = np.mean(mse_masked_list)
             model_block_results[block_size] = mse_masked
-            print(f"块大小 {block_size}: MSE (masked) = {mse_masked:.4f}")
+            print(f"Block size {block_size}: MSE (masked) = {mse_masked:.6f}")
         
-        block_results[model_name] = model_block_results
+        block_results[exp_key] = {"train_missing_mode": train_missing_mode, "by_block_size": model_block_results}
     
     # 生成对比报告
-    generate_comparison_report(model_results, simple_results, block_results, output_path, timestamp, config)
+    generate_comparison_report(model_results, block_results, output_path, timestamp, config)
     
     print(f"\n{'='*80}")
-    print("实验4：块状丢失模式性能对比完成")
-    print(f"结果保存至: {config['output_dir']}")
+    print("DONE: TRAINING MODE COMPARISON")
+    print(f"Saved to: {config['output_dir']}")
     print(f"{'='*80}")
     
-    return model_results, simple_results, block_results
+    return model_results, block_results
 
 
-def generate_comparison_report(model_results, simple_results, block_results, output_path, timestamp, config):
-    """生成对比报告"""
+def generate_comparison_report(model_results, block_results, output_path, timestamp, config):
+    """Generate comparison report."""
     print(f"\n{'='*80}")
-    print("生成对比报告")
+    print("Generating report")
     print(f"{'='*80}")
     
     # 方法名称映射
     method_name_map = {
-        "lnn": "LNN (Proposed)",
-        "gru": "GRU",
-        "locf": "LOCF",
-        "mean": "Mean Imputation",
+        "lnn_train_random": "LNN (Train: Random)",
+        "lnn_train_block": "LNN (Train: Block)",
     }
     
     # 收集所有方法的结果
@@ -380,54 +267,44 @@ def generate_comparison_report(model_results, simple_results, block_results, out
             "type": "deep",
         }
     
-    # 添加简单方法结果
-    for method, result in simple_results.items():
-        all_results[method] = {
-            "mse_masked": result["final_mse_masked"],
-            "mse_all": result["final_mse_all"],
-            "type": "simple",
-        }
-    
     # 生成总结表格
     summary_data = []
     for method, result in all_results.items():
         summary_data.append({
-            "方法": method_name_map.get(method, method),
-            "MSE (masked)": f"{result['mse_masked']:.4f}",
-            "MSE (all)": f"{result['mse_all']:.4f}",
-            "类型": "深度学习方法" if result['type'] == "deep" else "简单方法",
+            "method": method_name_map.get(method, method),
+            "final_mse_masked": f"{result['mse_masked']:.6f}",
+            "final_mse_all": f"{result['mse_all']:.6f}",
         })
     
     df_summary = pd.DataFrame(summary_data)
     print(df_summary.to_string(index=False))
     
     # 保存总结表格
-    summary_path = output_path / f"summary_block_missing_{timestamp}.csv"
+    summary_path = output_path / f"summary_training_modes_{timestamp}.csv"
     df_summary.to_csv(summary_path, index=False)
-    print(f"\n总结表格保存至: {summary_path}")
+    print(f"\n[Saved] Summary CSV: {summary_path}")
     
     # 生成不同块大小的对比表格
     if block_results:
         block_data = []
-        block_sizes = list(next(iter(block_results.values())).keys())
+        block_sizes = list(next(iter(block_results.values()))["by_block_size"].keys())
         
         for block_size in block_sizes:
-            row = {"块大小": block_size}
+            row = {"block_size": block_size}
             for method, results in block_results.items():
-                if block_size in results:
-                    row[f"{method_name_map.get(method, method)}_MSE_masked"] = f"{results[block_size]:.4f}"
+                row[f"{method_name_map.get(method, method)}_mse_masked"] = f"{results['by_block_size'][block_size]:.6f}"
             block_data.append(row)
         
         df_block = pd.DataFrame(block_data)
         print(f"\n{'='*80}")
-        print("不同块大小下的MSE对比")
+        print("MSE comparison across block sizes")
         print(f"{'='*80}")
         print(df_block.to_string(index=False))
         
         # 保存块大小对比表格
         block_path = output_path / f"block_size_comparison_{timestamp}.csv"
         df_block.to_csv(block_path, index=False)
-        print(f"\n块大小对比表格保存至: {block_path}")
+        print(f"\n[Saved] Block size CSV: {block_path}")
     
     # 绘制对比图
     import matplotlib.pyplot as plt
@@ -440,7 +317,7 @@ def generate_comparison_report(model_results, simple_results, block_results, out
     method_labels = [method_name_map.get(m, m) for m in methods]
     
     bars = plt.bar(method_labels, mse_values, capsize=5)
-    plt.title("MSE Comparison Under Block Missingness")
+    plt.title("Final Masked MSE (Eval: Block Missingness)")
     plt.xlabel("Method")
     plt.ylabel("MSE (masked)")
     plt.xticks(rotation=45, ha="right")
@@ -453,22 +330,22 @@ def generate_comparison_report(model_results, simple_results, block_results, out
                 f'{height:.4f}', ha='center', va='bottom')
     
     plt.tight_layout()
-    comparison_plot_path = output_path / f"comparison_block_methods_{timestamp}.png"
+    comparison_plot_path = output_path / f"comparison_training_modes_{timestamp}.png"
     plt.savefig(comparison_plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"对比图保存至: {comparison_plot_path}")
+    print(f"[Saved] Plot: {comparison_plot_path}")
     
     # 2. 不同块大小的MSE对比
     if block_results:
         plt.figure(figsize=(12, 6))
         
         for method, results in block_results.items():
-            block_sizes = list(results.keys())
-            mse_values = list(results.values())
+            block_sizes = list(results["by_block_size"].keys())
+            mse_values = list(results["by_block_size"].values())
             plt.plot(block_sizes, mse_values, marker='o', linewidth=2, 
                      label=method_name_map.get(method, method))
         
-        plt.title("MSE vs. Block Size")
+        plt.title("Masked MSE vs. Block Size (Eval: Block Missingness)")
         plt.xlabel("Block Size")
         plt.ylabel("MSE (masked)")
         plt.legend()
@@ -478,7 +355,7 @@ def generate_comparison_report(model_results, simple_results, block_results, out
         block_size_plot_path = output_path / f"comparison_block_sizes_{timestamp}.png"
         plt.savefig(block_size_plot_path, dpi=300, bbox_inches="tight")
         plt.close()
-        print(f"块大小对比图保存至: {block_size_plot_path}")
+        print(f"[Saved] Plot: {block_size_plot_path}")
 
 
 if __name__ == "__main__":
