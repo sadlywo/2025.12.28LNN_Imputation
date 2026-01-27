@@ -132,9 +132,12 @@ class AdaptiveLoss(nn.Module):
         loss_consistency = ((pred_diff - target_diff) ** 2).mean()
         
         # 3. Smoothness regularization (penalize high acceleration)
-        dt_expanded = dt[:, 1:]  # (B, T-1, 1)
-        pred_accel = pred_diff / (dt_expanded + 1e-6)  # Discrete derivative
-        loss_smooth = (pred_accel ** 2).mean()
+        if self.w_smooth != 0.0:
+            dt_expanded = dt[:, 1:]  # (B, T-1, 1)
+            pred_accel = pred_diff / (dt_expanded + 1e-6)  # Discrete derivative
+            loss_smooth = (pred_accel ** 2).mean()
+        else:
+            loss_smooth = torch.tensor(0.0, device=pred.device)
         
         total = (
             self.w_recon * loss_recon +
@@ -408,8 +411,11 @@ class PhysicsInformedLoss(nn.Module):
         
         # 3. 平滑度
         dt_expanded = dt[:, 1:]
-        pred_accel = pred_diff / (dt_expanded + 1e-6)
-        loss_smooth = (pred_accel ** 2).mean()
+        if self.w_smooth != 0.0:
+            pred_accel = pred_diff / (dt_expanded + 1e-6)
+            loss_smooth = (pred_accel ** 2).mean()
+        else:
+            loss_smooth = torch.tensor(0.0, device=pred.device)
         
         # 4. 物理约束
         if physics_info is not None:
