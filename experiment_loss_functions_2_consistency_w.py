@@ -24,7 +24,7 @@ def experiment_consistency_weight_ablation():
         "mask_rate": 0.3,
         "missing_mode": "random",
         "batch_size": 16,
-        "epochs": 50,
+        "epochs": 30,
         "lr": 1e-3,
         "hidden_units": 128,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -254,7 +254,7 @@ def generate_comparison_report(results, output_path, timestamp, config):
     for exp_name, result in results.items():
         plt.plot(epochs, result["history"]["val_mse_masked"], 
                  label=result.get("label", exp_name), linewidth=2)
-    plt.title("验证集 MSE (masked)")
+    plt.title("Validation MSE (masked)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
     plt.legend()
@@ -265,7 +265,7 @@ def generate_comparison_report(results, output_path, timestamp, config):
     for exp_name, result in results.items():
         plt.plot(epochs, result["history"]["val_mse_all"], 
                  label=result.get("label", exp_name), linewidth=2)
-    plt.title("验证集 MSE (all)")
+    plt.title("Validation MSE (all)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
     plt.legend()

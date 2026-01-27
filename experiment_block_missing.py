@@ -363,10 +363,10 @@ def generate_comparison_report(model_results, simple_results, block_results, out
     
     # 方法名称映射
     method_name_map = {
-        "lnn": "LNN（提出的方法）",
+        "lnn": "LNN (Proposed)",
         "gru": "GRU",
         "locf": "LOCF",
-        "mean": "均值插补",
+        "mean": "Mean Imputation",
     }
     
     # 收集所有方法的结果
@@ -440,8 +440,8 @@ def generate_comparison_report(model_results, simple_results, block_results, out
     method_labels = [method_name_map.get(m, m) for m in methods]
     
     bars = plt.bar(method_labels, mse_values, capsize=5)
-    plt.title("块状丢失模式下不同方法的MSE对比")
-    plt.xlabel("方法")
+    plt.title("MSE Comparison Under Block Missingness")
+    plt.xlabel("Method")
     plt.ylabel("MSE (masked)")
     plt.xticks(rotation=45, ha="right")
     plt.grid(True, alpha=0.3, axis="y")
@@ -468,8 +468,8 @@ def generate_comparison_report(model_results, simple_results, block_results, out
             plt.plot(block_sizes, mse_values, marker='o', linewidth=2, 
                      label=method_name_map.get(method, method))
         
-        plt.title("不同块大小下的MSE对比")
-        plt.xlabel("块大小")
+        plt.title("MSE vs. Block Size")
+        plt.xlabel("Block Size")
         plt.ylabel("MSE (masked)")
         plt.legend()
         plt.grid(True, alpha=0.3)

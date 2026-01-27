@@ -7,7 +7,7 @@ import torch
 from pathlib import Path
 
 sns.set_style("whitegrid")
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial', 'DejaVu Sans', 'sans-serif']
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 
@@ -28,7 +28,7 @@ def plot_training_curves(history: dict, save_path: str = "training_curves.png"):
     axes[0, 0].plot(epochs, history['val_loss'], 'r--', label='Val Loss', linewidth=2)
     axes[0, 0].set_xlabel('Epoch', fontsize=12)
     axes[0, 0].set_ylabel('Total Loss', fontsize=12)
-    axes[0, 0].set_title('训练/验证损失曲线', fontsize=14, fontweight='bold')
+    axes[0, 0].set_title('Training/Validation Loss', fontsize=14, fontweight='bold')
     axes[0, 0].legend(fontsize=11)
     axes[0, 0].grid(True, alpha=0.3)
     
@@ -36,7 +36,7 @@ def plot_training_curves(history: dict, save_path: str = "training_curves.png"):
     axes[0, 1].plot(epochs, history['val_mse_all'], 'g-', label='MSE (All)', linewidth=2)
     axes[0, 1].set_xlabel('Epoch', fontsize=12)
     axes[0, 1].set_ylabel('MSE', fontsize=12)
-    axes[0, 1].set_title('全通道MSE变化', fontsize=14, fontweight='bold')
+    axes[0, 1].set_title('MSE (All Channels)', fontsize=14, fontweight='bold')
     axes[0, 1].legend(fontsize=11)
     axes[0, 1].grid(True, alpha=0.3)
     
@@ -44,7 +44,7 @@ def plot_training_curves(history: dict, save_path: str = "training_curves.png"):
     axes[1, 0].plot(epochs, history['val_mse_masked'], 'm-', label='MSE (Masked)', linewidth=2)
     axes[1, 0].set_xlabel('Epoch', fontsize=12)
     axes[1, 0].set_ylabel('MSE', fontsize=12)
-    axes[1, 0].set_title('缺失位置MSE变化', fontsize=14, fontweight='bold')
+    axes[1, 0].set_title('MSE (Missing Positions)', fontsize=14, fontweight='bold')
     axes[1, 0].legend(fontsize=11)
     axes[1, 0].grid(True, alpha=0.3)
     
@@ -54,7 +54,7 @@ def plot_training_curves(history: dict, save_path: str = "training_curves.png"):
     axes[1, 1].plot(epochs, history['val_mse_masked'], 'g-', label='MSE(Masked)', alpha=0.7, linewidth=2)
     axes[1, 1].set_xlabel('Epoch', fontsize=12)
     axes[1, 1].set_ylabel('Value', fontsize=12)
-    axes[1, 1].set_title('综合对比', fontsize=14, fontweight='bold')
+    axes[1, 1].set_title('Overall Metrics', fontsize=14, fontweight='bold')
     axes[1, 1].legend(fontsize=11)
     axes[1, 1].grid(True, alpha=0.3)
     

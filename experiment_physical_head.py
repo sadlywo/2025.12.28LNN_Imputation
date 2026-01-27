@@ -254,10 +254,10 @@ def generate_comparison_report(results, output_path, timestamp, config):
     # MSE (masked) 对比
     plt.subplot(1, 2, 1)
     plt.plot(epochs, results["with_physical_head"]["history"]["val_mse_masked"], 
-             label="有物理输出头", linewidth=2)
+             label="With Physical Output Head", linewidth=2)
     plt.plot(epochs, results["without_physical_head"]["history"]["val_mse_masked"], 
-             label="无物理输出头", linewidth=2)
-    plt.title("验证集 MSE (masked)")
+             label="Without Physical Output Head", linewidth=2)
+    plt.title("Validation MSE (masked)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
     plt.legend()
@@ -266,10 +266,10 @@ def generate_comparison_report(results, output_path, timestamp, config):
     # MSE (all) 对比
     plt.subplot(1, 2, 2)
     plt.plot(epochs, results["with_physical_head"]["history"]["val_mse_all"], 
-             label="有物理输出头", linewidth=2)
+             label="With Physical Output Head", linewidth=2)
     plt.plot(epochs, results["without_physical_head"]["history"]["val_mse_all"], 
-             label="无物理输出头", linewidth=2)
-    plt.title("验证集 MSE (all)")
+             label="Without Physical Output Head", linewidth=2)
+    plt.title("Validation MSE (all)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
     plt.legend()

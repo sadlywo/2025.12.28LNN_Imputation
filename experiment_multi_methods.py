@@ -289,8 +289,8 @@ def generate_comparison_report(cv_results, model_results, output_path, timestamp
     # 方法名称映射
     method_name_map = {
         "locf": "LOCF",
-        "mean": "均值插补",
-        "lnn": "LNN（提出的方法）",
+        "mean": "Mean Imputation",
+        "lnn": "LNN (Proposed)",
         "gru": "GRU",
         # TODO: 添加其他方法的名称映射
     }
@@ -357,9 +357,9 @@ def generate_comparison_report(cv_results, model_results, output_path, timestamp
     
     plt.figure(figsize=(12, 6))
     bars = plt.bar(method_labels, mse_values, yerr=std_values, capsize=5)
-    plt.title("不同插补方法的MSE对比")
-    plt.xlabel("插补方法")
-    plt.ylabel("平均MSE")
+    plt.title("MSE Comparison Across Imputation Methods")
+    plt.xlabel("Imputation Method")
+    plt.ylabel("Mean MSE")
     plt.xticks(rotation=45, ha="right")
     plt.grid(True, alpha=0.3, axis="y")
     

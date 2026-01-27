@@ -272,9 +272,9 @@ def generate_comparison_report(results, output_path, timestamp, config):
     
     # 损失函数名称映射
     loss_name_map = {
-        "reconstruction_only": "只有数据重建损失",
-        "adaptive_loss": "自适应损失（基准）",
-        "physics_informed": "引入物理损失",
+        "reconstruction_only": "Reconstruction Only",
+        "adaptive_loss": "Adaptive Loss (Baseline)",
+        "physics_informed": "Physics-Informed Loss",
     }
     
     # 生成总结表格
@@ -323,7 +323,7 @@ def generate_comparison_report(results, output_path, timestamp, config):
     for exp_name, result in results.items():
         plt.plot(epochs, result["history"]["val_mse_masked"], 
                  label=loss_name_map.get(exp_name, exp_name), linewidth=2)
-    plt.title("验证集 MSE (masked)")
+    plt.title("Validation MSE (masked)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
     plt.legend()
@@ -334,7 +334,7 @@ def generate_comparison_report(results, output_path, timestamp, config):
     for exp_name, result in results.items():
         plt.plot(epochs, result["history"]["val_mse_all"], 
                  label=loss_name_map.get(exp_name, exp_name), linewidth=2)
-    plt.title("验证集 MSE (all)")
+    plt.title("Validation MSE (all)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
     plt.legend()
