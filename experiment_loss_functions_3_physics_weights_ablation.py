@@ -18,7 +18,7 @@ def experiment_physics_weights_ablation():
         "mask_rate": 0.3,
         "missing_mode": "random",
         "batch_size": 16,
-        "epochs": 50,
+        "epochs": 30,
         "lr": 1e-3,
         "hidden_units": 128,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -81,8 +81,8 @@ def experiment_physics_weights_ablation():
         pin_memory=True if config["device"] == "cuda" else False,
     )
 
-    w_integration_values = [0.0, 0.05, 0.1, 0.2, 0.5, 1.0]
-    w_energy_values = [0.0, 0.05, 0.1, 0.2, 0.5]
+    w_integration_values = [0.0, 0.1, 0.2, 0.5]
+    w_energy_values = [0.0, 0.1, 0.2, 0.5]
 
     results = {}
     for w_integration in w_integration_values:
