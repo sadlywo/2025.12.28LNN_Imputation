@@ -74,7 +74,7 @@ def run_comparison_experiment(
                 w_smooth = 0.0
             
             # Train model
-            model, history, multi_results = train(
+            train_out = train(
                 root_dir=root_dir,
                 seq_len=seq_len,
                 mask_rate=mask_rate,
@@ -91,6 +91,13 @@ def run_comparison_experiment(
                 num_workers=4,
                 use_scheduler=True,
             )
+            if isinstance(train_out, (tuple, list)) and len(train_out) == 4:
+                model, history, multi_results, num_params = train_out
+            elif isinstance(train_out, (tuple, list)) and len(train_out) == 3:
+                model, history, multi_results = train_out
+                num_params = None
+            else:
+                raise ValueError(f"Unexpected train() return value: {type(train_out)}")
             
             training_time = time.time() - start_time
             training_times[model_name] = training_time
@@ -105,6 +112,7 @@ def run_comparison_experiment(
                 "history": history,
                 "multi_pattern_results": multi_results,
                 "training_time": training_time,
+                "num_params": num_params,
                 "final_val_mse_masked": history["val_mse_masked"][-1],
                 "final_val_mse_all": history["val_mse_all"][-1],
             }

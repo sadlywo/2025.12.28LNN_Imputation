@@ -1,6 +1,5 @@
-"""实验1：有无物理输出头的对比实验"""
+"""实验2：时间一致性损失权重消融（基于无平滑项的 AdaptiveLoss）"""
 import torch
-import torch.nn as nn
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -13,11 +12,10 @@ from train import train_one_epoch, evaluate
 from visualization import plot_training_curves, plot_imputation_samples
 
 
-def experiment_physical_head():
+def experiment_consistency_weight_ablation():
     """
-    对比有无物理输出头的模型性能
-    - 模型1：使用物理输出头（分离的陀螺仪和加速度计头）
-    - 模型2：不使用物理输出头（单一输出头）
+    基准：AdaptiveLoss（w_smooth=0）
+    消融变量：w_consistency（时间一致性损失权重）
     """
     # 实验配置
     config = {
@@ -30,7 +28,7 @@ def experiment_physical_head():
         "lr": 1e-3,
         "hidden_units": 128,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "output_dir": "results/physical_head_experiment",
+        "output_dir": "results/consistency_weight_ablation",
         "num_workers": 4,
     }
     
@@ -40,12 +38,17 @@ def experiment_physical_head():
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"\n{'='*80}")
-    print(f"开始实验：有无物理输出头对比")
+    print(f"开始实验：时间一致性权重消融（AdaptiveLoss, w_smooth=0）")
     print(f"{'='*80}")
     print(f"设备: {config['device']}")
     print(f"输出目录: {config['output_dir']}")
     print(f"{'='*80}\n")
     
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     # 加载数据集
     print("加载数据集...")
     train_ds = CfCIMUDataset(
@@ -83,41 +86,33 @@ def experiment_physical_head():
         pin_memory=True if config["device"] == "cuda" else False,
     )
     
-    # 定义模型
-    models = {
-        "with_physical_head": PhysicsAwareIMUImputer(
+    w_consistency_values = [0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+    
+    # 训练不同 w_consistency 的模型
+    results = {}
+    for w_consistency in w_consistency_values:
+        exp_name = f"adaptive_no_smooth_wc{w_consistency:g}"
+        exp_label = f"w_consistency={w_consistency:g}"
+        print(f"\n{'='*80}")
+        print(f"训练模型: {exp_label}（AdaptiveLoss, w_smooth=0）")
+        print(f"{'='*80}")
+        
+        # 创建模型
+        model = PhysicsAwareIMUImputer(
             input_dim=13,
             hidden_units=config["hidden_units"],
             output_dim=6,
-            use_physics_prior=True,  # 使用物理输出头
-            mixed_memory=True,
-        ),
-        "without_physical_head": PhysicsAwareIMUImputer(
-            input_dim=13,
-            hidden_units=config["hidden_units"],
-            output_dim=6,
-            use_physics_prior=False,  # 不使用物理输出头
+            use_physics_prior=True,
             mixed_memory=True,
         )
-    }
-    
-    # 训练两个模型
-    results = {}
-    for model_name, model in models.items():
-        print(f"\n{'='*80}")
-        print(f"训练模型: {model_name}")
-        print(f"{'='*80}")
         
         # 设置设备
         model = model.to(config["device"])
         
-        # 定义损失函数和优化器
-        criterion = AdaptiveLoss(
-            w_recon=1.0,
-            w_consistency=0.1,
-            w_smooth=0.00,
-        )
+        # 创建损失函数
+        criterion = AdaptiveLoss(w_recon=1.0, w_consistency=w_consistency, w_smooth=0.0)
         
+        # 定义优化器
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config["lr"],
@@ -161,7 +156,7 @@ def experiment_physical_head():
             # 保存最佳模型
             if val_metrics["total"] < best_val_loss:
                 best_val_loss = val_metrics["total"]
-                model_path = output_path / f"best_model_{model_name}.pt"
+                model_path = output_path / f"best_model_{exp_name}.pt"
                 torch.save(model.state_dict(), model_path)
             
             # 每10个epoch可视化一次
@@ -170,24 +165,26 @@ def experiment_physical_head():
                 plot_imputation_samples(
                     sample_inputs, sample_targets, sample_preds, sample_masks,
                     num_samples=3,
-                    save_path=output_path / f"samples_epoch{epoch:03d}_{model_name}.png"
+                    save_path=output_path / f"samples_epoch{epoch:03d}_{exp_name}.png"
                 )
         
         # 保存训练曲线
         plot_training_curves(
             history,
-            save_path=output_path / f"training_curves_{model_name}.png"
+            save_path=output_path / f"training_curves_{exp_name}.png"
         )
         
         # 保存模型结果
-        results[model_name] = {
+        results[exp_name] = {
+            "label": exp_label,
+            "w_consistency": float(w_consistency),
             "history": history,
             "best_val_loss": best_val_loss,
             "final_mse_masked": history["val_mse_masked"][-1],
             "final_mse_all": history["val_mse_all"][-1],
         }
         
-        print(f"\n[{model_name}] 训练完成")
+        print(f"\n[{exp_label}] 训练完成")
         print(f"最佳验证损失: {best_val_loss:.4f}")
         print(f"最终MSE (masked): {history['val_mse_masked'][-1]:.4f}")
         print(f"最终MSE (all): {history['val_mse_all'][-1]:.4f}")
@@ -196,7 +193,7 @@ def experiment_physical_head():
     generate_comparison_report(results, output_path, timestamp, config)
     
     print(f"\n{'='*80}")
-    print("实验1：有无物理输出头对比实验完成")
+    print("实验2：时间一致性权重消融完成")
     print(f"结果保存至: {config['output_dir']}")
     print(f"{'='*80}")
     
@@ -211,9 +208,10 @@ def generate_comparison_report(results, output_path, timestamp, config):
     
     # 生成总结表格
     summary_data = []
-    for model_name, result in results.items():
+    for exp_name, result in results.items():
         summary_data.append({
-            "模型": "有物理输出头" if "with" in model_name else "无物理输出头",
+            "实验": result.get("label", exp_name),
+            "w_consistency": f"{result.get('w_consistency', float('nan')):g}",
             "最佳验证损失": f"{result['best_val_loss']:.4f}",
             "最终MSE (masked)": f"{result['final_mse_masked']:.4f}",
             "最终MSE (all)": f"{result['final_mse_all']:.4f}",
@@ -224,23 +222,23 @@ def generate_comparison_report(results, output_path, timestamp, config):
     print(df_summary.to_string(index=False))
     
     # 保存总结表格
-    summary_path = output_path / f"summary_physical_head_{timestamp}.csv"
+    summary_path = output_path / f"summary_loss_functions_{timestamp}.csv"
     df_summary.to_csv(summary_path, index=False)
     print(f"\n总结表格保存至: {summary_path}")
     
     # 生成详细的MSE对比表格
     mse_data = []
-    for epoch in range(len(results["with_physical_head"]["history"]["val_mse_masked"])):
-        mse_data.append({
-            "epoch": epoch + 1,
-            "有物理输出头_MSE_masked": results["with_physical_head"]["history"]["val_mse_masked"][epoch],
-            "无物理输出头_MSE_masked": results["without_physical_head"]["history"]["val_mse_masked"][epoch],
-            "有物理输出头_MSE_all": results["with_physical_head"]["history"]["val_mse_all"][epoch],
-            "无物理输出头_MSE_all": results["without_physical_head"]["history"]["val_mse_all"][epoch],
-        })
+    for epoch in range(config["epochs"]):
+        row = {"epoch": epoch + 1}
+        for exp_name, result in results.items():
+            if epoch < len(result["history"]["val_mse_masked"]):
+                label = result.get("label", exp_name)
+                row[f"{label}_MSE_masked"] = result["history"]["val_mse_masked"][epoch]
+                row[f"{label}_MSE_all"] = result["history"]["val_mse_all"][epoch]
+        mse_data.append(row)
     
     df_mse = pd.DataFrame(mse_data)
-    mse_path = output_path / f"mse_comparison_physical_head_{timestamp}.csv"
+    mse_path = output_path / f"mse_comparison_loss_functions_{timestamp}.csv"
     df_mse.to_csv(mse_path, index=False)
     print(f"MSE对比表格保存至: {mse_path}")
     
@@ -249,14 +247,13 @@ def generate_comparison_report(results, output_path, timestamp, config):
     
     epochs = list(range(1, config["epochs"] + 1))
     
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(15, 6))
     
     # MSE (masked) 对比
     plt.subplot(1, 2, 1)
-    plt.plot(epochs, results["with_physical_head"]["history"]["val_mse_masked"], 
-             label="有物理输出头", linewidth=2)
-    plt.plot(epochs, results["without_physical_head"]["history"]["val_mse_masked"], 
-             label="无物理输出头", linewidth=2)
+    for exp_name, result in results.items():
+        plt.plot(epochs, result["history"]["val_mse_masked"], 
+                 label=result.get("label", exp_name), linewidth=2)
     plt.title("验证集 MSE (masked)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
@@ -265,10 +262,9 @@ def generate_comparison_report(results, output_path, timestamp, config):
     
     # MSE (all) 对比
     plt.subplot(1, 2, 2)
-    plt.plot(epochs, results["with_physical_head"]["history"]["val_mse_all"], 
-             label="有物理输出头", linewidth=2)
-    plt.plot(epochs, results["without_physical_head"]["history"]["val_mse_all"], 
-             label="无物理输出头", linewidth=2)
+    for exp_name, result in results.items():
+        plt.plot(epochs, result["history"]["val_mse_all"], 
+                 label=result.get("label", exp_name), linewidth=2)
     plt.title("验证集 MSE (all)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
@@ -276,7 +272,7 @@ def generate_comparison_report(results, output_path, timestamp, config):
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    comparison_plot_path = output_path / f"comparison_physical_head_{timestamp}.png"
+    comparison_plot_path = output_path / f"comparison_loss_functions_{timestamp}.png"
     plt.savefig(comparison_plot_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"对比图保存至: {comparison_plot_path}")
@@ -284,4 +280,4 @@ def generate_comparison_report(results, output_path, timestamp, config):
 
 if __name__ == "__main__":
     # 运行实验
-    experiment_physical_head()
+    experiment_consistency_weight_ablation()
