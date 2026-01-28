@@ -114,7 +114,7 @@ def experiment_physical_head():
         # 定义损失函数和优化器
         criterion = AdaptiveLoss(
             w_recon=1.0,
-            w_consistency=0.0,
+            w_consistency=0.1,
             w_smooth=0.00,
         )
         
