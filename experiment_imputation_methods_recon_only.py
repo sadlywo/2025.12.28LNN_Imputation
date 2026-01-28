@@ -31,6 +31,10 @@ def _seed_all(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def _sync(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
 
 def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> Tuple[float, float]:
     mse_all = F.mse_loss(pred, target).item()
@@ -47,6 +51,39 @@ def _compute_target_mean(train_loader, device: torch.device) -> torch.Tensor:
         total += targets.sum(dim=(0, 1))
         count += targets.shape[0] * targets.shape[1]
     return total / max(count, 1)
+
+def _state_dict_size_mb(model: nn.Module) -> float:
+    total_bytes = 0
+    for v in model.state_dict().values():
+        if torch.is_tensor(v):
+            total_bytes += v.numel() * v.element_size()
+    return float(total_bytes) / (1024.0 * 1024.0)
+
+
+def _measure_deep_inference_time(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    max_batches: Optional[int] = None,
+) -> Tuple[float, int, int]:
+    model.eval()
+    total_time = 0.0
+    total_batches = 0
+    total_samples = 0
+    with torch.no_grad():
+        for inputs, _targets, _mask in loader:
+            if max_batches is not None and total_batches >= max_batches:
+                break
+            inputs = inputs.to(device)
+            _sync(device)
+            t0 = time.time()
+            out = model(inputs)
+            _ = out[0] if isinstance(out, (tuple, list)) else out
+            _sync(device)
+            total_time += time.time() - t0
+            total_batches += 1
+            total_samples += int(inputs.shape[0])
+    return float(total_time), int(total_batches), int(total_samples)
 
 
 def locf_impute_sequence(x_masked: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -244,7 +281,9 @@ class MethodResult:
     mse_all: float
     mse_masked: float
     train_time_sec: float
+    inference_time_sec: float
     num_params: Optional[int]
+    param_size_mb: Optional[float]
 
 
 def _evaluate_classical(
@@ -304,6 +343,7 @@ def run_comparison():
         "transformer_nhead": 4,
         "transformer_nlayers": 2,
         "gain_noise_scale": 0.1,
+        "deep_inference_max_val_batches": None,
     }
 
     _seed_all(config["seed"])
@@ -390,6 +430,7 @@ def run_comparison():
     for name, model_factory in deep_methods:
         model = model_factory().to(device)
         num_params = count_parameters(model)
+        param_size_mb = _state_dict_size_mb(model)
         method_param_rows.append(
             {
                 "method": name,
@@ -451,14 +492,23 @@ def run_comparison():
         per_method_histories[name] = history
         plot_training_curves(history, save_path=output_path / f"training_curves_{name}_{timestamp}.png")
 
+        best_model_path = output_path / f"best_model_{name}_{timestamp}.pt"
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        best_eval_metrics = evaluate(model, val_loader, criterion, device, use_physics=False)
+        infer_time, infer_batches, infer_samples = _measure_deep_inference_time(
+            model, val_loader, device=device, max_batches=config["deep_inference_max_val_batches"]
+        )
+
         results.append(
             MethodResult(
                 method=name,
                 kind="deep",
-                mse_all=float(history["val_mse_all"][-1]),
-                mse_masked=float(history["val_mse_masked"][-1]),
+                mse_all=float(best_eval_metrics["mse_all"]),
+                mse_masked=float(best_eval_metrics["mse_masked"]),
                 train_time_sec=float(train_time),
+                inference_time_sec=float(infer_time),
                 num_params=int(num_params),
+                param_size_mb=float(param_size_mb),
             )
         )
 
@@ -478,8 +528,10 @@ def run_comparison():
                 kind=f"classical(batches={batches})",
                 mse_all=a,
                 mse_masked=m,
-                train_time_sec=float(elapsed),
+                train_time_sec=0.0,
+                inference_time_sec=float(elapsed),
                 num_params=None,
+                param_size_mb=None,
             )
         )
         method_param_rows.append(
@@ -500,6 +552,12 @@ def run_comparison():
         )
 
     df = pd.DataFrame([r.__dict__ for r in results]).sort_values(by=["mse_masked", "mse_all"], ascending=[True, True])
+    df["total_time_sec"] = df["train_time_sec"].fillna(0.0) + df["inference_time_sec"].fillna(0.0)
+    df["inference_ms_per_batch"] = np.nan
+    for idx, row in df.iterrows():
+        if row["inference_time_sec"] and isinstance(row["kind"], str) and row["kind"].startswith("deep"):
+            df.loc[idx, "inference_ms_per_batch"] = 1000.0 * row["inference_time_sec"] / max(len(val_loader), 1)
+
     summary_path = output_path / f"summary_recon_only_methods_{timestamp}.csv"
     df.to_csv(summary_path, index=False)
     print(f"\n[Saved] Summary CSV: {summary_path}")
@@ -515,6 +573,18 @@ def run_comparison():
     method_params_path = output_path / f"method_key_parameters_{timestamp}.csv"
     df_method_params.to_csv(method_params_path, index=False)
     print(f"[Saved] Method key parameters CSV: {method_params_path}")
+
+    df_config = pd.DataFrame([{"key": k, "value": v} for k, v in config.items()])
+    excel_path = output_path / f"comparison_metrics_{timestamp}.xlsx"
+    try:
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="metrics")
+            df_params.to_excel(writer, index=False, sheet_name="param_counts")
+            df_method_params.to_excel(writer, index=False, sheet_name="method_params")
+            df_config.to_excel(writer, index=False, sheet_name="config")
+        print(f"[Saved] Excel: {excel_path}")
+    except Exception as e:
+        print(f"[Warning] Excel export failed: {e}")
 
     try:
         import matplotlib.pyplot as plt
