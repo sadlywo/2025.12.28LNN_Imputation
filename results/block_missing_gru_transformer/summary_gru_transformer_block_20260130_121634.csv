@@ -1,0 +1,3 @@
+model,best_val_loss,final_mse_masked,final_mse_all
+GRU,0.423766,0.423766,0.183841
+TRANSFORMER,0.411560,0.411560,0.466043

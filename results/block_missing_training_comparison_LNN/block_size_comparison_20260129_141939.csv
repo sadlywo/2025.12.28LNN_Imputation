@@ -1,0 +1,5 @@
+block_size,LNN (Train: Random)_mse_masked,LNN (Train: Block)_mse_masked
+5,0.576652,0.561666
+10,0.661453,0.624813
+15,0.719669,0.674577
+20,0.784538,0.737190

@@ -1,21 +1,48 @@
-"""Experiment: LNN training under different missing modes, evaluated on block missingness."""
+"""Experiment: baseline training under different missing modes, evaluated on block missingness."""
 import torch
+import torch.nn as nn
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from typing import Tuple
 
 # 导入项目模块
 from dataset import CfCIMUDataset
 from models import build_model
-from models import AdaptiveLoss
+from models import ReconstructionOnlyLoss
 from train import train_one_epoch, evaluate
 from visualization import plot_training_curves, plot_imputation_samples
 
 
+class GAINImputer(nn.Module):
+    def __init__(self, input_dim: int = 13, hidden_dim: int = 128, output_dim: int = 6, noise_scale: float = 0.1):
+        super().__init__()
+        self.noise_scale = noise_scale
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + output_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(output_dim, output_dim),
+            nn.Softplus(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        bsz, t_len, _ = x.shape
+        noise = torch.randn(bsz, t_len, 6, device=x.device, dtype=x.dtype) * self.noise_scale
+        z = torch.cat([x, noise], dim=-1)
+        pred = self.net(z)
+        unc = self.uncertainty_head(pred)
+        return pred, unc
+
+
 def experiment_block_missing():
     """
-    Compare LNN trained with different missing modes and evaluate on block missingness.
+    Compare GRU/Transformer/GAIN trained with different missing modes and evaluate on block missingness.
     Block missingness here means a continuous missing segment within a single channel.
     """
     # 实验配置
@@ -25,13 +52,15 @@ def experiment_block_missing():
         "mask_rate": 0.3,
         "train_missing_modes": ["random", "block"],
         "eval_missing_mode": "block",
+        "models": ["gru", "transformer", "gain"],
         "batch_size": 16,
         "epochs": 50,
         "lr": 1e-3,
         "hidden_units": 128,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "output_dir": "results/block_missing_training_comparison",
+        "output_dir": "results/block_missing_training_comparison_baselines",
         "num_workers": 4,
+        "gain_noise_scale": 0.1,
     }
     
     # 创建输出目录
@@ -66,108 +95,118 @@ def experiment_block_missing():
     )
 
     model_results = {}
-    for train_missing_mode in config["train_missing_modes"]:
-        exp_key = f"lnn_train_{train_missing_mode}"
-        print(f"\n{'='*80}")
-        print(f"Training LNN with missing_mode='{train_missing_mode}'")
-        print(f"{'='*80}")
+    for model_name in config["models"]:
+        for train_missing_mode in config["train_missing_modes"]:
+            exp_key = f"{model_name}_train_{train_missing_mode}"
+            print(f"\n{'='*80}")
+            print(f"Training {model_name.upper()} with missing_mode='{train_missing_mode}'")
+            print(f"{'='*80}")
 
-        train_ds = CfCIMUDataset(
-            root_dir=config["root_dir"],
-            seq_len=config["seq_len"],
-            mask_rate=config["mask_rate"],
-            missing_mode=train_missing_mode,
-            split="train",
-            eval_mode=False,
-            drift_scale=0.01,
-        )
-        val_ds = CfCIMUDataset(
-            root_dir=config["root_dir"],
-            seq_len=config["seq_len"],
-            mask_rate=config["mask_rate"],
-            missing_mode=config["eval_missing_mode"],
-            split="val",
-            eval_mode=True,
-            drift_scale=0.0,
-        )
-
-        train_loader = torch.utils.data.DataLoader(
-            train_ds,
-            batch_size=config["batch_size"],
-            shuffle=True,
-            num_workers=config["num_workers"],
-            pin_memory=True if config["device"] == "cuda" else False,
-        )
-        val_loader = torch.utils.data.DataLoader(
-            val_ds,
-            batch_size=config["batch_size"],
-            shuffle=False,
-            num_workers=config["num_workers"],
-            pin_memory=True if config["device"] == "cuda" else False,
-        )
-
-        model = build_model(
-            model_name="lnn",
-            input_dim=13,
-            hidden_dim=config["hidden_units"],
-            output_dim=6,
-        ).to(config["device"])
-
-        criterion = AdaptiveLoss(w_recon=1.0, w_consistency=0.1, w_smooth=0.01)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=config["lr"],
-            epochs=config["epochs"],
-            steps_per_epoch=len(train_loader),
-        )
-
-        history = {"train_loss": [], "val_loss": [], "val_mse_all": [], "val_mse_masked": []}
-        best_val_loss = float("inf")
-
-        for epoch in range(1, config["epochs"] + 1):
-            train_metrics = train_one_epoch(
-                model, train_loader, criterion, optimizer, scheduler, config["device"], epoch, use_physics=False
+            train_ds = CfCIMUDataset(
+                root_dir=config["root_dir"],
+                seq_len=config["seq_len"],
+                mask_rate=config["mask_rate"],
+                missing_mode=train_missing_mode,
+                split="train",
+                eval_mode=False,
+                drift_scale=0.01,
             )
-            val_metrics = evaluate(model, val_loader, criterion, config["device"], use_physics=False)
+            val_ds = CfCIMUDataset(
+                root_dir=config["root_dir"],
+                seq_len=config["seq_len"],
+                mask_rate=config["mask_rate"],
+                missing_mode=config["eval_missing_mode"],
+                split="val",
+                eval_mode=True,
+                drift_scale=0.0,
+            )
 
-            history["train_loss"].append(train_metrics["total"])
-            history["val_loss"].append(val_metrics["total"])
-            history["val_mse_all"].append(val_metrics["mse_all"])
-            history["val_mse_masked"].append(val_metrics["mse_masked"])
+            train_loader = torch.utils.data.DataLoader(
+                train_ds,
+                batch_size=config["batch_size"],
+                shuffle=True,
+                num_workers=config["num_workers"],
+                pin_memory=True if config["device"] == "cuda" else False,
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_ds,
+                batch_size=config["batch_size"],
+                shuffle=False,
+                num_workers=config["num_workers"],
+                pin_memory=True if config["device"] == "cuda" else False,
+            )
 
-            if val_metrics["total"] < best_val_loss:
-                best_val_loss = val_metrics["total"]
-                model_path = output_path / f"best_model_{exp_key}.pt"
-                torch.save(model.state_dict(), model_path)
+            if model_name == "gain":
+                model = GAINImputer(
+                    input_dim=13,
+                    hidden_dim=config["hidden_units"],
+                    output_dim=6,
+                    noise_scale=config["gain_noise_scale"],
+                ).to(config["device"])
+            else:
+                model = build_model(
+                    model_name=model_name,
+                    input_dim=13,
+                    hidden_dim=config["hidden_units"],
+                    output_dim=6,
+                ).to(config["device"])
 
-            if epoch % 10 == 0:
-                sample_inputs, sample_targets, sample_preds, sample_masks = val_metrics["samples"]
-                plot_imputation_samples(
-                    sample_inputs,
-                    sample_targets,
-                    sample_preds,
-                    sample_masks,
-                    num_samples=3,
-                    save_path=output_path / f"samples_epoch{epoch:03d}_{exp_key}.png",
+            criterion = ReconstructionOnlyLoss(w_recon=1.0)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-5)
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=config["lr"],
+                epochs=config["epochs"],
+                steps_per_epoch=len(train_loader),
+            )
+
+            history = {"train_loss": [], "val_loss": [], "val_mse_all": [], "val_mse_masked": []}
+            best_val_loss = float("inf")
+
+            for epoch in range(1, config["epochs"] + 1):
+                train_metrics = train_one_epoch(
+                    model, train_loader, criterion, optimizer, scheduler, config["device"], epoch, use_physics=False
                 )
+                val_metrics = evaluate(model, val_loader, criterion, config["device"], use_physics=False)
 
-        plot_training_curves(history, save_path=output_path / f"training_curves_{exp_key}.png")
+                history["train_loss"].append(train_metrics["total"])
+                history["val_loss"].append(val_metrics["total"])
+                history["val_mse_all"].append(val_metrics["mse_all"])
+                history["val_mse_masked"].append(val_metrics["mse_masked"])
 
-        model.load_state_dict(torch.load(model_path))
-        final_metrics = evaluate(model, eval_loader, criterion, config["device"], use_physics=False)
+                if val_metrics["total"] < best_val_loss:
+                    best_val_loss = val_metrics["total"]
+                    model_path = output_path / f"best_model_{exp_key}.pt"
+                    torch.save(model.state_dict(), model_path)
 
-        model_results[exp_key] = {
-            "train_missing_mode": train_missing_mode,
-            "history": history,
-            "best_val_loss": best_val_loss,
-            "final_mse_masked": float(final_metrics["mse_masked"]),
-            "final_mse_all": float(final_metrics["mse_all"]),
-        }
+                if epoch % 10 == 0:
+                    sample_inputs, sample_targets, sample_preds, sample_masks = val_metrics["samples"]
+                    plot_imputation_samples(
+                        sample_inputs,
+                        sample_targets,
+                        sample_preds,
+                        sample_masks,
+                        num_samples=3,
+                        save_path=output_path / f"samples_epoch{epoch:03d}_{exp_key}.png",
+                    )
 
-        print(f"[{exp_key}] Best val loss: {best_val_loss:.6f}")
-        print(f"[{exp_key}] Final eval MSE (masked): {final_metrics['mse_masked']:.6f}")
-        print(f"[{exp_key}] Final eval MSE (all): {final_metrics['mse_all']:.6f}")
+            plot_training_curves(history, save_path=output_path / f"training_curves_{exp_key}.png")
+
+            model.load_state_dict(torch.load(model_path))
+            final_metrics = evaluate(model, eval_loader, criterion, config["device"], use_physics=False)
+
+            model_results[exp_key] = {
+                "model_name": model_name,
+                "train_missing_mode": train_missing_mode,
+                "history": history,
+                "best_val_loss": best_val_loss,
+                "final_mse_masked": float(final_metrics["mse_masked"]),
+                "final_mse_all": float(final_metrics["mse_all"]),
+            }
+
+            print(f"[{exp_key}] Best val loss: {best_val_loss:.6f}")
+            print(f"[{exp_key}] Final eval MSE (masked): {final_metrics['mse_masked']:.6f}")
+            print(f"[{exp_key}] Final eval MSE (all): {final_metrics['mse_all']:.6f}")
     
     # 在不同块大小下评估模型性能
     print(f"\n{'='*80}")
@@ -179,15 +218,24 @@ def experiment_block_missing():
     block_results = {}
     
     for exp_key, info in model_results.items():
+        model_name = info["model_name"]
         train_missing_mode = info["train_missing_mode"]
         print(f"\nEvaluating {exp_key} across block sizes...")
 
-        model = build_model(
-            model_name="lnn",
-            input_dim=13,
-            hidden_dim=config["hidden_units"],
-            output_dim=6,
-        ).to(config["device"])
+        if model_name == "gain":
+            model = GAINImputer(
+                input_dim=13,
+                hidden_dim=config["hidden_units"],
+                output_dim=6,
+                noise_scale=config["gain_noise_scale"],
+            ).to(config["device"])
+        else:
+            model = build_model(
+                model_name=model_name,
+                input_dim=13,
+                hidden_dim=config["hidden_units"],
+                output_dim=6,
+            ).to(config["device"])
         model_path = output_path / f"best_model_{exp_key}.pt"
         model.load_state_dict(torch.load(model_path))
         
@@ -231,7 +279,11 @@ def experiment_block_missing():
             model_block_results[block_size] = mse_masked
             print(f"Block size {block_size}: MSE (masked) = {mse_masked:.6f}")
         
-        block_results[exp_key] = {"train_missing_mode": train_missing_mode, "by_block_size": model_block_results}
+        block_results[exp_key] = {
+            "model_name": model_name,
+            "train_missing_mode": train_missing_mode,
+            "by_block_size": model_block_results,
+        }
     
     # 生成对比报告
     generate_comparison_report(model_results, block_results, output_path, timestamp, config)
@@ -250,12 +302,6 @@ def generate_comparison_report(model_results, block_results, output_path, timest
     print("Generating report")
     print(f"{'='*80}")
     
-    # 方法名称映射
-    method_name_map = {
-        "lnn_train_random": "LNN (Train: Random)",
-        "lnn_train_block": "LNN (Train: Block)",
-    }
-    
     # 收集所有方法的结果
     all_results = {}
     
@@ -270,8 +316,9 @@ def generate_comparison_report(model_results, block_results, output_path, timest
     # 生成总结表格
     summary_data = []
     for method, result in all_results.items():
+        label = f"{result['model_name'].upper()} (Train: {result['train_missing_mode'].capitalize()})"
         summary_data.append({
-            "method": method_name_map.get(method, method),
+            "method": label,
             "final_mse_masked": f"{result['mse_masked']:.6f}",
             "final_mse_all": f"{result['mse_all']:.6f}",
         })
@@ -292,7 +339,8 @@ def generate_comparison_report(model_results, block_results, output_path, timest
         for block_size in block_sizes:
             row = {"block_size": block_size}
             for method, results in block_results.items():
-                row[f"{method_name_map.get(method, method)}_mse_masked"] = f"{results['by_block_size'][block_size]:.6f}"
+                label = f"{results['model_name'].upper()} (Train: {results['train_missing_mode'].capitalize()})"
+                row[f"{label}_mse_masked"] = f"{results['by_block_size'][block_size]:.6f}"
             block_data.append(row)
         
         df_block = pd.DataFrame(block_data)
@@ -343,7 +391,7 @@ def generate_comparison_report(model_results, block_results, output_path, timest
             block_sizes = list(results["by_block_size"].keys())
             mse_values = list(results["by_block_size"].values())
             plt.plot(block_sizes, mse_values, marker='o', linewidth=2, 
-                     label=method_name_map.get(method, method))
+                     label=f"{results['model_name'].upper()} (Train: {results['train_missing_mode'].capitalize()})")
         
         plt.title("Masked MSE vs. Block Size (Eval: Block Missingness)")
         plt.xlabel("Block Size")
