@@ -42,8 +42,8 @@ class TrainingConfig:
     
     # Loss weights
     w_recon: float = 1.0  # 重建损失权重
-    w_consistency: float = 0.5  # 时间一致性损失
-    w_smooth: float = 0.1  # 平滑度损失
+    w_consistency: float = 0.1  # 时间一致性损失
+    w_smooth: float = 0.0  # 平滑度损失
     
     # Scheduler
     use_scheduler: bool = True

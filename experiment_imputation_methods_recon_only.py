@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from dataset import CfCIMUDataset
 from models import (
@@ -43,10 +44,13 @@ def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) ->
     return mse_all, mse_masked
 
 
-def _compute_target_mean(train_loader, device: torch.device) -> torch.Tensor:
+def _compute_target_mean(train_loader, device: torch.device, max_batches: Optional[int] = None) -> torch.Tensor:
     total = torch.zeros(6, device=device)
     count = 0
-    for _inputs, targets, _mask in train_loader:
+    pbar = tqdm(train_loader, desc="Compute train target mean", leave=False)
+    for batch_idx, (_inputs, targets, _mask) in enumerate(pbar):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         targets = targets.to(device)
         total += targets.sum(dim=(0, 1))
         count += targets.shape[0] * targets.shape[1]
@@ -84,6 +88,55 @@ def _measure_deep_inference_time(
             total_batches += 1
             total_samples += int(inputs.shape[0])
     return float(total_time), int(total_batches), int(total_samples)
+
+
+def _safe_sheet_name(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in (" ", "_", "-") else "_" for ch in name).strip()
+    if not cleaned:
+        cleaned = "sheet"
+    return cleaned[:31]
+
+
+def _save_method_excel(
+    output_dir: Path,
+    method: str,
+    timestamp: str,
+    config: dict,
+    metrics: dict,
+    method_params: Optional[dict] = None,
+    history: Optional[dict] = None,
+):
+    per_method_dir = output_dir / "per_method_excels"
+    per_method_dir.mkdir(parents=True, exist_ok=True)
+    excel_path = per_method_dir / f"{method}_results_{timestamp}.xlsx"
+
+    df_metrics = pd.DataFrame([metrics])
+    df_config = pd.DataFrame([{"key": k, "value": v} for k, v in config.items()])
+    df_method_params = pd.DataFrame([method_params]) if method_params is not None else pd.DataFrame()
+
+    if history is not None:
+        df_history = pd.DataFrame(
+            {
+                "epoch": list(range(1, len(history.get("train_loss", [])) + 1)),
+                "train_loss": history.get("train_loss", []),
+                "val_loss": history.get("val_loss", []),
+                "val_mse_all": history.get("val_mse_all", []),
+                "val_mse_masked": history.get("val_mse_masked", []),
+            }
+        )
+    else:
+        df_history = pd.DataFrame()
+
+    try:
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            df_metrics.to_excel(writer, index=False, sheet_name=_safe_sheet_name("metrics"))
+            if not df_history.empty:
+                df_history.to_excel(writer, index=False, sheet_name=_safe_sheet_name("history"))
+            if not df_method_params.empty:
+                df_method_params.to_excel(writer, index=False, sheet_name=_safe_sheet_name("method_params"))
+            df_config.to_excel(writer, index=False, sheet_name=_safe_sheet_name("config"))
+    except Exception as e:
+        print(f"[Warning] Per-method Excel export failed ({method}): {e}")
 
 
 def locf_impute_sequence(x_masked: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -134,45 +187,6 @@ def knn_impute_sequence(x_masked: torch.Tensor, mask: torch.Tensor, k: int = 5) 
             x[t, c] = float(np.mean([v for _d, v in top]))
 
     return x
-
-
-def trmf_impute_sequence(
-    x_masked: torch.Tensor,
-    mask: torch.Tensor,
-    rank: int = 3,
-    steps: int = 300,
-    lr: float = 0.05,
-    lambda_time: float = 0.1,
-    lambda_l2: float = 1e-3,
-) -> torch.Tensor:
-    device = x_masked.device
-    t_len, channels = x_masked.shape
-
-    u = torch.randn(t_len, rank, device=device, requires_grad=True) * 0.01
-    v = torch.randn(channels, rank, device=device, requires_grad=True) * 0.01
-
-    optimizer = torch.optim.Adam([u, v], lr=lr)
-    obs = mask
-
-    for _ in range(steps):
-        optimizer.zero_grad(set_to_none=True)
-        y_hat = u @ v.t()
-
-        recon = ((y_hat - x_masked) ** 2 * obs).sum() / (obs.sum() + 1e-8)
-
-        if t_len >= 3:
-            d2 = u[2:] - 2 * u[1:-1] + u[:-2]
-            time_reg = (d2**2).mean()
-        else:
-            time_reg = torch.zeros((), device=device)
-
-        l2 = (u**2).mean() + (v**2).mean()
-        loss = recon + lambda_time * time_reg + lambda_l2 * l2
-        loss.backward()
-        optimizer.step()
-
-    with torch.no_grad():
-        return (u @ v.t()).detach()
 
 
 class GRUDImputer(nn.Module):
@@ -291,12 +305,14 @@ def _evaluate_classical(
     imputer: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
     max_batches: Optional[int] = None,
+    desc: str = "Classical",
 ) -> Tuple[float, float, int]:
     mse_all_list: List[float] = []
     mse_masked_list: List[float] = []
     batches = 0
 
-    for inputs, targets, mask in val_loader:
+    pbar = tqdm(val_loader, desc=desc)
+    for inputs, targets, mask in pbar:
         batches += 1
         if max_batches is not None and batches > max_batches:
             break
@@ -334,16 +350,12 @@ def run_comparison():
         "num_workers": 4,
         "seed": 42,
         "classical_max_val_batches": None,
-        "trmf_rank": 3,
-        "trmf_steps": 300,
-        "trmf_lr": 0.05,
-        "trmf_lambda_time": 0.1,
-        "trmf_lambda_l2": 1e-3,
         "knn_k": 5,
         "transformer_nhead": 4,
         "transformer_nlayers": 2,
         "gain_noise_scale": 0.1,
         "deep_inference_max_val_batches": None,
+        "compute_x_mean_max_train_batches": None,
     }
 
     _seed_all(config["seed"])
@@ -395,7 +407,8 @@ def run_comparison():
         pin_memory=True if device.type == "cuda" else False,
     )
 
-    x_mean = _compute_target_mean(train_loader, device=device)
+    print("\nComputing training target mean (for GRU-D)...")
+    x_mean = _compute_target_mean(train_loader, device=device, max_batches=config["compute_x_mean_max_train_batches"])
 
     deep_methods: List[Tuple[str, Callable[[], nn.Module]]] = [
         ("LNN", lambda: PhysicsAwareIMUImputer(input_dim=13, hidden_units=config["hidden_units"], output_dim=6, use_physics_prior=True, mixed_memory=True)),
@@ -407,18 +420,6 @@ def run_comparison():
     classical_methods: List[Tuple[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]] = [
         ("LOCF", lambda x, m: locf_impute_sequence(x, m)),
         ("KNN", lambda x, m: knn_impute_sequence(x, m, k=config["knn_k"])),
-        (
-            "TRMF",
-            lambda x, m: trmf_impute_sequence(
-                x,
-                m,
-                rank=config["trmf_rank"],
-                steps=config["trmf_steps"],
-                lr=config["trmf_lr"],
-                lambda_time=config["trmf_lambda_time"],
-                lambda_l2=config["trmf_lambda_l2"],
-            ),
-        ),
     ]
 
     results: List[MethodResult] = []
@@ -427,30 +428,84 @@ def run_comparison():
 
     criterion = ReconstructionOnlyLoss(w_recon=1.0)
 
+    for name, imputer in classical_methods:
+        print(f"\nRunning classical method: {name}")
+        start = time.time()
+        a, m, batches = _evaluate_classical(
+            val_loader,
+            imputer=imputer,
+            device=device,
+            max_batches=config["classical_max_val_batches"],
+            desc=f"Eval {name}",
+        )
+        elapsed = time.time() - start
+
+        results.append(
+            MethodResult(
+                method=name,
+                kind=f"classical(batches={batches})",
+                mse_all=a,
+                mse_masked=m,
+                train_time_sec=0.0,
+                inference_time_sec=float(elapsed),
+                num_params=None,
+                param_size_mb=None,
+            )
+        )
+        classical_params = {
+            "method": name,
+            "category": "classical",
+            "seq_len": config["seq_len"],
+            "mask_rate": config["mask_rate"],
+            "missing_mode": config["missing_mode"],
+            "classical_max_val_batches": config["classical_max_val_batches"],
+            "knn_k": config["knn_k"] if name == "KNN" else np.nan,
+        }
+        method_param_rows.append(classical_params)
+        _save_method_excel(
+            output_path,
+            method=name,
+            timestamp=timestamp,
+            config=config,
+            metrics={
+                "method": name,
+                "kind": f"classical(batches={batches})",
+                "mse_all": float(a),
+                "mse_masked": float(m),
+                "train_time_sec": 0.0,
+                "inference_time_sec": float(elapsed),
+                "num_params": None,
+                "param_size_mb": None,
+            },
+            method_params=classical_params,
+            history=None,
+        )
+
     for name, model_factory in deep_methods:
+        print(f"\nTraining deep model: {name}")
         model = model_factory().to(device)
         num_params = count_parameters(model)
         param_size_mb = _state_dict_size_mb(model)
-        method_param_rows.append(
-            {
-                "method": name,
-                "category": "deep",
-                "epochs": config["epochs"],
-                "batch_size": config["batch_size"],
-                "seq_len": config["seq_len"],
-                "mask_rate": config["mask_rate"],
-                "missing_mode": config["missing_mode"],
-                "lr": config["lr"],
-                "hidden_units": config["hidden_units"],
-                "num_params": int(num_params),
-                "transformer_nhead": config["transformer_nhead"] if name == "Transformer" else np.nan,
-                "transformer_nlayers": config["transformer_nlayers"] if name == "Transformer" else np.nan,
-                "gain_noise_scale": config["gain_noise_scale"] if name == "GAIN" else np.nan,
-                "grud_x_mean_source": "train_target_mean" if name == "GRU-D" else "",
-                "lnn_use_physics_prior": True if name == "LNN" else np.nan,
-                "lnn_mixed_memory": True if name == "LNN" else np.nan,
-            }
-        )
+        deep_params = {
+            "method": name,
+            "category": "deep",
+            "epochs": config["epochs"],
+            "batch_size": config["batch_size"],
+            "seq_len": config["seq_len"],
+            "mask_rate": config["mask_rate"],
+            "missing_mode": config["missing_mode"],
+            "lr": config["lr"],
+            "hidden_units": config["hidden_units"],
+            "num_params": int(num_params),
+            "param_size_mb": float(param_size_mb),
+            "transformer_nhead": config["transformer_nhead"] if name == "Transformer" else np.nan,
+            "transformer_nlayers": config["transformer_nlayers"] if name == "Transformer" else np.nan,
+            "gain_noise_scale": config["gain_noise_scale"] if name == "GAIN" else np.nan,
+            "grud_x_mean_source": "train_target_mean" if name == "GRU-D" else "",
+            "lnn_use_physics_prior": True if name == "LNN" else np.nan,
+            "lnn_mixed_memory": True if name == "LNN" else np.nan,
+        }
+        method_param_rows.append(deep_params)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -511,44 +566,28 @@ def run_comparison():
                 param_size_mb=float(param_size_mb),
             )
         )
-
-    for name, imputer in classical_methods:
-        start = time.time()
-        a, m, batches = _evaluate_classical(
-            val_loader,
-            imputer=imputer,
-            device=device,
-            max_batches=config["classical_max_val_batches"],
-        )
-        elapsed = time.time() - start
-
-        results.append(
-            MethodResult(
-                method=name,
-                kind=f"classical(batches={batches})",
-                mse_all=a,
-                mse_masked=m,
-                train_time_sec=0.0,
-                inference_time_sec=float(elapsed),
-                num_params=None,
-                param_size_mb=None,
-            )
-        )
-        method_param_rows.append(
-            {
+        _save_method_excel(
+            output_path,
+            method=name,
+            timestamp=timestamp,
+            config=config,
+            metrics={
                 "method": name,
-                "category": "classical",
-                "seq_len": config["seq_len"],
-                "mask_rate": config["mask_rate"],
-                "missing_mode": config["missing_mode"],
-                "classical_max_val_batches": config["classical_max_val_batches"],
-                "knn_k": config["knn_k"] if name == "KNN" else np.nan,
-                "trmf_rank": config["trmf_rank"] if name == "TRMF" else np.nan,
-                "trmf_steps": config["trmf_steps"] if name == "TRMF" else np.nan,
-                "trmf_lr": config["trmf_lr"] if name == "TRMF" else np.nan,
-                "trmf_lambda_time": config["trmf_lambda_time"] if name == "TRMF" else np.nan,
-                "trmf_lambda_l2": config["trmf_lambda_l2"] if name == "TRMF" else np.nan,
-            }
+                "kind": "deep",
+                "mse_all": float(best_eval_metrics["mse_all"]),
+                "mse_masked": float(best_eval_metrics["mse_masked"]),
+                "train_time_sec": float(train_time),
+                "inference_time_sec": float(infer_time),
+                "inference_batches": int(infer_batches),
+                "inference_samples": int(infer_samples),
+                "inference_ms_per_batch": 1000.0 * float(infer_time) / max(int(infer_batches), 1),
+                "inference_ms_per_sample": 1000.0 * float(infer_time) / max(int(infer_samples), 1),
+                "num_params": int(num_params),
+                "param_size_mb": float(param_size_mb),
+                "best_model_path": str(best_model_path),
+            },
+            method_params=deep_params,
+            history=history,
         )
 
     df = pd.DataFrame([r.__dict__ for r in results]).sort_values(by=["mse_masked", "mse_all"], ascending=[True, True])

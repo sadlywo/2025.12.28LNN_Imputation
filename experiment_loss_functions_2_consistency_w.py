@@ -86,7 +86,7 @@ def experiment_consistency_weight_ablation():
         pin_memory=True if config["device"] == "cuda" else False,
     )
     
-    w_consistency_values = [0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+    w_consistency_values = [0.0, 0.1, 0.3, 0.5, 1.0]
     
     # 训练不同 w_consistency 的模型
     results = {}
