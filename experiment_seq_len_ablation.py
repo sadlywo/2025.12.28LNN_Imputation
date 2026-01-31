@@ -50,7 +50,7 @@ def run_seq_len_ablation(
         "num_workers": 4,
         "seed": 42,
         "output_dir": str(output_dir),
-        "seq_len_values": seq_len_values or [10, 30, 50, 100],
+        "seq_len_values": seq_len_values or [200, 300,500],
         "drift_scale": float(drift_scale),
         "model_name": "lnn",
     }
