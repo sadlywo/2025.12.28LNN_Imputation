@@ -229,8 +229,8 @@ def run_seq_len_ablation(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--seq_lens", type=str, default="10,30,50,100")
-    parser.add_argument("--drift_scale", type=float, default=0.01)
+    parser.add_argument("--seq_lens", type=str, default="10, 30, 50, 100,200,300,500")
+    parser.add_argument("--drift_scale", type=float, default=0.00)
     parser.add_argument("--output_dir", type=str, default="results/seq_len_ablation_gru_transformer_recon_only")
     args = parser.parse_args()
 

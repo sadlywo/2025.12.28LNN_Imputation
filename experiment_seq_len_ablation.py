@@ -50,7 +50,7 @@ def run_seq_len_ablation(
         "num_workers": 4,
         "seed": 42,
         "output_dir": str(output_dir),
-        "seq_len_values": seq_len_values or [200, 300,500],
+        "seq_len_values": seq_len_values or [10, 30, 50, 100,200,300,500],
         "drift_scale": float(drift_scale),
         "model_name": "lnn",
     }
@@ -220,8 +220,8 @@ def run_seq_len_ablation(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--seq_lens", type=str, default="10,30,50,100")
-    parser.add_argument("--drift_scale", type=float, default=0.01)
+    parser.add_argument("--seq_lens", type=str, default="10, 30, 50, 100,200,300,500")
+    parser.add_argument("--drift_scale", type=float, default=0.00)
     parser.add_argument("--output_dir", type=str, default="results/seq_len_ablation_lnn_recon_only")
     args = parser.parse_args()
 
