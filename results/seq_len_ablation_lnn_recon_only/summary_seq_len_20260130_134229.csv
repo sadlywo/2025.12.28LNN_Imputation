@@ -1,0 +1,5 @@
+seq_len,best_epoch,best_val_loss,best_val_mse_masked,best_val_mse_all,num_params,weight_path
+100,30,0.07847517573031595,0.07847517573031595,0.08990951268672265,111292,results/seq_len_ablation_lnn_recon_only/best_model_lnn_seq100_20260130_134229.pt
+50,28,0.09373535427326299,0.09373535427326299,0.1174435736014846,111292,results/seq_len_ablation_lnn_recon_only/best_model_lnn_seq50_20260130_134229.pt
+30,30,0.11803353609117019,0.11803353609117019,0.1423569875231201,111292,results/seq_len_ablation_lnn_recon_only/best_model_lnn_seq30_20260130_134229.pt
+10,28,0.2423375412081561,0.2423375412081561,0.26646953128704315,111292,results/seq_len_ablation_lnn_recon_only/best_model_lnn_seq10_20260130_134229.pt
