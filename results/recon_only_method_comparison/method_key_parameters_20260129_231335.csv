@@ -1,0 +1,7 @@
+method,category,seq_len,mask_rate,missing_mode,classical_max_val_batches,knn_k,epochs,batch_size,lr,hidden_units,num_params,param_size_mb,transformer_nhead,transformer_nlayers,gain_noise_scale,grud_x_mean_source,lnn_use_physics_prior,lnn_mixed_memory
+LOCF,classical,50,0.3,random,,,,,,,,,,,,,,
+KNN,classical,50,0.3,random,,5.0,,,,,,,,,,,,
+LNN,deep,50,0.3,random,,,30.0,16.0,0.001,128.0,111292.0,0.460113525390625,,,,,True,True
+GRU-D,deep,50,0.3,random,,,30.0,16.0,0.001,128.0,80728.0,0.30797576904296875,,,,train_target_mean,,
+Transformer,deep,50,0.3,random,,,30.0,16.0,0.001,128.0,424268.0,1.6184539794921875,4.0,2.0,,,,
+GAIN,deep,50,0.3,random,,,30.0,16.0,0.001,128.0,19888.0,0.07586669921875,,,0.1,,,

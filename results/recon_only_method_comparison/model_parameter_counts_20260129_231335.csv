@@ -1,0 +1,5 @@
+method,num_params
+Transformer,424268
+LNN,111292
+GRU-D,80728
+GAIN,19888
