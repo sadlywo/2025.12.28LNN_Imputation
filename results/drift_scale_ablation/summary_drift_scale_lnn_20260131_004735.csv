@@ -1,0 +1,6 @@
+model,loss,drift_scale,best_epoch,best_val_loss,best_val_mse_masked,best_val_mse_all,num_params,weight_path
+lnn,adaptive,0.01,29,-3.184433124736347,0.09520564116161583,0.16095426029344234,111292,results/drift_scale_ablation/best_model_lnn_drift0.01_20260131_004735.pt
+lnn,adaptive,0.005,30,-3.3883943309989095,0.09640503902986668,0.139749174081128,111292,results/drift_scale_ablation/best_model_lnn_drift0.005_20260131_004735.pt
+lnn,adaptive,0.0,30,-3.48504129301268,0.09687760838983867,0.1205769344262985,111292,results/drift_scale_ablation/best_model_lnn_drift0_20260131_004735.pt
+lnn,adaptive,0.02,28,-2.794937775596705,0.09689844493202404,0.16977822489526695,111292,results/drift_scale_ablation/best_model_lnn_drift0.02_20260131_004735.pt
+lnn,adaptive,0.001,30,-3.477192762242157,0.09762033509758497,0.12244892572112794,111292,results/drift_scale_ablation/best_model_lnn_drift0.001_20260131_004735.pt
