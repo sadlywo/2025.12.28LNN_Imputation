@@ -23,7 +23,14 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
         losses["energy"] = []
     
     pbar = tqdm(loader, desc=f"Epoch {epoch:03d}")
-    for inputs, targets, mask in pbar:
+    for batch in pbar:
+        if len(batch) == 4:
+            inputs, targets, mask, stats = batch
+            stats = stats.to(device)
+        else:
+            inputs, targets, mask = batch
+            stats = None
+
         inputs = inputs.to(device)
         targets = targets.to(device)
         mask = mask.to(device)
@@ -34,7 +41,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
         # 根据模型类型调整前向传播
         if use_physics:
             pred, uncertainty, physics_info = model(inputs)
-            loss, comps = criterion(pred, targets, mask, uncertainty, dt, physics_info)
+            loss, comps = criterion(pred, targets, mask, uncertainty, dt, physics_info, stats=stats)
         else:
             pred, uncertainty = model(inputs)
             loss, comps = criterion(pred, targets, mask, uncertainty, dt)
@@ -69,7 +76,14 @@ def evaluate(model, loader, criterion, device, use_physics=False):
     sample_inputs, sample_targets, sample_preds, sample_masks = None, None, None, None
     
     with torch.no_grad():
-        for batch_idx, (inputs, targets, mask) in enumerate(loader):
+        for batch_idx, batch in enumerate(loader):
+            if len(batch) == 4:
+                inputs, targets, mask, stats = batch
+                stats = stats.to(device)
+            else:
+                inputs, targets, mask = batch
+                stats = None
+
             inputs = inputs.to(device)
             targets = targets.to(device)
             mask = mask.to(device)
@@ -77,7 +91,7 @@ def evaluate(model, loader, criterion, device, use_physics=False):
             
             if use_physics:
                 pred, uncertainty, physics_info = model(inputs)
-                loss, comps = criterion(pred, targets, mask, uncertainty, dt, physics_info)
+                loss, comps = criterion(pred, targets, mask, uncertainty, dt, physics_info, stats=stats)
             else:
                 pred, uncertainty = model(inputs)
                 loss, comps = criterion(pred, targets, mask, uncertainty, dt)

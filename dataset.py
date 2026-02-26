@@ -36,6 +36,7 @@ class CfCIMUDataset(Dataset):
         split_ratio: float = 0.8,
         eval_mode: bool = False,
         drift_scale: float = 0.0,
+        return_stats: bool = False,
     ):
         """
         Args:
@@ -53,6 +54,7 @@ class CfCIMUDataset(Dataset):
         self.missing_mode = missing_mode
         self.eval_mode = eval_mode
         self.drift_scale = drift_scale
+        self.return_stats = return_stats
         
         self.sequences: List[dict] = []
         self._load_all_sequences(split, split_ratio)
@@ -64,7 +66,7 @@ class CfCIMUDataset(Dataset):
     
     def _load_all_sequences(self, split: str, split_ratio: float):
         """Load and split sequences by file (not by window)."""
-        subfolders = ["handbag-1","handbag-2","handheld-1","handheld-2","handheld-3","pocket-1","pocket-2","running","slow walking","trolley","user-1","user-2"]
+        subfolders = ["handbag-1","handbag-2","handheld-1","handheld-2","pocket-1","pocket-2","running","slow walking","trolley","user-2"]
         all_file_pairs = []
         
         for subfolder in subfolders:
@@ -192,6 +194,7 @@ class CfCIMUDataset(Dataset):
             inputs: (seq_len, 13) = [masked_imu(6), mask(6), dt(1)]
             targets: (seq_len, 6) = ground truth IMU
             mask: (seq_len, 6) = 1 for observed, 0 for missing
+            stats (optional): (12,) = [median(6), mad(6)]
         """
         seq = self.sequences[idx]
         target_imu = seq["imu"]  # (seq_len, 6) - Clean target
@@ -235,4 +238,6 @@ class CfCIMUDataset(Dataset):
         # Construct input: [masked_imu(6), mask(6), dt(1)]
         inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1)], dim=-1)
         
+        if self.return_stats:
+            return inputs, target_imu, mask, seq["stats"]
         return inputs, target_imu, mask

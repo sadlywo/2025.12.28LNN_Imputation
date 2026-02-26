@@ -401,6 +401,9 @@ class PhysicsInformedLoss(nn.Module):
         w_smooth: float = 0.1,
         w_physics_integration: float = 0.2,
         w_physics_energy: float = 0.1,
+        use_denorm: bool = False,
+        normalize_physics: bool = False,
+        energy_threshold: float = 20.0,
     ):
         super().__init__()
         self.w_recon = w_recon
@@ -408,6 +411,9 @@ class PhysicsInformedLoss(nn.Module):
         self.w_smooth = w_smooth
         self.w_physics_integration = w_physics_integration
         self.w_physics_energy = w_physics_energy
+        self.use_denorm = use_denorm
+        self.normalize_physics = normalize_physics
+        self.energy_threshold = energy_threshold
     
     def forward(
         self,
@@ -417,6 +423,7 @@ class PhysicsInformedLoss(nn.Module):
         uncertainty: torch.Tensor,
         dt: torch.Tensor,
         physics_info: dict = None,
+        stats: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         计算物理信息增强损失
@@ -441,28 +448,40 @@ class PhysicsInformedLoss(nn.Module):
         
         # 4. 物理约束
         if physics_info is not None:
+            pred_phys = pred
+            target_phys = target
+            if self.use_denorm and stats is not None:
+                median = stats[:, :6].unsqueeze(1)
+                mad = stats[:, 6:].unsqueeze(1)
+                scale = 1.4826 * mad
+                pred_phys = pred * scale + median
+                target_phys = target * scale + median
+
             # 修正: 比较预测的动力学特征(导数)与目标的动力学特征，而不是错误的积分对比
             # 原始代码试图比较积分(角度)与差分(角加速度)，这是量纲不匹配的
             # 新逻辑: 强化动力学一致性，要求预测的变化率与真实变化率一致
             
             # 计算预测的角速度变化率 (近似角加速度)
-            pred_gyro = physics_info['gyro']
+            pred_gyro = pred_phys[:, :, :3]
             pred_gyro_diff = pred_gyro[:, 1:] - pred_gyro[:, :-1]
             pred_gyro_accel = pred_gyro_diff / (dt_expanded + 1e-6)
             
             # 计算目标的角速度变化率
-            target_gyro = target[:, :, :3]
+            target_gyro = target_phys[:, :, :3]
             target_gyro_diff = target_gyro[:, 1:] - target_gyro[:, :-1]
             target_gyro_accel = target_gyro_diff / (dt_expanded + 1e-6)
             
             # 只在观测点计算此损失(或者在全序列计算以利用物理先验)
             # 这里我们选择在全序列计算，作为物理约束
             loss_integration = ((pred_gyro_accel - target_gyro_accel) ** 2).mean()
+            if self.normalize_physics:
+                denom = target_gyro_accel.pow(2).mean()
+                loss_integration = loss_integration / (denom + 1e-6)
             
             # 能量约束: 限制加速度模长
-            acc_pred = physics_info['acc']
+            acc_pred = pred_phys[:, :, 3:]
             acc_magnitude = torch.norm(acc_pred, dim=-1)
-            loss_energy = F.relu(acc_magnitude - 20.0).mean()
+            loss_energy = F.relu(acc_magnitude - self.energy_threshold).mean()
         else:
             loss_integration = torch.tensor(0.0, device=pred.device)
             loss_energy = torch.tensor(0.0, device=pred.device)
