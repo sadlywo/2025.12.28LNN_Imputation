@@ -20,6 +20,8 @@ class PhysicsAwareIMUImputer(nn.Module):
         output_dim: int = 6,
         use_physics_prior: bool = True,
         mixed_memory: bool = True,
+        backbone_layers: int | None = None,
+        backbone_units: int | None = None,
     ):
         super().__init__()
         self.use_physics_prior = use_physics_prior
@@ -35,11 +37,20 @@ class PhysicsAwareIMUImputer(nn.Module):
         # Wiring: total units = hidden_units, output units = cfc_out_dim
         wiring = AutoNCP(hidden_units, self.cfc_out_dim)
         
+        cfc_kwargs = {
+            "batch_first": True,
+            "mixed_memory": mixed_memory,
+        }
+        if backbone_layers is not None or backbone_units is not None:
+            # CfC wired mode (AutoNCP) 不支持 backbone_* 参数
+            # 为保证兼容性，这里直接忽略这两个参数
+            backbone_layers = None
+            backbone_units = None
+
         self.cfc = CfC(
             input_dim,
             wiring,
-            batch_first=True,
-            mixed_memory=mixed_memory,
+            **cfc_kwargs,
         )
         
         # Simple output projection
@@ -272,6 +283,8 @@ class PhysicsInformedIMUImputer(nn.Module):
         use_physics_prior: bool = True,
         mixed_memory: bool = True,
         physics_strength: float = 0.1,
+        backbone_layers: int | None = None,
+        backbone_units: int | None = None,
     ):
         super().__init__()
         self.use_physics_prior = use_physics_prior
@@ -285,11 +298,20 @@ class PhysicsInformedIMUImputer(nn.Module):
             self.cfc_out_dim = max(hidden_units - 2, 1)
         
         wiring = AutoNCP(hidden_units, self.cfc_out_dim)
+        cfc_kwargs = {
+            "batch_first": True,
+            "mixed_memory": mixed_memory,
+        }
+        if backbone_layers is not None or backbone_units is not None:
+            # CfC wired mode (AutoNCP) 不支持 backbone_* 参数
+            # 为保证兼容性，这里直接忽略这两个参数
+            backbone_layers = None
+            backbone_units = None
+
         self.cfc = CfC(
             input_dim,
             wiring,
-            batch_first=True,
-            mixed_memory=mixed_memory,
+            **cfc_kwargs,
         )
         
         # 分离的物理头

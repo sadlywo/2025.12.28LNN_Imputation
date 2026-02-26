@@ -37,13 +37,6 @@ def _sync(device: torch.device):
         torch.cuda.synchronize(device)
 
 
-def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> Tuple[float, float]:
-    mse_all = F.mse_loss(pred, target).item()
-    missing_err = ((pred - target) ** 2 * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
-    mse_masked = missing_err.item()
-    return mse_all, mse_masked
-
-
 def _compute_target_mean(train_loader, device: torch.device, max_batches: Optional[int] = None) -> torch.Tensor:
     total = torch.zeros(6, device=device)
     count = 0
@@ -137,56 +130,6 @@ def _save_method_excel(
             df_config.to_excel(writer, index=False, sheet_name=_safe_sheet_name("config"))
     except Exception as e:
         print(f"[Warning] Per-method Excel export failed ({method}): {e}")
-
-
-def locf_impute_sequence(x_masked: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    x = x_masked.clone()
-    t_len, channels = x.shape
-    for c in range(channels):
-        last = None
-        for t in range(t_len):
-            if mask[t, c] > 0.5:
-                last = x[t, c].item()
-            else:
-                if last is None:
-                    pass
-                else:
-                    x[t, c] = last
-    return x
-
-
-def knn_impute_sequence(x_masked: torch.Tensor, mask: torch.Tensor, k: int = 5) -> torch.Tensor:
-    x = x_masked.clone()
-    t_len, channels = x.shape
-
-    for t in range(t_len):
-        for c in range(channels):
-            if mask[t, c] > 0.5:
-                continue
-
-            candidates = []
-            for s in range(t_len):
-                if mask[s, c] < 0.5:
-                    continue
-
-                common = (mask[t] > 0.5) & (mask[s] > 0.5)
-                if common.sum().item() == 0:
-                    continue
-
-                dist = torch.norm(x[t, common] - x[s, common], p=2).item()
-                candidates.append((dist, x[s, c].item()))
-
-            if not candidates:
-                observed = x_masked[mask[:, c] > 0.5, c]
-                if observed.numel() > 0:
-                    x[t, c] = observed.mean()
-                continue
-
-            candidates.sort(key=lambda z: z[0])
-            top = candidates[:k]
-            x[t, c] = float(np.mean([v for _d, v in top]))
-
-    return x
 
 
 class GRUDImputer(nn.Module):
@@ -300,57 +243,20 @@ class MethodResult:
     param_size_mb: Optional[float]
 
 
-def _evaluate_classical(
-    val_loader,
-    imputer: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    device: torch.device,
-    max_batches: Optional[int] = None,
-    desc: str = "Classical",
-) -> Tuple[float, float, int]:
-    mse_all_list: List[float] = []
-    mse_masked_list: List[float] = []
-    batches = 0
-
-    pbar = tqdm(val_loader, desc=desc)
-    for inputs, targets, mask in pbar:
-        batches += 1
-        if max_batches is not None and batches > max_batches:
-            break
-
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        mask = mask.to(device)
-        x_masked = inputs[:, :, :6]
-
-        preds = []
-        for i in range(x_masked.shape[0]):
-            pred_i = imputer(x_masked[i], mask[i])
-            preds.append(pred_i.unsqueeze(0))
-        pred = torch.cat(preds, dim=0)
-
-        a, m = _masked_mse(pred, targets, mask)
-        mse_all_list.append(a)
-        mse_masked_list.append(m)
-
-    return float(np.mean(mse_all_list)), float(np.mean(mse_masked_list)), batches
-
-
 def run_comparison():
     config = {
         "root_dir": "Oxford Dataset",
-        "seq_len": 50,
+        "seq_len": 100,
         "mask_rate": 0.3,
         "missing_mode": "random",
-        "batch_size": 16,
+        "batch_size": 32,
         "epochs": 30,
         "lr": 1e-3,
-        "hidden_units": 128,
+        "hidden_units": 64,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "output_dir": "results/recon_only_method_comparison",
         "num_workers": 4,
-        "seed": 42,
-        "classical_max_val_batches": None,
-        "knn_k": 5,
+        "seed": 2026,
         "transformer_nhead": 4,
         "transformer_nlayers": 2,
         "gain_noise_scale": 0.1,
@@ -380,7 +286,7 @@ def run_comparison():
         missing_mode=config["missing_mode"],
         split="train",
         eval_mode=False,
-        drift_scale=0.01,
+        drift_scale=0.00,
     )
     val_ds = CfCIMUDataset(
         root_dir=config["root_dir"],
@@ -417,69 +323,11 @@ def run_comparison():
         ("GAIN", lambda: GAINImputer(input_dim=13, hidden_dim=config["hidden_units"], output_dim=6, noise_scale=config["gain_noise_scale"])),
     ]
 
-    classical_methods: List[Tuple[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]] = [
-        ("LOCF", lambda x, m: locf_impute_sequence(x, m)),
-        ("KNN", lambda x, m: knn_impute_sequence(x, m, k=config["knn_k"])),
-    ]
-
     results: List[MethodResult] = []
     per_method_histories: Dict[str, dict] = {}
     method_param_rows: List[dict] = []
 
     criterion = ReconstructionOnlyLoss(w_recon=1.0)
-
-    for name, imputer in classical_methods:
-        print(f"\nRunning classical method: {name}")
-        start = time.time()
-        a, m, batches = _evaluate_classical(
-            val_loader,
-            imputer=imputer,
-            device=device,
-            max_batches=config["classical_max_val_batches"],
-            desc=f"Eval {name}",
-        )
-        elapsed = time.time() - start
-
-        results.append(
-            MethodResult(
-                method=name,
-                kind=f"classical(batches={batches})",
-                mse_all=a,
-                mse_masked=m,
-                train_time_sec=0.0,
-                inference_time_sec=float(elapsed),
-                num_params=None,
-                param_size_mb=None,
-            )
-        )
-        classical_params = {
-            "method": name,
-            "category": "classical",
-            "seq_len": config["seq_len"],
-            "mask_rate": config["mask_rate"],
-            "missing_mode": config["missing_mode"],
-            "classical_max_val_batches": config["classical_max_val_batches"],
-            "knn_k": config["knn_k"] if name == "KNN" else np.nan,
-        }
-        method_param_rows.append(classical_params)
-        _save_method_excel(
-            output_path,
-            method=name,
-            timestamp=timestamp,
-            config=config,
-            metrics={
-                "method": name,
-                "kind": f"classical(batches={batches})",
-                "mse_all": float(a),
-                "mse_masked": float(m),
-                "train_time_sec": 0.0,
-                "inference_time_sec": float(elapsed),
-                "num_params": None,
-                "param_size_mb": None,
-            },
-            method_params=classical_params,
-            history=None,
-        )
 
     for name, model_factory in deep_methods:
         print(f"\nTraining deep model: {name}")
