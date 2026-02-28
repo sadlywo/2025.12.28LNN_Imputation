@@ -6,6 +6,7 @@ Compares:
 2. LSTM-only (long-term bidirectional LSTM)
 3. Hybrid (learned gating fusion)
 4. Hybrid + RMSE reweight (post-hoc RMSE-based fusion on validation)
+5. Light full-sequence loss variants
 
 Outputs:
 - CSV summary with MSE metrics, parameter counts, and timing
@@ -31,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataset import CfCIMUDataset
+from dataset import CfCIMUDataset, compute_ate, compute_relative_trajectory_error
 from models import ReconstructionOnlyLoss
 from models_hybrid import (
     ShortTermLNN,
@@ -65,6 +66,29 @@ def _state_dict_size_mb(model: nn.Module) -> float:
     for v in model.state_dict().values():
         total += v.nelement() * v.element_size()
     return total / (1024 * 1024)
+
+
+class LightAllLoss(nn.Module):
+    """Lightweight full-sequence loss: missing MSE + lambda * full MSE."""
+
+    def __init__(self, w_recon: float = 1.0, w_all: float = 0.1):
+        super().__init__()
+        self.w_recon = w_recon
+        self.w_all = w_all
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        uncertainty: torch.Tensor = None,
+        dt: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        missing = ((pred - target) ** 2 * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
+        full = F.mse_loss(pred, target)
+        total = self.w_recon * missing + self.w_all * full
+        components = {"recon": missing.item(), "all": full.item()}
+        return total, components
 
 
 def _measure_inference_time(
@@ -106,11 +130,12 @@ def _train_model(
     config: dict,
     output_path: Path,
     timestamp: str,
+    criterion: nn.Module | None = None,
 ) -> Tuple[dict, dict, float]:
     """
     Train a model with standard loop, returning history, best eval metrics, and train time.
     """
-    criterion = ReconstructionOnlyLoss(w_recon=1.0)
+    criterion = criterion or ReconstructionOnlyLoss(w_recon=1.0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -225,6 +250,151 @@ def _evaluate_rmse_fusion(
     }
 
 
+def _evaluate_ate_rmse_fusion(
+    lnn_model: nn.Module,
+    lstm_model: nn.Module,
+    ate_loader,
+    device: torch.device,
+) -> Dict[str, float]:
+    """
+    Evaluate ATE for RMSE-based post-hoc fusion.
+    """
+    lnn_model.eval()
+    lstm_model.eval()
+    
+    all_ate = []
+    all_max_drift = []
+    all_axis_errors = []
+    
+    with torch.no_grad():
+        for batch in ate_loader:
+            if len(batch) < 5:
+                continue
+                
+            inputs, targets, mask, stats, vicon = batch
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            mask = mask.to(device)
+            stats = stats.to(device)
+            vicon = vicon.to(device)
+            
+            # Get predictions from both models
+            lnn_pred, _ = lnn_model(inputs)
+            lstm_pred, _ = lstm_model(inputs)
+            
+            # RMSE-based fusion
+            fused, _, _ = rmse_based_reweight(lnn_pred, lstm_pred, targets, mask)
+            
+            # Extract dt
+            dt = inputs[:, :, -1]
+            
+            try:
+                ate_result = compute_ate(
+                    pred_acc=fused,
+                    gt_pos=vicon,
+                    dt=dt,
+                    stats=stats,
+                    acc_indices=(3, 4, 5),
+                )
+                all_ate.append(ate_result["ate"])
+                all_max_drift.append(ate_result["max_drift"])
+                all_axis_errors.append(ate_result["ate_per_axis"])
+            except Exception as e:
+                print(f"[Warning] RMSE fusion ATE computation failed: {e}")
+                continue
+    
+    if len(all_ate) == 0:
+        return {"ate": float("nan"), "max_drift": float("nan"), "ate_x": float("nan"), "ate_y": float("nan"), "ate_z": float("nan")}
+    
+    return {
+        "ate": float(np.mean(all_ate)),
+        "max_drift": float(np.mean(all_max_drift)),
+        "ate_x": float(np.mean([e[0] for e in all_axis_errors])),
+        "ate_y": float(np.mean([e[1] for e in all_axis_errors])),
+        "ate_z": float(np.mean([e[2] for e in all_axis_errors])),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ATE (Absolute Trajectory Error) evaluation
+# ---------------------------------------------------------------------------
+
+def _evaluate_ate(
+    model: nn.Module,
+    ate_loader,
+    device: torch.device,
+    use_denorm: bool = True,
+) -> Dict[str, float]:
+    """
+    Evaluate Absolute Trajectory Error by integrating predicted acceleration.
+    
+    Args:
+        model: Trained imputation model
+        ate_loader: DataLoader with return_vicon=True, return_stats=True
+        device: Computation device
+        use_denorm: Whether to denormalize acceleration before integration
+    
+    Returns:
+        dict with ATE metrics (mean, per_axis, max_drift)
+    """
+    model.eval()
+    
+    all_ate = []
+    all_max_drift = []
+    all_axis_errors = []
+    
+    with torch.no_grad():
+        for batch in ate_loader:
+            # batch: (inputs, targets, mask, stats, vicon)
+            if len(batch) < 5:
+                print("[Warning] ATE loader missing vicon data, skipping batch")
+                continue
+                
+            inputs, targets, mask, stats, vicon = batch
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            stats = stats.to(device) if use_denorm else None
+            vicon = vicon.to(device)
+            
+            # Get model predictions
+            out = model(inputs)
+            pred = out[0] if isinstance(out, (tuple, list)) else out
+            
+            # Extract dt from inputs (last channel)
+            dt = inputs[:, :, -1]  # (batch, seq_len)
+            
+            # Compute ATE
+            try:
+                ate_result = compute_ate(
+                    pred_acc=pred,
+                    gt_pos=vicon,
+                    dt=dt,
+                    stats=stats,
+                    acc_indices=(3, 4, 5),  # user_acc indices
+                )
+                all_ate.append(ate_result["ate"])
+                all_max_drift.append(ate_result["max_drift"])
+                all_axis_errors.append(ate_result["ate_per_axis"])
+            except Exception as e:
+                print(f"[Warning] ATE computation failed: {e}")
+                continue
+    
+    if len(all_ate) == 0:
+        return {"ate": float("nan"), "max_drift": float("nan"), "ate_x": float("nan"), "ate_y": float("nan"), "ate_z": float("nan")}
+    
+    mean_ate = float(np.mean(all_ate))
+    mean_max_drift = float(np.mean(all_max_drift))
+    mean_axis = np.mean(all_axis_errors, axis=0)
+    
+    return {
+        "ate": mean_ate,
+        "max_drift": mean_max_drift,
+        "ate_x": float(mean_axis[0]),
+        "ate_y": float(mean_axis[1]),
+        "ate_z": float(mean_axis[2]),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Gate analysis
 # ---------------------------------------------------------------------------
@@ -312,10 +482,11 @@ def _plot_comparison(
 
     models = summary_df["model"].tolist()
     x = np.arange(len(models))
+    colors = plt.cm.tab10(np.linspace(0, 1, max(3, len(models))))
 
     # MSE masked
     ax = axes[0]
-    bars = ax.bar(x, summary_df["best_val_mse_masked"], color=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"])
+    bars = ax.bar(x, summary_df["best_val_mse_masked"], color=colors[:len(models)])
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=15, ha="right")
     ax.set_ylabel("MSE (masked)")
@@ -327,7 +498,7 @@ def _plot_comparison(
 
     # MSE all
     ax = axes[1]
-    bars = ax.bar(x, summary_df["best_val_mse_all"], color=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"])
+    bars = ax.bar(x, summary_df["best_val_mse_all"], color=colors[:len(models)])
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=15, ha="right")
     ax.set_ylabel("MSE (all)")
@@ -340,7 +511,7 @@ def _plot_comparison(
     # Parameters
     ax = axes[2]
     params = summary_df["num_params"].tolist()
-    bars = ax.bar(x, params, color=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"])
+    bars = ax.bar(x, params, color=colors[:len(models)])
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=15, ha="right")
     ax.set_ylabel("Parameters")
@@ -469,6 +640,20 @@ def run_hybrid_experiment(
         eval_mode=True,
         drift_scale=0.0,
     )
+    
+    # ATE evaluation dataset (with Vicon ground truth)
+    ate_ds = CfCIMUDataset(
+        root_dir=config["root_dir"],
+        seq_len=config["seq_len"],
+        mask_rate=config["mask_rate"],
+        missing_mode=config["missing_mode"],
+        split="val",
+        eval_mode=True,
+        drift_scale=0.0,
+        return_stats=True,
+        return_vicon=True,
+    )
+    
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=config["batch_size"],
@@ -483,39 +668,97 @@ def run_hybrid_experiment(
         num_workers=config["num_workers"],
         pin_memory=True if device.type == "cuda" else False,
     )
+    
+    ate_loader = torch.utils.data.DataLoader(
+        ate_ds,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=True if device.type == "cuda" else False,
+    )
 
     print(f"\nTrain samples: {len(train_ds)}, Val samples: {len(val_ds)}")
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    print(f"ATE eval samples: {len(ate_ds)}")
 
     # ----- Models -----
     models_to_train = {
-        "LNN_only": ShortTermLNN(
-            input_dim=13,
-            hidden_units=config["lnn_hidden"],
-            output_dim=6,
-        ),
-        "LSTM_only": LongTermLSTM(
-            input_dim=13,
-            hidden_dim=config["lstm_hidden"],
-            output_dim=6,
-            num_layers=config["lstm_layers"],
-        ),
-        "Hybrid_LNN_LSTM": HybridLNNLSTM(
-            input_dim=13,
-            lnn_hidden=config["lnn_hidden"],
-            lstm_hidden=config["lstm_hidden"],
-            output_dim=6,
-            lstm_layers=config["lstm_layers"],
-            fusion_mode="learned",
-        ),
+        "LNN_only": {
+            "model": ShortTermLNN(
+                input_dim=13,
+                hidden_units=config["lnn_hidden"],
+                output_dim=6,
+            ),
+            "criterion": ReconstructionOnlyLoss(w_recon=1.0),
+        },
+        "LSTM_only": {
+            "model": LongTermLSTM(
+                input_dim=13,
+                hidden_dim=config["lstm_hidden"],
+                output_dim=6,
+                num_layers=config["lstm_layers"],
+            ),
+            "criterion": ReconstructionOnlyLoss(w_recon=1.0),
+        },
+        "Hybrid_LNN_LSTM": {
+            "model": HybridLNNLSTM(
+                input_dim=13,
+                lnn_hidden=config["lnn_hidden"],
+                lstm_hidden=config["lstm_hidden"],
+                output_dim=6,
+                lstm_layers=config["lstm_layers"],
+                fusion_mode="learned",
+            ),
+            "criterion": ReconstructionOnlyLoss(w_recon=1.0),
+        },
+        "Hybrid_LNN_LSTM_Uncertainty": {
+            "model": HybridLNNLSTM(
+                input_dim=13,
+                lnn_hidden=config["lnn_hidden"],
+                lstm_hidden=config["lstm_hidden"],
+                output_dim=6,
+                lstm_layers=config["lstm_layers"],
+                fusion_mode="uncertainty",
+            ),
+            "criterion": ReconstructionOnlyLoss(w_recon=1.0),
+        },
+        "LNN_only_LightAll": {
+            "model": ShortTermLNN(
+                input_dim=13,
+                hidden_units=config["lnn_hidden"],
+                output_dim=6,
+            ),
+            "criterion": LightAllLoss(w_recon=1.0, w_all=0.1),
+        },
+        "LSTM_only_LightAll": {
+            "model": LongTermLSTM(
+                input_dim=13,
+                hidden_dim=config["lstm_hidden"],
+                output_dim=6,
+                num_layers=config["lstm_layers"],
+            ),
+            "criterion": LightAllLoss(w_recon=1.0, w_all=0.1),
+        },
+        "Hybrid_LNN_LSTM_LightAll": {
+            "model": HybridLNNLSTM(
+                input_dim=13,
+                lnn_hidden=config["lnn_hidden"],
+                lstm_hidden=config["lstm_hidden"],
+                output_dim=6,
+                lstm_layers=config["lstm_layers"],
+                fusion_mode="learned",
+            ),
+            "criterion": LightAllLoss(w_recon=1.0, w_all=0.1),
+        },
     }
 
     summary_rows: List[dict] = []
     history_rows: List[dict] = []
     all_histories: Dict[str, dict] = {}
 
-    for model_name, model in models_to_train.items():
-        model = model.to(device)
+    for model_name, payload in models_to_train.items():
+        model = payload["model"].to(device)
+        criterion = payload["criterion"]
         num_params = count_parameters(model)
         size_mb = _state_dict_size_mb(model)
 
@@ -534,6 +777,7 @@ def run_hybrid_experiment(
             config=config,
             output_path=output_path,
             timestamp=timestamp,
+            criterion=criterion,
         )
         all_histories[model_name] = history
 
@@ -541,6 +785,9 @@ def run_hybrid_experiment(
         infer_time, infer_batches, infer_samples = _measure_inference_time(
             model, val_loader, device
         )
+        
+        # ATE evaluation
+        ate_metrics = _evaluate_ate(model, ate_loader, device, use_denorm=True)
 
         # Save history rows
         for epoch_idx in range(len(history["train_loss"])):
@@ -561,6 +808,11 @@ def run_hybrid_experiment(
             "best_val_loss": best_metrics["best_val_loss"],
             "best_val_mse_all": best_metrics["best_val_mse_all"],
             "best_val_mse_masked": best_metrics["best_val_mse_masked"],
+            "ate": ate_metrics["ate"],
+            "ate_max_drift": ate_metrics["max_drift"],
+            "ate_x": ate_metrics["ate_x"],
+            "ate_y": ate_metrics["ate_y"],
+            "ate_z": ate_metrics["ate_z"],
             "train_time_sec": round(train_time, 2),
             "inference_time_sec": round(infer_time, 4),
             "inference_ms_per_sample": round(1000.0 * infer_time / max(infer_samples, 1), 4),
@@ -570,6 +822,8 @@ def run_hybrid_experiment(
         print(f"  Best epoch:          {best_metrics['best_epoch']}")
         print(f"  Best val MSE(masked): {best_metrics['best_val_mse_masked']:.6f}")
         print(f"  Best val MSE(all):    {best_metrics['best_val_mse_all']:.6f}")
+        print(f"  ATE (trajectory):     {ate_metrics['ate']:.4f} m")
+        print(f"  ATE max drift:        {ate_metrics['max_drift']:.4f} m")
         print(f"  Train time:          {train_time:.1f}s")
         print(f"  Inference:           {1000.0 * infer_time / max(infer_batches, 1):.3f} ms/batch")
 
@@ -578,8 +832,8 @@ def run_hybrid_experiment(
     print("Evaluating RMSE-based post-hoc fusion (LNN + LSTM)")
     print(f"{'=' * 80}")
 
-    lnn_model = models_to_train["LNN_only"].to(device)
-    lstm_model = models_to_train["LSTM_only"].to(device)
+    lnn_model = models_to_train["LNN_only"]["model"].to(device)
+    lstm_model = models_to_train["LSTM_only"]["model"].to(device)
 
     # Load best weights
     lnn_model.load_state_dict(
@@ -590,6 +844,9 @@ def run_hybrid_experiment(
     )
 
     rmse_results = _evaluate_rmse_fusion(lnn_model, lstm_model, val_loader, device)
+    
+    # ATE for RMSE fusion
+    rmse_ate_metrics = _evaluate_ate_rmse_fusion(lnn_model, lstm_model, ate_loader, device)
 
     summary_rows.append({
         "model": "RMSE_Fusion(LNN+LSTM)",
@@ -599,6 +856,11 @@ def run_hybrid_experiment(
         "best_val_loss": "-",
         "best_val_mse_all": rmse_results["mse_all"],
         "best_val_mse_masked": rmse_results["mse_masked"],
+        "ate": rmse_ate_metrics["ate"],
+        "ate_max_drift": rmse_ate_metrics["max_drift"],
+        "ate_x": rmse_ate_metrics["ate_x"],
+        "ate_y": rmse_ate_metrics["ate_y"],
+        "ate_z": rmse_ate_metrics["ate_z"],
         "train_time_sec": "-",
         "inference_time_sec": "-",
         "inference_ms_per_sample": "-",
@@ -606,6 +868,7 @@ def run_hybrid_experiment(
 
     print(f"  RMSE Fusion MSE(masked): {rmse_results['mse_masked']:.6f}")
     print(f"  RMSE Fusion MSE(all):    {rmse_results['mse_all']:.6f}")
+    print(f"  RMSE Fusion ATE:         {rmse_ate_metrics['ate']:.4f} m")
     print(f"  Avg w_LNN:               {rmse_results['avg_w_lnn']:.4f}")
     print(f"  Avg w_LSTM:              {rmse_results['avg_w_lstm']:.4f}")
 
@@ -614,7 +877,7 @@ def run_hybrid_experiment(
     print("Analyzing learned gate (Hybrid model)")
     print(f"{'=' * 80}")
 
-    hybrid_model = models_to_train["Hybrid_LNN_LSTM"].to(device)
+    hybrid_model = models_to_train["Hybrid_LNN_LSTM"]["model"].to(device)
     hybrid_model.load_state_dict(
         torch.load(output_path / f"best_model_Hybrid_LNN_LSTM_{timestamp}.pt", map_location=device)
     )
