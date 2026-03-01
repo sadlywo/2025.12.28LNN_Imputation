@@ -40,8 +40,9 @@ def plot_training_curves(history: dict, save_path: str = "training_curves.png"):
     axes[0, 1].legend(fontsize=11)
     axes[0, 1].grid(True, alpha=0.3)
     
-    # 3. MSE (Masked only)
-    axes[1, 0].plot(epochs, history['val_mse_masked'], 'm-', label='MSE (Masked)', linewidth=2)
+    # 3. MSE (Masked/Missing only)
+    mse_missing_key = 'val_mse_missing' if 'val_mse_missing' in history else 'val_mse_masked'
+    axes[1, 0].plot(epochs, history[mse_missing_key], 'm-', label='MSE (Missing)', linewidth=2)
     axes[1, 0].set_xlabel('Epoch', fontsize=12)
     axes[1, 0].set_ylabel('MSE', fontsize=12)
     axes[1, 0].set_title('MSE (Missing Positions)', fontsize=14, fontweight='bold')
@@ -51,7 +52,7 @@ def plot_training_curves(history: dict, save_path: str = "training_curves.png"):
     # 4. Loss comparison
     axes[1, 1].plot(epochs, history['train_loss'], 'b-', label='Train', alpha=0.7, linewidth=2)
     axes[1, 1].plot(epochs, history['val_loss'], 'r-', label='Val', alpha=0.7, linewidth=2)
-    axes[1, 1].plot(epochs, history['val_mse_masked'], 'g-', label='MSE(Masked)', alpha=0.7, linewidth=2)
+    axes[1, 1].plot(epochs, history[mse_missing_key], 'g-', label='MSE(Missing)', alpha=0.7, linewidth=2)
     axes[1, 1].set_xlabel('Epoch', fontsize=12)
     axes[1, 1].set_ylabel('Value', fontsize=12)
     axes[1, 1].set_title('Overall Metrics', fontsize=14, fontweight='bold')

@@ -95,7 +95,7 @@ def run_dim_ablation():
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "output_dir": "results/dim_ablation_lnn",
         "num_workers": 4,
-        "drift_scale": 0.01,
+        "drift_scale": 0.00,
         "seed": 42,
     }
 

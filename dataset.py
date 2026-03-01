@@ -38,6 +38,7 @@ class CfCIMUDataset(Dataset):
         missing_mode: str = "random",
         split: str = "train",
         split_ratio: float = 0.8,
+        val_ratio: float = 0.1,
         eval_mode: bool = False,
         drift_scale: float = 0.0,
         return_stats: bool = False,
@@ -69,6 +70,8 @@ class CfCIMUDataset(Dataset):
         self.use_gravity = use_gravity
         self.use_attitude = use_attitude
         self.return_vicon = return_vicon
+        self.split_ratio = split_ratio
+        self.val_ratio = val_ratio
         
         # Calculate feature dimensions
         # Base: gyro(3) + acc(3) = 6
@@ -79,11 +82,12 @@ class CfCIMUDataset(Dataset):
         if use_attitude:
             self.extra_dim += 3
         self.feature_dim = self.base_dim + self.extra_dim
-        # Input dim: feature_dim + mask(feature_dim) + dt(1) = feature_dim * 2 + 1
-        self.input_dim = self.feature_dim * 2 + 1
+        self.window_feat_dim = 12  # a_abs_mean(3), w_abs_mean(3), a_diff_energy(3), w_diff_energy(3)
+        # Input dim: feature_dim + mask(feature_dim) + dt(1) + window_feat_dim
+        self.input_dim = self.feature_dim * 2 + 1 + self.window_feat_dim
         
         self.sequences: List[dict] = []
-        self._load_all_sequences(split, split_ratio)
+        self._load_all_sequences(split, split_ratio, val_ratio)
         
         if len(self.sequences) == 0:
             raise ValueError(f"No sequences loaded for split={split}")
@@ -92,7 +96,7 @@ class CfCIMUDataset(Dataset):
         print(f"[Dataset] Feature dim: {self.feature_dim} (base=6, gravity={use_gravity}, attitude={use_attitude})")
         print(f"[Dataset] Input dim: {self.input_dim}")
     
-    def _load_all_sequences(self, split: str, split_ratio: float):
+    def _load_all_sequences(self, split: str, split_ratio: float, val_ratio: float):
         """Load and split sequences by file (not by window)."""
         subfolders = ["handbag-1","handbag-2","handheld-1","handheld-2","pocket-1","pocket-2","running","slow walking","trolley","user-2"]
         all_file_pairs = []
@@ -116,11 +120,17 @@ class CfCIMUDataset(Dataset):
         # Split by file to avoid data leakage
         n_files = len(all_file_pairs)
         n_train = int(n_files * split_ratio)
+        n_val = int(n_files * val_ratio)
+        n_test = max(n_files - n_train - n_val, 0)
         
         if split == "train":
             file_pairs = all_file_pairs[:n_train]
+        elif split == "val":
+            file_pairs = all_file_pairs[n_train:n_train + n_val]
+        elif split == "test":
+            file_pairs = all_file_pairs[n_train + n_val:]
         else:
-            file_pairs = all_file_pairs[n_train:]
+            raise ValueError(f"Unknown split: {split}")
         
         print(f"[Dataset] Processing {len(file_pairs)} file pairs for {split}...")
         for imu_path, vi_path in file_pairs:
@@ -326,9 +336,30 @@ class CfCIMUDataset(Dataset):
             torch.set_rng_state(rng_state)  # Restore RNG state
         
         imu_masked = input_imu * mask
+
+        # Window-level features (shared across the sequence)
+        gyro = target_imu[:, :3]
+        acc = target_imu[:, 3:6]
+        acc_abs_mean = acc.abs().mean(dim=0)
+        gyro_abs_mean = gyro.abs().mean(dim=0)
+
+        acc_diff = acc[1:] - acc[:-1]
+        gyro_diff = gyro[1:] - gyro[:-1]
+        if acc_diff.numel() > 0:
+            acc_diff_energy = (acc_diff.pow(2).mean(dim=0))
+            gyro_diff_energy = (gyro_diff.pow(2).mean(dim=0))
+        else:
+            acc_diff_energy = torch.zeros(3, dtype=target_imu.dtype)
+            gyro_diff_energy = torch.zeros(3, dtype=target_imu.dtype)
+
+        window_feat_values = torch.cat(
+            [acc_abs_mean, gyro_abs_mean, acc_diff_energy, gyro_diff_energy],
+            dim=0,
+        )
+        window_feats = window_feat_values.unsqueeze(0).repeat(self.seq_len, 1)
         
-        # Construct input: [masked_imu(feature_dim), mask(feature_dim), dt(1)]
-        inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1)], dim=-1)
+        # Construct input: [masked_imu(feature_dim), mask(feature_dim), dt(1), window_features(4)]
+        inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1), window_feats], dim=-1)
         
         # Build return tuple based on options
         result = [inputs, target_imu, mask]
@@ -376,9 +407,14 @@ def compute_ate(
     """
     batch_size, seq_len, feature_dim = pred_acc.shape
     device = pred_acc.device
+
+    # Sanitize inputs to avoid NaNs/inf propagating into ATE
+    pred_acc = torch.nan_to_num(pred_acc, nan=0.0, posinf=0.0, neginf=0.0)
+    dt = torch.nan_to_num(dt, nan=1e-2, posinf=1.0, neginf=1e-2)
     
     # Extract acceleration (indices 3, 4, 5 for user_acc by default)
     acc = pred_acc[:, :, list(acc_indices)]  # (batch, seq_len, 3)
+    acc = torch.nan_to_num(acc, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Denormalize if stats provided
     if stats is not None:
@@ -386,11 +422,14 @@ def compute_ate(
         half = stats.shape[-1] // 2
         median = stats[:, list(acc_indices)].unsqueeze(1)  # (batch, 1, 3)
         mad = stats[:, [i + half for i in acc_indices]].unsqueeze(1)  # (batch, 1, 3)
+        median = torch.nan_to_num(median, nan=0.0, posinf=0.0, neginf=0.0)
+        mad = torch.nan_to_num(mad, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=1e-6)
         acc = acc * (1.4826 * mad) + median  # Reverse MAD normalization
     
     # Extract ground truth position (first 3 dims if 7-dim)
     if gt_pos.shape[-1] == 7:
         gt_pos = gt_pos[:, :, :3]
+    gt_pos = torch.nan_to_num(gt_pos, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Initialize velocity and position
     if initial_vel is None:
@@ -423,7 +462,7 @@ def compute_ate(
         pred_pos[:, t, :] = pred_pos[:, t-1, :] + vel_avg * dt_t
     
     # Compute position errors
-    pos_error = pred_pos - gt_pos  # (batch, seq_len, 3)
+    pos_error = torch.nan_to_num(pred_pos - gt_pos, nan=0.0, posinf=0.0, neginf=0.0)  # (batch, seq_len, 3)
     
     # ATE: RMSE of position errors
     ate_per_sample = torch.sqrt((pos_error ** 2).sum(dim=-1))  # (batch, seq_len)

@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ncps.torch import CfC
-from ncps.wirings import AutoNCP
 from typing import Tuple, Dict
 
 
@@ -31,13 +30,14 @@ class ShortTermLNN(nn.Module):
         super().__init__()
         self.hidden_units = hidden_units
 
-        # CfC backbone — good at capturing continuous-time ODE dynamics
-        self.cfc_out_dim = max(hidden_units // 2, 4)
-        if self.cfc_out_dim > hidden_units - 2:
-            self.cfc_out_dim = max(hidden_units - 2, 1)
-
-        wiring = AutoNCP(hidden_units, self.cfc_out_dim)
-        self.cfc = CfC(input_dim, wiring, batch_first=True, mixed_memory=mixed_memory)
+        # CfC backbone — fully connected wiring
+        self.cfc_out_dim = hidden_units
+        self.cfc = CfC(
+            input_dim,
+            hidden_units,
+            batch_first=True,
+            mixed_memory=mixed_memory,
+        )
 
         # Physics-aware dual heads
         self.gyro_head = nn.Sequential(
@@ -82,7 +82,7 @@ class LongTermLSTM(nn.Module):
     def __init__(
         self,
         input_dim: int = 13,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
         output_dim: int = 6,
         num_layers: int = 2,
         dropout: float = 0.1,
@@ -144,7 +144,7 @@ class HybridLNNLSTM(nn.Module):
         self,
         input_dim: int = 13,
         lnn_hidden: int = 64,
-        lstm_hidden: int = 128,
+        lstm_hidden: int = 64,
         output_dim: int = 6,
         lstm_layers: int = 2,
         lstm_dropout: float = 0.1,
@@ -172,11 +172,9 @@ class HybridLNNLSTM(nn.Module):
         # Input: lnn_pred(6) + lstm_pred(6) + lnn_unc(6) + lstm_unc(6) + original_input(13) = 37
         gate_input_dim = output_dim * 4 + input_dim
         self.gate_net = nn.Sequential(
-            nn.Linear(gate_input_dim, 64),
+            nn.Linear(gate_input_dim, 16),
             nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, output_dim),
+            nn.Linear(16, output_dim),
             nn.Sigmoid(),  # Output in [0, 1]: weight for LNN
         )
 
@@ -187,7 +185,10 @@ class HybridLNNLSTM(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor
+        self,
+        x: torch.Tensor,
+        target: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -199,9 +200,20 @@ class HybridLNNLSTM(nn.Module):
         lnn_pred, lnn_unc = self.lnn(x)        # (B, T, 6), (B, T, 6)
         lstm_pred, lstm_unc = self.lstm(x)      # (B, T, 6), (B, T, 6)
 
+        if self.fusion_mode == "rmse" and target is not None and mask is not None:
+            pred, w_lnn, w_lstm = rmse_based_reweight(
+                lnn_pred,
+                lstm_pred,
+                target,
+                mask,
+            )
+            unc = w_lnn * lnn_unc + w_lstm * lstm_unc
+            return pred, unc
         if self.fusion_mode == "learned":
             gate_input = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
             gate = self.gate_net(gate_input)  # (B, T, 6) in [0, 1]
+            gate = gate.mean(dim=1, keepdim=True)  # window-level weight
+            gate = gate.expand(-1, lnn_pred.shape[1], -1)
         elif self.fusion_mode == "uncertainty":
             # Inverse uncertainty weighting
             lnn_w = 1.0 / (lnn_unc + 1e-6)
@@ -229,6 +241,8 @@ class HybridLNNLSTM(nn.Module):
 
         gate_input = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
         gate = self.gate_net(gate_input)
+        gate = gate.mean(dim=1, keepdim=True)  # window-level weight
+        gate = gate.expand(-1, lnn_pred.shape[1], -1)
 
         pred = gate * lnn_pred + (1.0 - gate) * lstm_pred
         unc = self.combined_uncertainty(torch.cat([lnn_unc, lstm_unc], dim=-1))
