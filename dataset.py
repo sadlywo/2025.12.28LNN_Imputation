@@ -44,6 +44,7 @@ class CfCIMUDataset(Dataset):
         return_stats: bool = False,
         use_gravity: bool = False,
         use_attitude: bool = False,
+        include_window_features: bool = True,
         return_vicon: bool = False,
     ):
         """
@@ -58,6 +59,7 @@ class CfCIMUDataset(Dataset):
             return_stats: If True, return normalization stats for denormalization
             use_gravity: If True, include gravity vector (3 dims) in input features
             use_attitude: If True, include attitude (roll/pitch/yaw) (3 dims) in input features
+            include_window_features: If True, append window-level statistics features
             return_vicon: If True, return Vicon ground truth (position + quaternion) for ATE computation
         """
         self.root_dir = root_dir
@@ -69,6 +71,7 @@ class CfCIMUDataset(Dataset):
         self.return_stats = return_stats
         self.use_gravity = use_gravity
         self.use_attitude = use_attitude
+        self.include_window_features = include_window_features
         self.return_vicon = return_vicon
         self.split_ratio = split_ratio
         self.val_ratio = val_ratio
@@ -82,7 +85,7 @@ class CfCIMUDataset(Dataset):
         if use_attitude:
             self.extra_dim += 3
         self.feature_dim = self.base_dim + self.extra_dim
-        self.window_feat_dim = 12  # a_abs_mean(3), w_abs_mean(3), a_diff_energy(3), w_diff_energy(3)
+        self.window_feat_dim = 12 if include_window_features else 0
         # Input dim: feature_dim + mask(feature_dim) + dt(1) + window_feat_dim
         self.input_dim = self.feature_dim * 2 + 1 + self.window_feat_dim
         
@@ -337,29 +340,30 @@ class CfCIMUDataset(Dataset):
         
         imu_masked = input_imu * mask
 
-        # Window-level features (shared across the sequence)
-        gyro = target_imu[:, :3]
-        acc = target_imu[:, 3:6]
-        acc_abs_mean = acc.abs().mean(dim=0)
-        gyro_abs_mean = gyro.abs().mean(dim=0)
+        if self.include_window_features:
+            # Window-level features (shared across the sequence)
+            gyro = target_imu[:, :3]
+            acc = target_imu[:, 3:6]
+            acc_abs_mean = acc.abs().mean(dim=0)
+            gyro_abs_mean = gyro.abs().mean(dim=0)
 
-        acc_diff = acc[1:] - acc[:-1]
-        gyro_diff = gyro[1:] - gyro[:-1]
-        if acc_diff.numel() > 0:
-            acc_diff_energy = (acc_diff.pow(2).mean(dim=0))
-            gyro_diff_energy = (gyro_diff.pow(2).mean(dim=0))
+            acc_diff = acc[1:] - acc[:-1]
+            gyro_diff = gyro[1:] - gyro[:-1]
+            if acc_diff.numel() > 0:
+                acc_diff_energy = (acc_diff.pow(2).mean(dim=0))
+                gyro_diff_energy = (gyro_diff.pow(2).mean(dim=0))
+            else:
+                acc_diff_energy = torch.zeros(3, dtype=target_imu.dtype)
+                gyro_diff_energy = torch.zeros(3, dtype=target_imu.dtype)
+
+            window_feat_values = torch.cat(
+                [acc_abs_mean, gyro_abs_mean, acc_diff_energy, gyro_diff_energy],
+                dim=0,
+            )
+            window_feats = window_feat_values.unsqueeze(0).repeat(self.seq_len, 1)
+            inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1), window_feats], dim=-1)
         else:
-            acc_diff_energy = torch.zeros(3, dtype=target_imu.dtype)
-            gyro_diff_energy = torch.zeros(3, dtype=target_imu.dtype)
-
-        window_feat_values = torch.cat(
-            [acc_abs_mean, gyro_abs_mean, acc_diff_energy, gyro_diff_energy],
-            dim=0,
-        )
-        window_feats = window_feat_values.unsqueeze(0).repeat(self.seq_len, 1)
-        
-        # Construct input: [masked_imu(feature_dim), mask(feature_dim), dt(1), window_features(4)]
-        inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1), window_feats], dim=-1)
+            inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1)], dim=-1)
         
         # Build return tuple based on options
         result = [inputs, target_imu, mask]

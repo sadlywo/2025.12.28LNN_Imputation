@@ -3,10 +3,12 @@
 Compares:
 1) 13-dim input: base IMU (gyro+acc) + mask + dt
 2) 19-dim input: base IMU + gravity + mask + dt
+3) 25-dim input: base IMU + mask + dt + window stats (12 dims)
 
 Notes:
 - 13-dim input => feature_dim=6, input_dim=6*2+1=13
 - 19-dim input => feature_dim=9 (gyro+acc+gravity), input_dim=9*2+1=19
+- 25-dim input => feature_dim=6, input_dim=6*2+1+12=25
 """
 from __future__ import annotations
 
@@ -85,10 +87,10 @@ def _evaluate(model, loader, criterion, device):
 def run_dim_ablation():
     config = {
         "root_dir": "Oxford Dataset",
-        "seq_len": 50,
+    "seq_len": 30,
         "mask_rate": 0.3,
         "missing_mode": "random",
-        "batch_size": 16,
+    "batch_size": 32,
         "epochs": 30,
         "lr": 1e-3,
         "hidden_units": 64,
@@ -115,8 +117,21 @@ def run_dim_ablation():
     print("=" * 80)
 
     experiments = {
-        "LNN_dim13": {"use_gravity": False, "use_attitude": False},
-        "LNN_dim19": {"use_gravity": True, "use_attitude": False},
+        "LNN_dim13": {
+            "use_gravity": False,
+            "use_attitude": False,
+            "include_window_features": False,
+        },
+        "LNN_dim19": {
+            "use_gravity": True,
+            "use_attitude": False,
+            "include_window_features": False,
+        },
+        "LNN_dim25_window": {
+            "use_gravity": False,
+            "use_attitude": False,
+            "include_window_features": True,
+        },
     }
 
     summary_rows: List[dict] = []
@@ -137,6 +152,7 @@ def run_dim_ablation():
             drift_scale=config["drift_scale"],
             use_gravity=flags["use_gravity"],
             use_attitude=flags["use_attitude"],
+            include_window_features=flags["include_window_features"],
         )
         val_ds = CfCIMUDataset(
             root_dir=config["root_dir"],
@@ -148,6 +164,7 @@ def run_dim_ablation():
             drift_scale=0.0,
             use_gravity=flags["use_gravity"],
             use_attitude=flags["use_attitude"],
+            include_window_features=flags["include_window_features"],
         )
 
         train_loader = torch.utils.data.DataLoader(
