@@ -121,16 +121,19 @@ def run_dim_ablation():
             "use_gravity": False,
             "use_attitude": False,
             "include_window_features": False,
+            "use_physics_prior": True,
         },
         "LNN_dim19": {
             "use_gravity": True,
             "use_attitude": False,
             "include_window_features": False,
+            "use_physics_prior": False,
         },
         "LNN_dim25_window": {
             "use_gravity": False,
             "use_attitude": False,
             "include_window_features": True,
+            "use_physics_prior": True,
         },
     }
 
@@ -186,6 +189,7 @@ def run_dim_ablation():
             input_dim=train_ds.input_dim,
             hidden_units=config["hidden_units"],
             output_dim=train_ds.feature_dim,
+            use_physics_prior=flags["use_physics_prior"],
         ).to(device)
         criterion = ReconstructionOnlyLoss(w_recon=1.0)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-5)

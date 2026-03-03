@@ -168,11 +168,12 @@ class AdaptiveLoss(nn.Module):
 class ReconstructionOnlyLoss(nn.Module):
     """
     Reconstruction-only loss used for non-CfC baselines (GRU/Transformer).
-    Computes MSE only on the missing positions indicated by mask.
+    Computes MSE on missing positions and (optionally) on observed positions.
     """
-    def __init__(self, w_recon: float = 1.0):
+    def __init__(self, w_recon: float = 1.0, w_observed: float = 0.0):
         super().__init__()
         self.w_recon = w_recon
+        self.w_observed = w_observed
 
     def forward(
         self,
@@ -182,9 +183,16 @@ class ReconstructionOnlyLoss(nn.Module):
         uncertainty: torch.Tensor = None,
         dt: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
-        recon = ((pred - target) ** 2 * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
-        total = self.w_recon * recon
-        components = {"recon": recon.item(), "consistency": 0.0, "smooth": 0.0}
+        missing = (1 - mask)
+        recon = ((pred - target) ** 2 * missing).sum() / (missing.sum() + 1e-8)
+        observed = ((pred - target) ** 2 * mask).sum() / (mask.sum() + 1e-8)
+        total = self.w_recon * recon + self.w_observed * observed
+        components = {
+            "recon": recon.item(),
+            "observed": observed.item(),
+            "consistency": 0.0,
+            "smooth": 0.0,
+        }
         return total, components
 
 

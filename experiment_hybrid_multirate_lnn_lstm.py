@@ -3,20 +3,18 @@ Experiment: Multi-Rate Hybrid LNN + LSTM Imputation.
 
 Core idea (our proposed method):
 - LSTM branch receives **downsampled** input (every K points),
-  capturing long-term motion patterns (turns, periodic gait, etc.)
-  at a coarser temporal resolution.
-- LNN (CfC) branch receives **full-rate** original input,
-  performing smooth continuous-time ODE integration for high-frequency
-  kinematic imputation.
-- At inference, the LSTM output is **upsampled** back to the original
-  time resolution via linear interpolation, then fused with the LNN
-  output using RMSE-based adaptive weighting on observed positions.
+    capturing long-term motion patterns (turns, periodic gait, etc.)
+    at a coarser temporal resolution.
+- LNN (CfC) branch receives **full-rate** input without mask channels,
+    focusing on short-term kinematic continuity.
+- The LSTM output is **upsampled** back to the original time resolution
+    via linear interpolation, then fused with the LNN output using a
+    learned gate (and RMSE fusion for the baseline row).
 
 Comparison groups:
-1. LNN_only           – full-rate CfC
-2. LSTM_only          – full-rate BiLSTM (baseline, no downsampling)
-3. Hybrid_Normal      – standard learned-gate hybrid (same input to both)
-4. MultiRate_Fusion   – **proposed** (downsampled LSTM + full-rate LNN + RMSE fusion)
+1. LNN_only           – full-rate CfC (maskless, 25-dim with window stats)
+2. LSTM_only          – full-rate BiLSTM
+3. Hybrid_Normal      – standard learned-gate hybrid (maskless LNN + masked LSTM)
 
 Outputs:
 - CSV summary & history
@@ -28,6 +26,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import inspect
 import time
 from datetime import datetime
 from pathlib import Path
@@ -42,7 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataset import CfCIMUDataset
+from dataset import CfCIMUDataset, compute_ate, compute_relative_trajectory_error
 from models import ReconstructionOnlyLoss
 from models_hybrid import (
     ShortTermLNN,
@@ -72,6 +71,29 @@ def _state_dict_size_mb(model: nn.Module) -> float:
     return total / (1024 * 1024)
 
 
+def _build_recon_loss(observed_weight: float) -> ReconstructionOnlyLoss:
+    sig = inspect.signature(ReconstructionOnlyLoss.__init__)
+    if "w_observed" in sig.parameters:
+        return ReconstructionOnlyLoss(w_recon=1.0, w_observed=observed_weight)
+    return ReconstructionOnlyLoss(w_recon=1.0)
+
+
+def _unpack_batch(batch):
+    inputs = batch[0]
+    targets = batch[1]
+    mask = batch[2]
+    stats = batch[3] if len(batch) > 3 else None
+    vicon = batch[4] if len(batch) > 4 else None
+    return inputs, targets, mask, stats, vicon
+
+
+def _strip_mask_inputs(x: torch.Tensor, feature_dim: int) -> torch.Tensor:
+    imu = x[:, :, :feature_dim]
+    dt = x[:, :, feature_dim * 2 : feature_dim * 2 + 1]
+    window_feats = x[:, :, feature_dim * 2 + 1 :]
+    return torch.cat([imu, dt, window_feats], dim=-1)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Multi-Rate Hybrid Model  (proposed)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -98,22 +120,27 @@ class MultiRateHybridLNNLSTM(nn.Module):
     def __init__(
         self,
         input_dim: int = 13,
+        feature_dim: int = 6,
+        window_feat_dim: int = 0,
         lnn_hidden: int = 64,
         lstm_hidden: int = 64,
         output_dim: int = 6,
         lstm_layers: int = 2,
         lstm_dropout: float = 0.1,
         downsample_factor: int = 5,
-    fusion_mode: str = "learned",
+        fusion_mode: str = "learned",
     ):
         super().__init__()
         self.output_dim = output_dim
         self.downsample_factor = downsample_factor
         self.fusion_mode = fusion_mode
+        self.feature_dim = feature_dim
+        self.window_feat_dim = window_feat_dim
+        self.lnn_input_dim = input_dim - feature_dim
 
         # ── Sub-models ──────────────────────────────────────────────────
         self.lnn = ShortTermLNN(
-            input_dim=input_dim,
+            input_dim=self.lnn_input_dim,
             hidden_units=lnn_hidden,
             output_dim=output_dim,
         )
@@ -158,6 +185,12 @@ class MultiRateHybridLNNLSTM(nn.Module):
         return x_up.permute(0, 2, 1)                           # (B, target_len, D)
 
     # -----------------------------------------------------------------
+    def _strip_mask(self, x: torch.Tensor) -> torch.Tensor:
+        imu = x[:, :, : self.feature_dim]
+        dt = x[:, :, self.feature_dim * 2 : self.feature_dim * 2 + 1]
+        window_feats = x[:, :, self.feature_dim * 2 + 1 :]
+        return torch.cat([imu, dt, window_feats], dim=-1)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -172,13 +205,15 @@ class MultiRateHybridLNNLSTM(nn.Module):
         B, T, D = x.shape
         K = self.downsample_factor
 
-        # ── LNN branch: full-rate ───────────────────────────────────────
-        lnn_pred, lnn_unc = self.lnn(x)           # (B, T, 6)
+        # ── LNN branch: full-rate (mask removed) ────────────────────────
+        lnn_input = self._strip_mask(x)
+        lnn_pred, lnn_unc = self.lnn(lnn_input)   # (B, T, 6)
 
-        # ── LSTM branch: downsample then upsample to keep length ────────
+        # ── LSTM branch: downsample input, output low-rate, then upsample ──
         x_ds = self._downsample(x, K)             # (B, T//K, D)
-        x_lstm = self._upsample_linear(x_ds, T)   # (B, T, D)
-        lstm_pred, lstm_unc = self.lstm(x_lstm)   # (B, T, 6)
+        lstm_pred_ds, lstm_unc_ds = self.lstm(x_ds)   # (B, T//K, 6)
+        lstm_pred = self._upsample_linear(lstm_pred_ds, T)
+        lstm_unc = self._upsample_linear(lstm_unc_ds, T)
 
         # ── Learned gate fusion ─────────────────────────────────────────
         gate_in = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
@@ -197,10 +232,12 @@ class MultiRateHybridLNNLSTM(nn.Module):
         B, T, D = x.shape
         K = self.downsample_factor
 
-        lnn_pred, lnn_unc = self.lnn(x)
+        lnn_input = self._strip_mask(x)
+        lnn_pred, lnn_unc = self.lnn(lnn_input)
         x_ds = self._downsample(x, K)
-        x_lstm = self._upsample_linear(x_ds, T)
-        lstm_pred, lstm_unc = self.lstm(x_lstm)
+        lstm_pred_ds, lstm_unc_ds = self.lstm(x_ds)
+        lstm_pred = self._upsample_linear(lstm_pred_ds, T)
+        lstm_unc = self._upsample_linear(lstm_unc_ds, T)
 
         gate_in = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
         gate = self.gate_net(gate_in)
@@ -221,11 +258,107 @@ class MultiRateHybridLNNLSTM(nn.Module):
         }
 
 
+class MasklessLNN(nn.Module):
+    def __init__(self, input_dim: int, feature_dim: int, hidden_units: int = 64, output_dim: int = 6):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.lnn = ShortTermLNN(
+            input_dim=input_dim,
+            hidden_units=hidden_units,
+            output_dim=output_dim,
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        lnn_input = _strip_mask_inputs(x, self.feature_dim)
+        return self.lnn(lnn_input)
+
+
+class MasklessHybridLNNLSTM(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        feature_dim: int,
+        lnn_hidden: int = 64,
+        lstm_hidden: int = 64,
+        output_dim: int = 6,
+        lstm_layers: int = 2,
+        lstm_dropout: float = 0.1,
+        fusion_mode: str = "learned",
+    ):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.output_dim = output_dim
+        self.fusion_mode = fusion_mode
+        self.lnn = ShortTermLNN(
+            input_dim=input_dim - feature_dim,
+            hidden_units=lnn_hidden,
+            output_dim=output_dim,
+        )
+        self.lstm = LongTermLSTM(
+            input_dim=input_dim,
+            hidden_dim=lstm_hidden,
+            output_dim=output_dim,
+            num_layers=lstm_layers,
+            dropout=lstm_dropout,
+        )
+        gate_input_dim = output_dim * 4 + input_dim
+        self.gate_net = nn.Sequential(
+            nn.Linear(gate_input_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, output_dim),
+            nn.Sigmoid(),
+        )
+        self.combined_uncertainty = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim),
+            nn.Softplus(),
+        )
+
+    def forward(self, x: torch.Tensor, target=None, mask=None) -> Tuple[torch.Tensor, torch.Tensor]:
+        lnn_input = _strip_mask_inputs(x, self.feature_dim)
+        lnn_pred, lnn_unc = self.lnn(lnn_input)
+        lstm_pred, lstm_unc = self.lstm(x)
+
+        if self.fusion_mode == "rmse" and target is not None and mask is not None:
+            pred, w_lnn, w_lstm = rmse_based_reweight(lnn_pred, lstm_pred, target, mask)
+            unc = w_lnn * lnn_unc + w_lstm * lstm_unc
+            return pred, unc
+
+        gate_input = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
+        gate = self.gate_net(gate_input)
+        gate = gate.mean(dim=1, keepdim=True)
+        gate = gate.expand(-1, lnn_pred.shape[1], -1)
+        pred = gate * lnn_pred + (1.0 - gate) * lstm_pred
+        unc = self.combined_uncertainty(torch.cat([lnn_unc, lstm_unc], dim=-1))
+        return pred, unc
+
+    def forward_with_components(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        lnn_input = _strip_mask_inputs(x, self.feature_dim)
+        lnn_pred, lnn_unc = self.lnn(lnn_input)
+        lstm_pred, lstm_unc = self.lstm(x)
+
+        gate_input = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
+        gate = self.gate_net(gate_input)
+        gate = gate.mean(dim=1, keepdim=True)
+        gate = gate.expand(-1, lnn_pred.shape[1], -1)
+        pred = gate * lnn_pred + (1.0 - gate) * lstm_pred
+        unc = self.combined_uncertainty(torch.cat([lnn_unc, lstm_unc], dim=-1))
+
+        return {
+            "pred": pred,
+            "uncertainty": unc,
+            "lnn_pred": lnn_pred,
+            "lstm_pred": lstm_pred,
+            "lnn_uncertainty": lnn_unc,
+            "lstm_uncertainty": lstm_unc,
+            "gate": gate,
+        }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Training / Evaluation helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _train_one_epoch(model, loader, criterion, optimizer, scheduler, device):
+def _train_one_epoch(model, loader, criterion, optimizer, scheduler, device, gate_reg_weight: float = 0.0):
     model.train()
     losses = []
     for inputs, targets, mask in loader:
@@ -235,8 +368,26 @@ def _train_one_epoch(model, loader, criterion, optimizer, scheduler, device):
         dt = inputs[:, :, -1:]
 
         optimizer.zero_grad()
-        pred, uncertainty = model(inputs)
+        gate_reg = torch.tensor(0.0, device=device)
+        if gate_reg_weight > 0 and hasattr(model, "forward_with_components"):
+            components = model.forward_with_components(inputs)
+            pred = components["pred"]
+            uncertainty = components["uncertainty"]
+
+            missing = (1 - mask)
+            lnn_err = ((components["lnn_pred"] - targets) ** 2 * missing).sum(dim=(1, 2))
+            lstm_err = ((components["lstm_pred"] - targets) ** 2 * missing).sum(dim=(1, 2))
+            denom = (missing.sum(dim=(1, 2)) + 1e-8)
+            lnn_mse = lnn_err / denom
+            lstm_mse = lstm_err / denom
+            target_w_lnn = (lstm_mse / (lnn_mse + lstm_mse + 1e-8)).view(-1, 1, 1)
+            target_w_lnn = target_w_lnn.expand_as(components["gate"])
+            gate_reg = F.mse_loss(components["gate"], target_w_lnn)
+        else:
+            pred, uncertainty = model(inputs)
+
         loss, _ = criterion(pred, targets, mask, uncertainty, dt)
+        loss = loss + gate_reg_weight * gate_reg
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -250,7 +401,8 @@ def _evaluate(model, loader, criterion, device):
     model.eval()
     losses, mse_all_list, mse_observed_list, mse_missing_list = [], [], [], []
     with torch.no_grad():
-        for inputs, targets, mask in loader:
+        for batch in loader:
+            inputs, targets, mask, _, _ = _unpack_batch(batch)
             inputs = inputs.to(device)
             targets = targets.to(device)
             mask = mask.to(device)
@@ -271,6 +423,82 @@ def _evaluate(model, loader, criterion, device):
         "mse_all": float(np.mean(mse_all_list)),
         "mse_observed": float(np.mean(mse_observed_list)),
         "mse_missing": float(np.mean(mse_missing_list)),
+    }
+
+
+def _evaluate_trajectory_metrics(model, loader, device: torch.device) -> Dict[str, float]:
+    model.eval()
+    total_ate = 0.0
+    total_rte = 0.0
+    total_samples = 0
+    with torch.no_grad():
+        for batch in loader:
+            inputs, targets, _, stats, vicon = _unpack_batch(batch)
+            if stats is None or vicon is None:
+                continue
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            stats = stats.to(device)
+            vicon = vicon.to(device)
+            dt = inputs[:, :, -1]
+
+            pred, _ = model(inputs)
+            ate_result = compute_ate(pred, vicon, dt, stats=stats)
+            rte_result = compute_relative_trajectory_error(pred, vicon, dt, stats=stats)
+
+            batch_size = inputs.shape[0]
+            total_ate += ate_result["ate"] * batch_size
+            total_rte += rte_result["rte"] * batch_size
+            total_samples += batch_size
+
+    if total_samples == 0:
+        return {"ate": float("nan"), "rte": float("nan")}
+    return {
+        "ate": total_ate / total_samples,
+        "rte": total_rte / total_samples,
+    }
+
+
+def _evaluate_trajectory_metrics_rmse_fusion(
+    lnn_model: nn.Module,
+    lstm_model: nn.Module,
+    loader,
+    device: torch.device,
+) -> Dict[str, float]:
+    lnn_model.eval()
+    lstm_model.eval()
+    total_ate = 0.0
+    total_rte = 0.0
+    total_samples = 0
+    with torch.no_grad():
+        for batch in loader:
+            inputs, targets, mask, stats, vicon = _unpack_batch(batch)
+            if stats is None or vicon is None:
+                continue
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            mask = mask.to(device)
+            stats = stats.to(device)
+            vicon = vicon.to(device)
+            dt = inputs[:, :, -1]
+
+            lnn_pred, _ = lnn_model(inputs)
+            lstm_pred, _ = lstm_model(inputs)
+            fused, _, _ = rmse_based_reweight(lnn_pred, lstm_pred, targets, mask)
+
+            ate_result = compute_ate(fused, vicon, dt, stats=stats)
+            rte_result = compute_relative_trajectory_error(fused, vicon, dt, stats=stats)
+
+            batch_size = inputs.shape[0]
+            total_ate += ate_result["ate"] * batch_size
+            total_rte += rte_result["rte"] * batch_size
+            total_samples += batch_size
+
+    if total_samples == 0:
+        return {"ate": float("nan"), "rte": float("nan")}
+    return {
+        "ate": total_ate / total_samples,
+        "rte": total_rte / total_samples,
     }
 
 
@@ -306,7 +534,15 @@ def _train_model(
 
     start = time.time()
     for epoch in range(1, config["epochs"] + 1):
-        train_m = _train_one_epoch(model, train_loader, criterion, optimizer, scheduler, device)
+        train_m = _train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            scheduler,
+            device,
+            gate_reg_weight=config.get("gate_reg_weight", 0.0),
+        )
         val_m = _evaluate(model, val_loader, criterion, device)
 
         history["train_loss"].append(train_m["total"])
@@ -364,7 +600,8 @@ def _evaluate_rmse_fusion(
     all_w_lstm = []
 
     with torch.no_grad():
-        for inputs, targets, mask in val_loader:
+        for batch in val_loader:
+            inputs, targets, mask, _, _ = _unpack_batch(batch)
             inputs = inputs.to(device)
             targets = targets.to(device)
             mask = mask.to(device)
@@ -464,9 +701,10 @@ def run_multirate_experiment(
     mask_rate: float = 0.3,
     missing_mode: str = "random",
     drift_scale: float = 0.00,
-    downsample_factors: str = "2,3",
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
+    gate_reg_weight: float = 0.1,
+    observed_weight: float = 0.1,
     output_dir: str = "results/hybrid_multirate",
 ):
     config = {
@@ -485,9 +723,11 @@ def run_multirate_experiment(
         "seed": 2026,
         "output_dir": str(output_dir),
         "drift_scale": float(drift_scale),
-        "downsample_factors": str(downsample_factors),
         "train_ratio": float(train_ratio),
         "val_ratio": float(val_ratio),
+        "gate_reg_weight": float(gate_reg_weight),
+        "observed_weight": float(observed_weight),
+        "include_window_features": True,
     }
 
     _seed_all(config["seed"])
@@ -496,19 +736,17 @@ def run_multirate_experiment(
     output_path.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    ks = [int(k.strip()) for k in config["downsample_factors"].split(",") if k.strip()]
-
     print("=" * 80)
     print("MULTI-RATE HYBRID LNN-LSTM EXPERIMENT")
     print("=" * 80)
     print(f"Device:            {device}")
     print(f"Seq len:           {config['seq_len']}")
-    print(f"Downsample factors: {ks}  (LSTM input length stays seq_len)")
     print(f"Missing:           {config['missing_mode']} @ {config['mask_rate'] * 100:.0f}%")
     print(f"Epochs:            {config['epochs']}")
     print(f"LNN hidden:        {config['lnn_hidden']}")
     print(f"LSTM hidden:       {config['lstm_hidden']} x {config['lstm_layers']} layers (BiLSTM)")
     print(f"Drift scale:       {config['drift_scale']}")
+    print(f"Observed weight:   {config['observed_weight']}")
     print(f"Output:            {output_path}")
     print("=" * 80)
 
@@ -523,6 +761,7 @@ def run_multirate_experiment(
         val_ratio=config["val_ratio"],
         eval_mode=False,
         drift_scale=config["drift_scale"],
+        include_window_features=config["include_window_features"],
     )
     val_ds = CfCIMUDataset(
         root_dir=config["root_dir"],
@@ -534,6 +773,7 @@ def run_multirate_experiment(
         val_ratio=config["val_ratio"],
         eval_mode=True,
         drift_scale=0.0,
+        include_window_features=config["include_window_features"],
     )
     test_ds = CfCIMUDataset(
         root_dir=config["root_dir"],
@@ -545,9 +785,15 @@ def run_multirate_experiment(
         val_ratio=config["val_ratio"],
         eval_mode=True,
         drift_scale=0.0,
+        return_stats=True,
+        return_vicon=True,
+        include_window_features=config["include_window_features"],
     )
 
     config["input_dim"] = int(train_ds.input_dim)
+    config["feature_dim"] = int(train_ds.feature_dim)
+    config["window_feat_dim"] = int(train_ds.window_feat_dim)
+    config["lnn_input_dim"] = int(train_ds.input_dim - train_ds.feature_dim)
 
     train_loader = torch.utils.data.DataLoader(
         train_ds,
@@ -576,12 +822,13 @@ def run_multirate_experiment(
     print(f"Test:  {len(test_ds)} samples ({len(test_loader)} batches)")
 
     # ── Models to train ─────────────────────────────────────────────────
-    criterion = ReconstructionOnlyLoss(w_recon=1.0)
+    criterion = _build_recon_loss(config["observed_weight"])
 
     models_to_train = {
-        # 1. LNN only (full-rate CfC)
-        "LNN_only": ShortTermLNN(
-            input_dim=config["input_dim"],
+        # 1. LNN only (full-rate CfC, no mask channels)
+        "LNN_only": MasklessLNN(
+            input_dim=config["lnn_input_dim"],
+            feature_dim=config["feature_dim"],
             hidden_units=config["lnn_hidden"],
             output_dim=6,
         ),
@@ -592,9 +839,10 @@ def run_multirate_experiment(
             output_dim=6,
             num_layers=config["lstm_layers"],
         ),
-        # 3. Normal Hybrid (dynamic gate, same input to both branches)
-        "Hybrid_Normal": HybridLNNLSTM(
+        # 3. Normal Hybrid (dynamic gate, maskless LNN + masked LSTM)
+        "Hybrid_Normal": MasklessHybridLNNLSTM(
             input_dim=config["input_dim"],
+            feature_dim=config["feature_dim"],
             lnn_hidden=config["lnn_hidden"],
             lstm_hidden=config["lstm_hidden"],
             output_dim=6,
@@ -602,17 +850,6 @@ def run_multirate_experiment(
             fusion_mode="learned",
         ),
     }
-
-    for k in ks:
-        models_to_train[f"MultiRate_Hybrid_K{k}"] = MultiRateHybridLNNLSTM(
-            input_dim=config["input_dim"],
-            lnn_hidden=config["lnn_hidden"],
-            lstm_hidden=config["lstm_hidden"],
-            output_dim=6,
-            lstm_layers=config["lstm_layers"],
-            downsample_factor=k,
-            fusion_mode="learned",
-        )
 
     summary_rows: List[dict] = []
     history_rows: List[dict] = []
@@ -641,8 +878,8 @@ def run_multirate_experiment(
             criterion=criterion,
         )
         all_histories[model_name] = history
-
         test_metrics = _evaluate(model, test_loader, criterion, device)
+        traj_metrics = _evaluate_trajectory_metrics(model, test_loader, device)
 
         for ei in range(len(history["train_loss"])):
             history_rows.append({
@@ -666,6 +903,8 @@ def run_multirate_experiment(
             "test_mse_all": float(test_metrics["mse_all"]),
             "test_mse_observed": float(test_metrics["mse_observed"]),
             "test_mse_missing": float(test_metrics["mse_missing"]),
+            "test_ate": float(traj_metrics["ate"]),
+            "test_rte": float(traj_metrics["rte"]),
             "train_time_sec": round(train_time, 2),
         }
         summary_rows.append(row)
@@ -677,33 +916,6 @@ def run_multirate_experiment(
         print(f"  Test MSE(all):         {test_metrics['mse_all']:.6f}")
         print(f"  Train time:           {train_time:.1f}s")
 
-    # ── RMSE fusion baseline ──────────────────────────────────────────
-    if "LNN_only" in models_to_train and "LSTM_only" in models_to_train:
-        lnn_model = models_to_train["LNN_only"].to(device)
-        lstm_model = models_to_train["LSTM_only"].to(device)
-
-        lnn_model.load_state_dict(
-            torch.load(output_path / f"best_model_LNN_only_{timestamp}.pt", map_location=device)
-        )
-        lstm_model.load_state_dict(
-            torch.load(output_path / f"best_model_LSTM_only_{timestamp}.pt", map_location=device)
-        )
-
-        rmse_results = _evaluate_rmse_fusion(lnn_model, lstm_model, test_loader, device)
-        summary_rows.append({
-            "model": "RMSE_Fusion(LNN+LSTM)",
-            "num_params": count_parameters(lnn_model) + count_parameters(lstm_model),
-            "param_size_mb": round(_state_dict_size_mb(lnn_model) + _state_dict_size_mb(lstm_model), 4),
-            "best_epoch": "-",
-            "best_val_loss": "-",
-            "best_val_mse_all": "-",
-            "best_val_mse_observed": "-",
-            "best_val_mse_missing": "-",
-            "test_mse_all": rmse_results["mse_all"],
-            "test_mse_observed": rmse_results["mse_observed"],
-            "test_mse_missing": rmse_results["mse_missing"],
-            "train_time_sec": "-",
-        })
 
     # ── Save results ────────────────────────────────────────────────────
     df_summary = pd.DataFrame(summary_rows)
@@ -760,10 +972,11 @@ if __name__ == "__main__":
     parser.add_argument("--missing_mode", type=str, default="random",
                         choices=["random", "block", "channel"])
     parser.add_argument("--drift_scale", type=float, default=0.00)
-    parser.add_argument("--downsample_factors", type=str, default="2,3",
-                        help="Comma-separated downsampling factors K (default=2,3)")
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--gate_reg_weight", type=float, default=0.1)
+    parser.add_argument("--observed_weight", type=float, default=0.1,
+                        help="Weight for observed reconstruction loss")
     parser.add_argument("--output_dir", type=str, default="results/hybrid_multirate")
     args = parser.parse_args()
 
@@ -776,8 +989,9 @@ if __name__ == "__main__":
         mask_rate=args.mask_rate,
         missing_mode=args.missing_mode,
         drift_scale=args.drift_scale,
-        downsample_factors=args.downsample_factors,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
+        gate_reg_weight=args.gate_reg_weight,
+        observed_weight=args.observed_weight,
         output_dir=args.output_dir,
     )
