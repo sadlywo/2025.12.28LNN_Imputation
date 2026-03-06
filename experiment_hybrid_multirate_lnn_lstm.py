@@ -71,11 +71,14 @@ def _state_dict_size_mb(model: nn.Module) -> float:
     return total / (1024 * 1024)
 
 
-def _build_recon_loss(observed_weight: float) -> ReconstructionOnlyLoss:
+def _build_recon_loss(observed_weight: float, consistency_weight: float) -> ReconstructionOnlyLoss:
     sig = inspect.signature(ReconstructionOnlyLoss.__init__)
+    kwargs = {"w_recon": 1.0}
     if "w_observed" in sig.parameters:
-        return ReconstructionOnlyLoss(w_recon=1.0, w_observed=observed_weight)
-    return ReconstructionOnlyLoss(w_recon=1.0)
+        kwargs["w_observed"] = observed_weight
+    if "w_consistency" in sig.parameters:
+        kwargs["w_consistency"] = consistency_weight
+    return ReconstructionOnlyLoss(**kwargs)
 
 
 def _unpack_batch(batch):
@@ -218,8 +221,6 @@ class MultiRateHybridLNNLSTM(nn.Module):
         # ── Learned gate fusion ─────────────────────────────────────────
         gate_in = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
         gate = self.gate_net(gate_in)              # (B, T, 6)  ∈ [0,1]
-        gate = gate.mean(dim=1, keepdim=True)
-        gate = gate.expand(-1, lnn_pred.shape[1], -1)
 
         pred = gate * lnn_pred + (1.0 - gate) * lstm_pred
         unc = self.combined_uncertainty(torch.cat([lnn_unc, lstm_unc], dim=-1))
@@ -241,8 +242,6 @@ class MultiRateHybridLNNLSTM(nn.Module):
 
         gate_in = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
         gate = self.gate_net(gate_in)
-        gate = gate.mean(dim=1, keepdim=True)
-        gate = gate.expand(-1, lnn_pred.shape[1], -1)
 
         pred = gate * lnn_pred + (1.0 - gate) * lstm_pred
         unc = self.combined_uncertainty(torch.cat([lnn_unc, lstm_unc], dim=-1))
@@ -325,8 +324,6 @@ class MasklessHybridLNNLSTM(nn.Module):
 
         gate_input = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
         gate = self.gate_net(gate_input)
-        gate = gate.mean(dim=1, keepdim=True)
-        gate = gate.expand(-1, lnn_pred.shape[1], -1)
         pred = gate * lnn_pred + (1.0 - gate) * lstm_pred
         unc = self.combined_uncertainty(torch.cat([lnn_unc, lstm_unc], dim=-1))
         return pred, unc
@@ -338,8 +335,6 @@ class MasklessHybridLNNLSTM(nn.Module):
 
         gate_input = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
         gate = self.gate_net(gate_input)
-        gate = gate.mean(dim=1, keepdim=True)
-        gate = gate.expand(-1, lnn_pred.shape[1], -1)
         pred = gate * lnn_pred + (1.0 - gate) * lstm_pred
         unc = self.combined_uncertainty(torch.cat([lnn_unc, lstm_unc], dim=-1))
 
@@ -431,6 +426,7 @@ def _evaluate_trajectory_metrics(model, loader, device: torch.device) -> Dict[st
     total_ate = 0.0
     total_rte = 0.0
     total_samples = 0
+    printed_debug = False
     with torch.no_grad():
         for batch in loader:
             inputs, targets, _, stats, vicon = _unpack_batch(batch)
@@ -443,6 +439,18 @@ def _evaluate_trajectory_metrics(model, loader, device: torch.device) -> Dict[st
             dt = inputs[:, :, -1]
 
             pred, _ = model(inputs)
+            if not printed_debug:
+                dt_min = float(dt.min().item())
+                dt_mean = float(dt.mean().item())
+                dt_max = float(dt.max().item())
+                pred_abs_mean = float(pred.abs().mean().item())
+                print(
+                    f"[ATE/RTE Debug] dt(min/mean/max)={dt_min:.6f}/{dt_mean:.6f}/{dt_max:.6f} "
+                    f"pred|abs|mean={pred_abs_mean:.6f}"
+                )
+                if dt_min <= 0 or dt_max > 1.0:
+                    print("[ATE/RTE Warning] dt range异常，可能导致积分漂移。")
+                printed_debug = True
             ate_result = compute_ate(pred, vicon, dt, stats=stats)
             rte_result = compute_relative_trajectory_error(pred, vicon, dt, stats=stats)
 
@@ -694,7 +702,7 @@ def _plot_all_histories(all_histories: Dict[str, dict], output_path: Path, times
 
 def run_multirate_experiment(
     epochs: int = 30,
-    lnn_hidden: int = 64,
+    lnn_hidden: int = 256,
     lstm_hidden: int = 64,
     lstm_layers: int = 2,
     seq_len: int = 30,
@@ -705,6 +713,7 @@ def run_multirate_experiment(
     val_ratio: float = 0.1,
     gate_reg_weight: float = 0.1,
     observed_weight: float = 0.1,
+    consistency_weight: float = 0.05,
     output_dir: str = "results/hybrid_multirate",
 ):
     config = {
@@ -727,6 +736,7 @@ def run_multirate_experiment(
         "val_ratio": float(val_ratio),
         "gate_reg_weight": float(gate_reg_weight),
         "observed_weight": float(observed_weight),
+        "consistency_weight": float(consistency_weight),
         "include_window_features": True,
     }
 
@@ -747,6 +757,7 @@ def run_multirate_experiment(
     print(f"LSTM hidden:       {config['lstm_hidden']} x {config['lstm_layers']} layers (BiLSTM)")
     print(f"Drift scale:       {config['drift_scale']}")
     print(f"Observed weight:   {config['observed_weight']}")
+    print(f"Consistency weight:{config['consistency_weight']}")
     print(f"Output:            {output_path}")
     print("=" * 80)
 
@@ -822,7 +833,7 @@ def run_multirate_experiment(
     print(f"Test:  {len(test_ds)} samples ({len(test_loader)} batches)")
 
     # ── Models to train ─────────────────────────────────────────────────
-    criterion = _build_recon_loss(config["observed_weight"])
+    criterion = _build_recon_loss(config["observed_weight"], config["consistency_weight"])
 
     models_to_train = {
         # 1. LNN only (full-rate CfC, no mask channels)
@@ -964,7 +975,7 @@ if __name__ == "__main__":
         description="Multi-Rate Hybrid LNN-LSTM imputation experiment"
     )
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lnn_hidden", type=int, default=64)
+    parser.add_argument("--lnn_hidden", type=int, default=256)
     parser.add_argument("--lstm_hidden", type=int, default=64)
     parser.add_argument("--lstm_layers", type=int, default=2)
     parser.add_argument("--seq_len", type=int, default=30)
@@ -977,6 +988,8 @@ if __name__ == "__main__":
     parser.add_argument("--gate_reg_weight", type=float, default=0.1)
     parser.add_argument("--observed_weight", type=float, default=0.1,
                         help="Weight for observed reconstruction loss")
+    parser.add_argument("--consistency_weight", type=float, default=0.05,
+                        help="Weight for temporal consistency loss")
     parser.add_argument("--output_dir", type=str, default="results/hybrid_multirate")
     args = parser.parse_args()
 
@@ -993,5 +1006,6 @@ if __name__ == "__main__":
         val_ratio=args.val_ratio,
         gate_reg_weight=args.gate_reg_weight,
         observed_weight=args.observed_weight,
+        consistency_weight=args.consistency_weight,
         output_dir=args.output_dir,
     )

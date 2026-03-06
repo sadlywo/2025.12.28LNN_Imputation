@@ -85,9 +85,10 @@ class CfCIMUDataset(Dataset):
         if use_attitude:
             self.extra_dim += 3
         self.feature_dim = self.base_dim + self.extra_dim
-        self.window_feat_dim = 12 if include_window_features else 0
-        # Input dim: feature_dim + mask(feature_dim) + dt(1) + window_feat_dim
-        self.input_dim = self.feature_dim * 2 + 1 + self.window_feat_dim
+        self.delta_dim = 6  # gyro/acc first-order difference
+        self.window_feat_dim = 24 if include_window_features else 0
+        # Input dim: feature_dim + mask(feature_dim) + dt(1) + delta(6) + window_feat_dim
+        self.input_dim = self.feature_dim * 2 + 1 + self.delta_dim + self.window_feat_dim
         
         self.sequences: List[dict] = []
         self._load_all_sequences(split, split_ratio, val_ratio)
@@ -347,6 +348,13 @@ class CfCIMUDataset(Dataset):
             torch.set_rng_state(rng_state)  # Restore RNG state
         
         imu_masked = input_imu * mask
+        # First-order difference (gyro/acc only) as additional input features
+        base_mask = mask[:, :6]
+        delta = torch.zeros_like(target_imu[:, :6])
+        if delta.shape[0] > 1:
+            delta_raw = input_imu[1:, :6] - input_imu[:-1, :6]
+            adj_mask = base_mask[1:] * base_mask[:-1]
+            delta[1:] = delta_raw * adj_mask
 
         if self.include_window_features:
             # Window-level features (shared across the sequence)
@@ -364,14 +372,28 @@ class CfCIMUDataset(Dataset):
                 acc_diff_energy = torch.zeros(3, dtype=target_imu.dtype)
                 gyro_diff_energy = torch.zeros(3, dtype=target_imu.dtype)
 
+            acc_energy = acc.pow(2).mean(dim=0)
+            gyro_energy = gyro.pow(2).mean(dim=0)
+            acc_var = acc.var(dim=0, unbiased=False)
+            gyro_var = gyro.var(dim=0, unbiased=False)
+
             window_feat_values = torch.cat(
-                [acc_abs_mean, gyro_abs_mean, acc_diff_energy, gyro_diff_energy],
+                [
+                    acc_abs_mean,
+                    gyro_abs_mean,
+                    acc_diff_energy,
+                    gyro_diff_energy,
+                    acc_energy,
+                    gyro_energy,
+                    acc_var,
+                    gyro_var,
+                ],
                 dim=0,
             )
             window_feats = window_feat_values.unsqueeze(0).repeat(self.seq_len, 1)
-            inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1), window_feats], dim=-1)
+            inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1), delta, window_feats], dim=-1)
         else:
-            inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1)], dim=-1)
+            inputs = torch.cat([imu_masked, mask, dt.unsqueeze(-1), delta], dim=-1)
         
         # Build return tuple based on options
         result = [inputs, target_imu, mask]

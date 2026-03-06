@@ -170,10 +170,11 @@ class ReconstructionOnlyLoss(nn.Module):
     Reconstruction-only loss used for non-CfC baselines (GRU/Transformer).
     Computes MSE on missing positions and (optionally) on observed positions.
     """
-    def __init__(self, w_recon: float = 1.0, w_observed: float = 0.0):
+    def __init__(self, w_recon: float = 1.0, w_observed: float = 0.0, w_consistency: float = 0.0):
         super().__init__()
         self.w_recon = w_recon
         self.w_observed = w_observed
+        self.w_consistency = w_consistency
 
     def forward(
         self,
@@ -186,11 +187,20 @@ class ReconstructionOnlyLoss(nn.Module):
         missing = (1 - mask)
         recon = ((pred - target) ** 2 * missing).sum() / (missing.sum() + 1e-8)
         observed = ((pred - target) ** 2 * mask).sum() / (mask.sum() + 1e-8)
-        total = self.w_recon * recon + self.w_observed * observed
+
+        if self.w_consistency != 0.0:
+            pred_diff = pred[:, 1:] - pred[:, :-1]
+            target_diff = target[:, 1:] - target[:, :-1]
+            mask_diff = mask[:, 1:] * mask[:, :-1]
+            consistency = ((pred_diff - target_diff) ** 2 * mask_diff).sum() / (mask_diff.sum() + 1e-8)
+        else:
+            consistency = torch.tensor(0.0, device=pred.device)
+
+        total = self.w_recon * recon + self.w_observed * observed + self.w_consistency * consistency
         components = {
             "recon": recon.item(),
             "observed": observed.item(),
-            "consistency": 0.0,
+            "consistency": consistency.item(),
             "smooth": 0.0,
         }
         return total, components

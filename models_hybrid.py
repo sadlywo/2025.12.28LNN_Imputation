@@ -43,12 +43,16 @@ class ShortTermLNN(nn.Module):
         self.gyro_head = nn.Sequential(
             nn.Linear(self.cfc_out_dim, hidden_units // 2),
             nn.Tanh(),
-            nn.Linear(hidden_units // 2, 3),
+            nn.Linear(hidden_units // 2, hidden_units // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_units // 4, 3),
         )
         self.acc_head = nn.Sequential(
             nn.Linear(self.cfc_out_dim, hidden_units // 2),
             nn.ReLU(),
-            nn.Linear(hidden_units // 2, 3),
+            nn.Linear(hidden_units // 2, hidden_units // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_units // 4, 3),
         )
 
         self.uncertainty_head = nn.Sequential(
@@ -212,8 +216,6 @@ class HybridLNNLSTM(nn.Module):
         if self.fusion_mode == "learned":
             gate_input = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
             gate = self.gate_net(gate_input)  # (B, T, 6) in [0, 1]
-            gate = gate.mean(dim=1, keepdim=True)  # window-level weight
-            gate = gate.expand(-1, lnn_pred.shape[1], -1)
         elif self.fusion_mode == "uncertainty":
             # Inverse uncertainty weighting
             lnn_w = 1.0 / (lnn_unc + 1e-6)
@@ -241,8 +243,6 @@ class HybridLNNLSTM(nn.Module):
 
         gate_input = torch.cat([lnn_pred, lstm_pred, lnn_unc, lstm_unc, x], dim=-1)
         gate = self.gate_net(gate_input)
-        gate = gate.mean(dim=1, keepdim=True)  # window-level weight
-        gate = gate.expand(-1, lnn_pred.shape[1], -1)
 
         pred = gate * lnn_pred + (1.0 - gate) * lstm_pred
         unc = self.combined_uncertainty(torch.cat([lnn_unc, lstm_unc], dim=-1))
