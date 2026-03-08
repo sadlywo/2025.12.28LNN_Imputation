@@ -35,14 +35,14 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """Training procedure configuration."""
-    epochs: int = 50
+    epochs: int = 30
     lr: float = 1e-3
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
     
     # Loss weights
     w_recon: float = 1.0  # 重建损失权重
-    w_consistency: float = 0.1  # 时间一致性损失
+    w_consistency: float = 0.0  # 时间一致性损失
     w_smooth: float = 0.0  # 平滑度损失
     
     # Scheduler

@@ -102,7 +102,7 @@ class CfCIMUDataset(Dataset):
     
     def _load_all_sequences(self, split: str, split_ratio: float, val_ratio: float):
         """Load and split sequences by file (not by window)."""
-        subfolders = ["handbag-1","handbag-2","handheld-1","handheld-2","pocket-1","pocket-2","running","slow walking","trolley","user-2"]
+        subfolders = ["handbag-1","handbag-2","handheld-1","handheld-2","running","slow walking","trolley","user-2"]
         all_file_pairs = []
         
         for subfolder in subfolders:

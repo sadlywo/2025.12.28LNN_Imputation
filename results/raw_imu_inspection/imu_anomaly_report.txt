@@ -1,0 +1,62 @@
+IMU Raw Data Anomaly Inspection Report
+============================================================
+Scanned files: 57
+Flagged files: 57
+
+Oxford Dataset\handbag-2\imu3.csv | severity=88234.5 | dt=43981 jump=271 spike=1 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-2\imu2.csv | severity=2892.5 | dt=9 jump=2270 spike=403 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-2\imu4.csv | severity=2636.5 | dt=12 jump=2350 spike=175 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-2\imu3.csv | severity=2632.5 | dt=11 jump=2219 spike=261 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-2\imu1.csv | severity=2597.0 | dt=12 jump=2258 spike=210 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-2\imu6.csv | severity=2163.0 | dt=12 jump=2028 spike=74 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-2\imu5.csv | severity=1814.5 | dt=10 jump=1664 spike=87 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-1\imu1.csv | severity=1587.0 | dt=12 jump=1332 spike=154 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-1\imu4.csv | severity=1501.5 | dt=6 jump=1431 spike=39 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-1\imu3.csv | severity=1395.0 | dt=8 jump=1358 spike=14 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-1\imu2.csv | severity=1220.5 | dt=7 jump=1202 spike=3 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\pocket-1\imu5.csv | severity=1166.0 | dt=4 jump=963 spike=130 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handbag-2\imu1.csv | severity=698.5 | dt=12 jump=643 spike=21 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handbag-1\imu3.csv | severity=662.5 | dt=4 jump=647 spike=5 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handbag-1\imu2.csv | severity=651.5 | dt=12 jump=617 spike=7 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handbag-2\imu2.csv | severity=647.5 | dt=15 jump=598 spike=13 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handbag-1\imu1.csv | severity=641.0 | dt=14 jump=595 spike=12 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\user-2\imu4.csv | severity=613.0 | dt=6 jump=601 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\handbag-2\imu4.csv | severity=482.5 | dt=6 jump=463 spike=5 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\user-2\imu6.csv | severity=472.5 | dt=2 jump=455 spike=9 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handbag-1\imu4.csv | severity=450.0 | dt=10 jump=403 spike=18 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\user-2\imu5.csv | severity=431.5 | dt=6 jump=409 spike=7 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\user-2\imu3.csv | severity=390.0 | dt=9 jump=372 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\trolley\imu2.csv | severity=383.0 | dt=11 jump=295 spike=44 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\trolley\imu3.csv | severity=206.5 | dt=13 jump=152 spike=19 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\trolley\imu1.csv | severity=203.0 | dt=11 jump=181 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\running\imu4.csv | severity=184.0 | dt=82 jump=20 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\trolley\imu4.csv | severity=167.5 | dt=17 jump=114 spike=13 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\trolley\imu5.csv | severity=163.0 | dt=19 jump=116 spike=6 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\slow walking\imu1.csv | severity=159.0 | dt=75 jump=9 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\slow walking\imu4.csv | severity=159.0 | dt=70 jump=19 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\slow walking\imu6.csv | severity=158.0 | dt=72 jump=14 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\user-2\imu2.csv | severity=140.0 | dt=4 jump=132 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\slow walking\imu3.csv | severity=138.0 | dt=57 jump=24 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\slow walking\imu5.csv | severity=136.0 | dt=65 jump=6 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\trolley\imu6.csv | severity=135.5 | dt=20 jump=91 spike=3 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\running\imu3.csv | severity=132.0 | dt=63 jump=6 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\user-2\imu1.csv | severity=131.0 | dt=2 jump=127 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\slow walking\imu2.csv | severity=129.0 | dt=55 jump=19 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\running\imu2.csv | severity=118.0 | dt=55 jump=8 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\running\imu5.csv | severity=117.0 | dt=54 jump=9 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\handheld-1\imu2.csv | severity=116.0 | dt=8 jump=100 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\running\imu7.csv | severity=112.0 | dt=47 jump=18 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\handheld-1\imu5.csv | severity=109.5 | dt=9 jump=72 spike=13 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handheld-1\imu4.csv | severity=105.5 | dt=6 jump=92 spike=1 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\running\imu1.csv | severity=101.0 | dt=48 jump=5 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\running\imu6.csv | severity=92.0 | dt=38 jump=16 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\slow walking\imu7.csv | severity=68.0 | dt=33 jump=2 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\slow walking\imu8.csv | severity=62.0 | dt=22 jump=18 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\handheld-1\imu1.csv | severity=58.0 | dt=6 jump=46 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\handheld-1\imu3.csv | severity=45.0 | dt=1 jump=34 spike=6 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handheld-2\imu3.csv | severity=43.0 | dt=7 jump=20 spike=6 flatline=0 | timestamp异常;跳变;尖峰
+Oxford Dataset\handheld-1\imu6.csv | severity=37.0 | dt=7 jump=23 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\trolley\imu7.csv | severity=26.0 | dt=8 jump=10 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\handheld-2\imu2.csv | severity=21.0 | dt=5 jump=11 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\handheld-2\imu1.csv | severity=14.0 | dt=6 jump=2 spike=0 flatline=0 | timestamp异常;跳变
+Oxford Dataset\handheld-1\imu7.csv | severity=9.0 | dt=0 jump=6 spike=2 flatline=0 | 跳变;尖峰
