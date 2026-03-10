@@ -40,19 +40,31 @@ def plot_training_curves(history: dict, save_path: str = "training_curves.png"):
     axes[0, 1].legend(fontsize=11)
     axes[0, 1].grid(True, alpha=0.3)
     
-    # 3. MSE (Masked/Missing only)
-    mse_missing_key = 'val_mse_missing' if 'val_mse_missing' in history else 'val_mse_masked'
-    axes[1, 0].plot(epochs, history[mse_missing_key], 'm-', label='MSE (Missing)', linewidth=2)
+    # 3. Missing-only metric: prefer RMSE for newer experiments, fallback to MSE
+    if 'val_rmse_missing' in history:
+        missing_key = 'val_rmse_missing'
+        missing_label = 'RMSE (Missing)'
+        missing_title = 'RMSE (Missing Positions)'
+    elif 'val_mse_missing' in history:
+        missing_key = 'val_mse_missing'
+        missing_label = 'MSE (Missing)'
+        missing_title = 'MSE (Missing Positions)'
+    else:
+        missing_key = 'val_mse_masked'
+        missing_label = 'MSE (Missing)'
+        missing_title = 'MSE (Missing Positions)'
+
+    axes[1, 0].plot(epochs, history[missing_key], 'm-', label=missing_label, linewidth=2)
     axes[1, 0].set_xlabel('Epoch', fontsize=12)
-    axes[1, 0].set_ylabel('MSE', fontsize=12)
-    axes[1, 0].set_title('MSE (Missing Positions)', fontsize=14, fontweight='bold')
+    axes[1, 0].set_ylabel('Value', fontsize=12)
+    axes[1, 0].set_title(missing_title, fontsize=14, fontweight='bold')
     axes[1, 0].legend(fontsize=11)
     axes[1, 0].grid(True, alpha=0.3)
     
     # 4. Loss comparison
     axes[1, 1].plot(epochs, history['train_loss'], 'b-', label='Train', alpha=0.7, linewidth=2)
     axes[1, 1].plot(epochs, history['val_loss'], 'r-', label='Val', alpha=0.7, linewidth=2)
-    axes[1, 1].plot(epochs, history[mse_missing_key], 'g-', label='MSE(Missing)', alpha=0.7, linewidth=2)
+    axes[1, 1].plot(epochs, history[missing_key], 'g-', label=missing_label, alpha=0.7, linewidth=2)
     axes[1, 1].set_xlabel('Epoch', fontsize=12)
     axes[1, 1].set_ylabel('Value', fontsize=12)
     axes[1, 1].set_title('Overall Metrics', fontsize=14, fontweight='bold')
