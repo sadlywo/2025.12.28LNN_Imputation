@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Hybrid LNN-LSTM Imputation Model.
 
