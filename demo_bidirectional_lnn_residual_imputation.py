@@ -206,7 +206,7 @@ def run_demo(
     demo_output_dir: str = "results/bidirectional_lnn_residual/demo_imputation",
     seq_len: int = 30,
     mask_rate: float = 0.3,
-    missing_mode: str = "block",
+    missing_mode: str = "random",
     sample_index: int = 0,
     lnn_hidden: int = 128,
     lstm_hidden: int = 64,
@@ -253,7 +253,7 @@ def run_demo(
         lstm_layers=lstm_layers,
     )
 
-    model_outputs: Dict[str, Dict[str, np.ndarray]] = {}
+    model_outputs: Dict[str, Dict[str, np.ndarray | float]] = {}
     loaded_models: Dict[str, torch.nn.Module] = {}
     load_rows: List[dict] = []
     for model_name, model in models.items():
@@ -270,13 +270,24 @@ def run_demo(
             pred, _ = model(inputs)
         loaded_models[model_name] = model
 
-        traj_before = compute_ate(masked_signal, gt_pos, dt, stats=stats)["pred_trajectory"][0]
-        traj_after = compute_ate(pred, gt_pos, dt, stats=stats)["pred_trajectory"][0]
+        before_result = compute_ate(masked_signal, gt_pos, dt, stats=stats)
+        after_result = compute_ate(pred, gt_pos, dt, stats=stats)
+        traj_before = before_result["pred_trajectory"][0]
+        traj_after = after_result["pred_trajectory"][0]
         traj_gt = gt_pos[0]
+        missing_mask_3d = (1.0 - mask[:, :, :6]).max(dim=-1).values.unsqueeze(-1)
+        pred_missing_err = (pred - target)[:, :, :6] * missing_mask_3d
+        missing_count = int(missing_mask_3d.sum().item())
+        missing_rmse = float(
+            torch.sqrt((pred_missing_err.pow(2).sum() / max(missing_count * 6, 1))).item()
+        )
         model_outputs[model_name] = {
             "before_xy": _to_xy(traj_before, xy_axes),
             "after_xy": _to_xy(traj_after, xy_axes),
             "gt_xy": _to_xy(traj_gt, xy_axes),
+            "ate_before": float(before_result["ate"]),
+            "ate_after": float(after_result["ate"]),
+            "missing_rmse": missing_rmse,
         }
         load_rows.append({"model": model_name, "checkpoint": ckpt.name, "loaded": True, "note": "ok"})
 
@@ -333,7 +344,7 @@ def run_demo(
             ax.set_ylabel("Y Position (m)")
         ax.set_xlim(*xlim_full)
         ax.set_ylim(*ylim_full)
-        ax.set_aspect("auto")
+        ax.set_aspect("equal", adjustable="box")
         ax.grid(True, alpha=0.25)
         if i == 0:
             ax.legend(loc="best", frameon=True, framealpha=0.9)
@@ -376,7 +387,7 @@ def run_demo(
             ax.set_xlabel("X Position (m)")
             if i == 0:
                 ax.set_ylabel("Y Position (m)")
-            ax.set_aspect("auto")
+            ax.set_aspect("equal", adjustable="box")
             ax.grid(True, alpha=0.25)
             if r == 0 and i == 0:
                 ax.legend(loc="best", frameon=True, framealpha=0.9)
@@ -390,77 +401,91 @@ def run_demo(
     fig2.savefig(fig_path_seg, dpi=300, bbox_inches="tight")
     plt.close(fig2)
 
-    loop_idx = _find_loop_like_sample(dataset, max_scan=500)
-    inputs_loop, target_loop, mask_loop, stats_loop, vicon_loop = _extract_demo_batch(dataset, loop_idx, device)
-    dt_loop = inputs_loop[:, :, dt_index]
-    masked_loop_signal = inputs_loop[:, :, :feature_dim]
-    gt_loop = vicon_loop[:, :, :3]
-    with torch.no_grad():
-        pred_loop, _ = loaded_models[first_name](inputs_loop)
-
-    traj_before_loop = compute_ate(masked_loop_signal, gt_loop, dt_loop, stats=stats_loop)["pred_trajectory"][0]
-    traj_after_loop = compute_ate(pred_loop, gt_loop, dt_loop, stats=stats_loop)["pred_trajectory"][0]
-    traj_gt_loop = gt_loop[0]
-
-    axes_loop = _choose_xy_axes_by_span(traj_gt_loop.detach().cpu().numpy())
-    gt_loop_xy = _to_xy(traj_gt_loop, axes_loop)
-    before_loop_xy = _to_xy(traj_before_loop, axes_loop)
-    after_loop_xy = _to_xy(traj_after_loop, axes_loop)
-    miss_loop_idx = np.where((mask_loop[0].mean(dim=-1).detach().cpu().numpy() < 0.999))[0]
-    obs_loop_xy = before_loop_xy.copy()
-    obs_loop_xy[miss_loop_idx] = np.nan
-
-    fig3, ax3 = plt.subplots(1, 1, figsize=(6.0, 5.2))
-    ax3.plot(gt_loop_xy[:, 0], gt_loop_xy[:, 1], color="black", linewidth=2.2, alpha=0.95, label="GT loop trajectory", zorder=4)
-    ax3.plot(obs_loop_xy[:, 0], obs_loop_xy[:, 1], color="#1f77b4", linewidth=2.0, alpha=0.95, label="Observed (with missing block)", zorder=5)
-    if len(miss_loop_idx) > 0:
-        ax3.scatter(
-            gt_loop_xy[miss_loop_idx, 0],
-            gt_loop_xy[miss_loop_idx, 1],
-            s=38,
-            marker="x",
-            color="#d62728",
-            linewidth=1.25,
-            label="Missing points",
-            zorder=7,
-        )
-    ax3.scatter(gt_loop_xy[0, 0], gt_loop_xy[0, 1], s=36, color="#2ca02c", label="Start", zorder=8)
-    ax3.scatter(gt_loop_xy[-1, 0], gt_loop_xy[-1, 1], s=40, marker="X", color="#ff7f0e", label="End", zorder=8)
-    ax3.set_title(f"Loop-Like Trajectory Missing Case (sample={loop_idx}, mode={missing_mode})")
-    ax3.set_xlabel("X Position (m)")
-    ax3.set_ylabel("Y Position (m)")
-    ax3.grid(True, alpha=0.25)
-    ax3.set_aspect("equal", adjustable="box")
-    ax3.legend(loc="best", frameon=True, framealpha=0.9)
+    fig3, axes3 = plt.subplots(1, n, figsize=(5.6 * n, 4.4), squeeze=False, sharey=True)
+    if len(missing_step_idx) > 0:
+        miss_bool = np.zeros(mask.shape[1], dtype=bool)
+        miss_bool[missing_step_idx] = True
+    else:
+        miss_bool = np.zeros(mask.shape[1], dtype=bool)
+        miss_bool[max(0, s0):min(mask.shape[1], s1)] = True
+    obs_bool = ~miss_bool
+    for i, name in enumerate(model_names):
+        ax = axes3[0, i]
+        d = model_outputs[name]
+        err_before = np.linalg.norm(d["before_xy"] - d["gt_xy"], axis=1)
+        err_after = np.linalg.norm(d["after_xy"] - d["gt_xy"], axis=1)
+        before_missing = float(np.mean(err_before[miss_bool])) if miss_bool.any() else float(np.mean(err_before))
+        after_missing = float(np.mean(err_after[miss_bool])) if miss_bool.any() else float(np.mean(err_after))
+        before_observed = float(np.mean(err_before[obs_bool])) if obs_bool.any() else float(np.mean(err_before))
+        after_observed = float(np.mean(err_after[obs_bool])) if obs_bool.any() else float(np.mean(err_after))
+        labels = ["Missing", "Observed"]
+        x = np.arange(2)
+        bw = 0.34
+        ax.bar(x - bw / 2, [before_missing, before_observed], width=bw, color="#d62728", alpha=0.86, label="Before")
+        ax.bar(x + bw / 2, [after_missing, after_observed], width=bw, color="#1f77b4", alpha=0.86, label="After")
+        ax.set_title(name)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        if i == 0:
+            ax.set_ylabel("Mean 2D Position Error (m)")
+            ax.legend(loc="best", frameon=True, framealpha=0.9)
+        ax.grid(True, axis="y", alpha=0.25)
+    fig3.suptitle("Error Breakdown by Missing/Observed Steps", fontsize=13, fontweight="bold")
     fig3.tight_layout()
-    fig_path_loop = save_dir / f"trajectory_loop_missing_case_{timestamp}.png"
-    fig3.savefig(fig_path_loop, dpi=300, bbox_inches="tight")
+    fig_path_breakdown = save_dir / f"trajectory_missing_observed_breakdown_{timestamp}.png"
+    fig3.savefig(fig_path_breakdown, dpi=300, bbox_inches="tight")
     plt.close(fig3)
 
-    ref_name = model_names[0]
-    gt_10 = _subsample_one_tenth(gt_loop_xy)
-    before_10 = _subsample_one_tenth(obs_loop_xy)
-    after_10 = _subsample_one_tenth(after_loop_xy)
-
-    fig4, axes4 = plt.subplots(1, 3, figsize=(14.8, 4.5), squeeze=False)
-    titles = ["GT Trajectory (1/10 samples)", "Missing Trajectory (1/10 samples)", "Imputed Trajectory (1/10 samples)"]
-    series = [gt_10, before_10, after_10]
-    colors = ["black", "#d62728", "#1f77b4"]
-    for i in range(3):
-        ax = axes4[0, i]
-        xy = series[i]
-        ax.plot(xy[:, 0], xy[:, 1], color=colors[i], linewidth=2.0, marker="o", markersize=3.2)
-        ax.set_title(titles[i])
-        ax.set_xlabel("X Position (m)")
-        if i == 0:
-            ax.set_ylabel("Y Position (m)")
-        ax.grid(True, alpha=0.25)
-        ax.set_aspect("equal", adjustable="box")
-    fig4.suptitle(f"One-Tenth Trajectory Views (loop sample={loop_idx}, model={ref_name}, mode={missing_mode})", fontsize=12.5, fontweight="bold")
+    fig4, axes4 = plt.subplots(2, n, figsize=(5.9 * n, 7.2), squeeze=False, sharex=True)
+    t = np.arange(mask.shape[1])
+    for i, name in enumerate(model_names):
+        d = model_outputs[name]
+        for r, coord_name in enumerate(["X", "Y"]):
+            ax = axes4[r, i]
+            dim = 0 if r == 0 else 1
+            ax.plot(t, d["gt_xy"][:, dim], color="black", linewidth=2.0, label="GT", zorder=4)
+            ax.plot(t, d["before_xy"][:, dim], color="#d62728", linestyle="--", linewidth=1.35, label="Before", zorder=2)
+            ax.plot(t, d["after_xy"][:, dim], color="#1f77b4", linewidth=1.45, label="After", zorder=3)
+            for seg_start, seg_end in all_segments:
+                ax.axvspan(seg_start, seg_end, color="#ffbf00", alpha=0.16)
+            if r == 0:
+                ax.set_title(name)
+            if i == 0:
+                ax.set_ylabel(f"{coord_name} Position (m)")
+            if r == 1:
+                ax.set_xlabel("Time Step")
+            ax.grid(True, alpha=0.22)
+            if r == 0 and i == 0:
+                ax.legend(loc="best", frameon=True, framealpha=0.9)
+    fig4.suptitle("Trajectory Coordinates Over Time (Missing Intervals Highlighted)", fontsize=13, fontweight="bold")
     fig4.tight_layout()
-    fig_path_onetenth = save_dir / f"trajectory_onetenth_views_{timestamp}.png"
-    fig4.savefig(fig_path_onetenth, dpi=300, bbox_inches="tight")
+    fig_path_coords_t = save_dir / f"trajectory_coordinates_timeseries_{timestamp}.png"
+    fig4.savefig(fig_path_coords_t, dpi=300, bbox_inches="tight")
     plt.close(fig4)
+
+    fig5, axes5 = plt.subplots(1, n, figsize=(5.8 * n, 4.2), squeeze=False, sharey=True)
+    time_steps = np.arange(mask.shape[1])
+    for i, name in enumerate(model_names):
+        ax = axes5[0, i]
+        d = model_outputs[name]
+        err_before = np.linalg.norm(d["before_xy"] - d["gt_xy"], axis=1)
+        err_after = np.linalg.norm(d["after_xy"] - d["gt_xy"], axis=1)
+        ax.plot(time_steps, err_before, color="#d62728", linestyle="--", linewidth=1.45, label="Before")
+        ax.plot(time_steps, err_after, color="#1f77b4", linewidth=1.65, label="After")
+        for seg_start, seg_end in all_segments:
+            ax.axvspan(seg_start, seg_end, color="#ffbf00", alpha=0.18)
+        ax.set_title(name)
+        ax.set_xlabel("Time Step")
+        if i == 0:
+            ax.set_ylabel("2D Position Error (m)")
+        ax.grid(True, alpha=0.25)
+        if i == 0:
+            ax.legend(loc="best", frameon=True, framealpha=0.9)
+    fig5.suptitle("Per-Step Trajectory Error (Highlighted Missing Intervals)", fontsize=13, fontweight="bold")
+    fig5.tight_layout()
+    fig_path_error_t = save_dir / f"trajectory_error_timeseries_{timestamp}.png"
+    fig5.savefig(fig_path_error_t, dpi=300, bbox_inches="tight")
+    plt.close(fig5)
 
     pd_rows = []
     for name in model_names:
@@ -473,11 +498,63 @@ def run_demo(
                 "trajectory_rmse_before": before_rmse,
                 "trajectory_rmse_after": after_rmse,
                 "rmse_improvement": before_rmse - after_rmse,
+                "ate_before": float(d["ate_before"]),
+                "ate_after": float(d["ate_after"]),
+                "ate_improvement": float(d["ate_before"]) - float(d["ate_after"]),
+                "missing_imputation_rmse": float(d["missing_rmse"]),
                 "missing_segment_start": int(s0),
                 "missing_segment_end": int(s1),
             }
         )
     df_metrics = pd.DataFrame(pd_rows)
+
+    model_labels = df_metrics["model"].to_list()
+    x = np.arange(len(model_labels))
+    bar_w = 0.36
+    fig6, axes6 = plt.subplots(1, 3, figsize=(17.2, 4.8), squeeze=False)
+    ax_rmse = axes6[0, 0]
+    ax_rmse.bar(x - bar_w / 2, df_metrics["trajectory_rmse_before"], width=bar_w, color="#d62728", alpha=0.85, label="Before")
+    ax_rmse.bar(x + bar_w / 2, df_metrics["trajectory_rmse_after"], width=bar_w, color="#1f77b4", alpha=0.85, label="After")
+    ax_rmse.set_title("Trajectory RMSE Comparison")
+    ax_rmse.set_ylabel("RMSE (m)")
+    ax_rmse.set_xticks(x)
+    ax_rmse.set_xticklabels(model_labels, rotation=10)
+    ax_rmse.grid(True, axis="y", alpha=0.25)
+    ax_rmse.legend(loc="best", frameon=True, framealpha=0.9)
+
+    ax_gain = axes6[0, 1]
+    ate_gain = df_metrics["ate_improvement"].to_numpy()
+    colors = np.where(ate_gain >= 0, "#2ca02c", "#d62728")
+    bars = ax_gain.bar(x, ate_gain, color=colors, alpha=0.88)
+    ax_gain.axhline(0.0, color="black", linewidth=1.0)
+    ax_gain.set_title("ATE Improvement (Before - After)")
+    ax_gain.set_ylabel("ATE Gain (m)")
+    ax_gain.set_xticks(x)
+    ax_gain.set_xticklabels(model_labels, rotation=10)
+    ax_gain.grid(True, axis="y", alpha=0.25)
+    for j, b in enumerate(bars):
+        h = float(b.get_height())
+        va = "bottom" if h >= 0 else "top"
+        dy = 0.01 if h >= 0 else -0.01
+        ax_gain.text(b.get_x() + b.get_width() * 0.5, h + dy, f"{h:.3f}", ha="center", va=va, fontsize=9)
+
+    ax_missing = axes6[0, 2]
+    miss_rmse = df_metrics["missing_imputation_rmse"].to_numpy()
+    miss_bars = ax_missing.bar(x, miss_rmse, color="#9467bd", alpha=0.9)
+    ax_missing.set_title("Imputation RMSE on Missing IMU")
+    ax_missing.set_ylabel("Missing-Point RMSE")
+    ax_missing.set_xticks(x)
+    ax_missing.set_xticklabels(model_labels, rotation=10)
+    ax_missing.grid(True, axis="y", alpha=0.25)
+    for b in miss_bars:
+        h = float(b.get_height())
+        ax_missing.text(b.get_x() + b.get_width() * 0.5, h + 0.001, f"{h:.3f}", ha="center", va="bottom", fontsize=9)
+
+    fig6.suptitle("Model-Wise Downstream Trajectory Impact Summary", fontsize=13, fontweight="bold")
+    fig6.tight_layout()
+    fig_path_summary = save_dir / f"trajectory_downstream_impact_summary_{timestamp}.png"
+    fig6.savefig(fig_path_summary, dpi=300, bbox_inches="tight")
+    plt.close(fig6)
     df_load = pd.DataFrame(load_rows)
     metrics_csv = save_dir / f"demo_metrics_{timestamp}.csv"
     load_csv = save_dir / f"checkpoint_load_status_{timestamp}.csv"
@@ -486,23 +563,24 @@ def run_demo(
 
     print(f"[Saved] {fig_path_full}")
     print(f"[Saved] {fig_path_seg}")
-    print(f"[Saved] {fig_path_loop}")
-    print(f"[Saved] {fig_path_onetenth}")
+    print(f"[Saved] {fig_path_breakdown}")
+    print(f"[Saved] {fig_path_coords_t}")
+    print(f"[Saved] {fig_path_error_t}")
+    print(f"[Saved] {fig_path_summary}")
     print(f"[Saved] {metrics_csv}")
     print(f"[Saved] {load_csv}")
     print(f"[Info] XY axes selected from GT trajectory: {xy_axes}")
     print(f"[Info] missing segments found: {len(all_segments)}, selected: {selected_segments}")
-    print(f"[Info] loop-like sample selected: {loop_idx}, axes: {axes_loop}")
     print(df_metrics.to_string(index=False))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Demo: load trained BiLNN/BiLSTM/Hybrid models for trajectory imputation under contiguous missing segments")
+    parser = argparse.ArgumentParser(description="Demo: load trained BiLNN/BiLSTM/Hybrid models for trajectory imputation under random missing")
     parser.add_argument("--output_dir", type=str, default="results/bidirectional_lnn_residual")
     parser.add_argument("--demo_output_dir", type=str, default="results/bidirectional_lnn_residual/demo_imputation")
     parser.add_argument("--seq_len", type=int, default=30)
     parser.add_argument("--mask_rate", type=float, default=0.3)
-    parser.add_argument("--missing_mode", type=str, default="block", choices=["random", "block", "channel"])
+    parser.add_argument("--missing_mode", type=str, default="random", choices=["random", "block", "channel"])
     parser.add_argument("--sample_index", type=int, default=0)
     parser.add_argument("--lnn_hidden", type=int, default=128)
     parser.add_argument("--lstm_hidden", type=int, default=64)

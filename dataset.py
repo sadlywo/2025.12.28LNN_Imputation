@@ -250,8 +250,15 @@ class CfCIMUDataset(Dataset):
                     vicon_pos = vi_df[VICON_POS_COLUMNS].to_numpy(dtype=np.float32)
                     vicon_quat = vi_df[VICON_QUAT_COLUMNS].to_numpy(dtype=np.float32)
                     vicon_time = vi_df["Time"].to_numpy(dtype=np.float64)
+                elif vi_df.shape[1] >= 9:
+                    # Fallback by column index (9 columns):
+                    # [Time_ns, frame_idx, pos(3), quat(4)]
+                    vicon_time = vi_df.iloc[:, 0].to_numpy(dtype=np.float64)
+                    vicon_pos = vi_df.iloc[:, 2:5].to_numpy(dtype=np.float32)
+                    vicon_quat = vi_df.iloc[:, 5:9].to_numpy(dtype=np.float32)
                 elif vi_df.shape[1] >= 8:
-                    # Fallback by column index: [Time, pos(3), quat(4)]
+                    # Fallback by column index (8 columns):
+                    # [Time, pos(3), quat(4)]
                     vicon_time = vi_df.iloc[:, 0].to_numpy(dtype=np.float64)
                     vicon_pos = vi_df.iloc[:, 1:4].to_numpy(dtype=np.float32)
                     vicon_quat = vi_df.iloc[:, 4:8].to_numpy(dtype=np.float32)
