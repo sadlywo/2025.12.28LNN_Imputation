@@ -227,6 +227,7 @@ grep '^batch_size:' "$ACTIVE_CONFIG"
 export RESULT_ROOT="results/validation_v2/server_full-${COMMIT}-batch16"
 export RUN_LOG="$AUDIT_DIR/server_full-${COMMIT}-batch16.log"
 # Preserve the original root and run/resume this exact replacement command.
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 set -o pipefail
 python -m validation_v2.cli matrix \
   --config "$ACTIVE_CONFIG" \

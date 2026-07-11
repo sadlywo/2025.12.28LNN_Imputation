@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 
 import pytest
@@ -22,6 +23,25 @@ TRAJECTORY_METRICS = (
     "velocity_rmse_mps",
     "delta_ate_rmse_m",
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_runbook_pins_cuda_workspace_for_every_full_matrix_command() -> None:
+    runbook = (REPO_ROOT / "docs" / "validation_v2_server_runbook.md").read_text(
+        encoding="utf-8"
+    )
+    bash_blocks = re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)
+    matrix_blocks = [
+        block
+        for block in bash_blocks
+        if "python -m validation_v2.cli matrix" in block and "--dry-run" not in block
+    ]
+
+    assert matrix_blocks
+    assert all(
+        "CUBLAS_WORKSPACE_CONFIG=:4096:8" in block for block in matrix_blocks
+    ), matrix_blocks
 
 
 def _sha256(path: Path) -> str:
