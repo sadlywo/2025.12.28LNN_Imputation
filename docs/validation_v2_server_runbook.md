@@ -76,11 +76,13 @@ Use the existing conda environment at `/root/miniconda3/envs/pinn_imu`:
 source /root/miniconda3/etc/profile.d/conda.sh
 conda activate /root/miniconda3/envs/pinn_imu
 cd /root/autodl-tmp/2025.12.28LNN_Imputation
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 python --version
 python -m pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.3.1
 python -m pip install -r requirements-validation-v2.txt
 python - <<'PY'
 import importlib.metadata as md
+import os
 import platform
 import torch
 
@@ -96,10 +98,12 @@ expected = {
 actual = {name: md.version(name) for name in expected}
 assert platform.python_version().startswith("3.9."), platform.python_version()
 assert actual == expected, (actual, expected)
+assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
 assert torch.cuda.is_available()
 assert torch.version.cuda == "12.1", torch.version.cuda
 assert "4090 D" in torch.cuda.get_device_name(0), torch.cuda.get_device_name(0)
 print(platform.python_version(), actual)
+print("CUBLAS_WORKSPACE_CONFIG", os.environ["CUBLAS_WORKSPACE_CONFIG"])
 print(torch.version.cuda, torch.cuda.get_device_name(0))
 PY
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
@@ -173,6 +177,7 @@ export RESULT_ROOT="results/validation_v2/server_full-${COMMIT}"
 export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${COMMIT}"
 export RUN_LOG="$AUDIT_DIR/server_full-${COMMIT}.log"
 export ACTIVE_CONFIG="$PWD/configs/validation_v2/server_full.yaml"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 set -o pipefail
 python -m validation_v2.cli matrix \
   --config "$ACTIVE_CONFIG" \
@@ -190,7 +195,8 @@ export RESULT_ROOT="results/validation_v2/server_full-${COMMIT}"
 export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${COMMIT}"
 export RUN_LOG="$AUDIT_DIR/server_full-${COMMIT}.log"
 mkdir -p "$AUDIT_DIR"
-nohup env ACTIVE_CONFIG="$ACTIVE_CONFIG" RESULT_ROOT="$RESULT_ROOT" RUN_LOG="$RUN_LOG" \
+nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 ACTIVE_CONFIG="$ACTIVE_CONFIG" \
+  RESULT_ROOT="$RESULT_ROOT" RUN_LOG="$RUN_LOG" \
   bash -lc 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate /root/miniconda3/envs/pinn_imu && cd /root/autodl-tmp/2025.12.28LNN_Imputation && set -o pipefail && python -m validation_v2.cli matrix --config "$ACTIVE_CONFIG" --output-root "$RESULT_ROOT" --device cuda 2>&1 | tee -a "$RUN_LOG"' \
   >"$AUDIT_DIR/nohup.out" 2>&1 &
 ```

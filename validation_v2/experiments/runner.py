@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+import os
+
+_CUBLAS_WORKSPACE_CONFIG = os.environ.setdefault(
+    "CUBLAS_WORKSPACE_CONFIG", ":4096:8"
+)
+if _CUBLAS_WORKSPACE_CONFIG not in {":4096:8", ":16:8"}:
+    raise ValueError("CUBLAS_WORKSPACE_CONFIG must be :4096:8 or :16:8")
+
 import csv
 import hashlib
 import json
