@@ -101,13 +101,15 @@ def contiguous_block(
 def channel_outage(
     template: torch.Tensor, requested_fraction: float, seed: int
 ) -> MaskResult:
-    """Mask whole channels, using floor(channel_count * requested_fraction)."""
+    """Mask whole channels, with one-channel minimum for a positive request."""
 
     template = _template(template)
     requested_fraction = _fraction(requested_fraction, "requested_fraction")
     seed = _seed(seed)
+    floored = int(math.floor(template.shape[1] * requested_fraction))
     channels = min(
-        template.shape[1], int(math.floor(template.shape[1] * requested_fraction))
+        template.shape[1],
+        max(1, floored) if requested_fraction > 0 else 0,
     )
     mask = torch.ones_like(template)
     if channels:

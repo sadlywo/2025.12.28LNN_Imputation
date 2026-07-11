@@ -216,6 +216,14 @@ def test_channel_mask_reports_floor_discrete_realized_rate():
     assert int((result.mask == 0).all(dim=0).sum()) == 1
 
 
+def test_positive_channel_rate_masks_at_least_one_channel():
+    result = channel_outage(torch.ones(100, 6), requested_fraction=0.10, seed=7)
+
+    assert result.masked_channels == 1
+    assert result.realized_fraction == pytest.approx(1 / 6)
+    assert int((result.mask == 0).all(dim=0).sum()) == 1
+
+
 @pytest.mark.parametrize("fraction", [0.0, 1.0])
 @pytest.mark.parametrize("generator", [point_missing, contiguous_block, channel_outage])
 def test_mask_fraction_boundaries(generator, fraction):

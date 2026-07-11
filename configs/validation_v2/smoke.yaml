@@ -1,0 +1,38 @@
+data_root: Oxford Dataset
+output_root: results/validation_v2/smoke
+selection_split: validation
+seeds: [2026]
+seq_len: 30
+batch_size: 4
+epochs: 1
+device: auto
+models: [linear, bilstm, hybrid]
+protocols: [strict_file]
+topologies: [point]
+rates: [0.3]
+objective: reconstruction_only
+kinematic_ablation:
+  name: kinematic_ablation
+  enabled: false
+trajectory_enabled: true
+max_train_windows: 4
+max_eval_samples: 120
+hidden_size: 4
+learning_rate: 0.001
+recordings:
+  - scenario: handbag-1
+    split: train
+    imu: handbag-1/imu1.csv
+    vicon: handbag-1/vi1.csv
+  - scenario: handbag-1
+    split: train
+    imu: handbag-1/imu2.csv
+    vicon: handbag-1/vi2.csv
+  - scenario: handbag-1
+    split: validation
+    imu: handbag-1/imu3.csv
+    vicon: handbag-1/vi3.csv
+  - scenario: handbag-1
+    split: test
+    imu: handbag-1/imu4.csv
+    vicon: handbag-1/vi4.csv

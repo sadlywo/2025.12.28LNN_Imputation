@@ -65,6 +65,10 @@ def enumerate_matrix(config: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "irregular_method": irregular.get("method"),
                 "requested_irregularity": irregular.get("requested_irregularity"),
                 "realized_irregularity": irregular.get("realized_irregularity"),
+                "value_topology": irregular.get("value_topology"),
+                "value_requested_fraction": irregular.get(
+                    "value_requested_fraction"
+                ),
             }
         )
 
