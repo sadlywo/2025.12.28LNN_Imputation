@@ -1,9 +1,14 @@
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
 from validation_v2.config import ExperimentConfig, load_config
+
+
+def test_config_declares_selection_split_as_str():
+    assert get_type_hints(ExperimentConfig)["selection_split"] is str
 
 
 def test_config_rejects_test_tuning(tmp_path: Path):

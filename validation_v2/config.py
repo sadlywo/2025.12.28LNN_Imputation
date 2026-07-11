@@ -2,18 +2,16 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Mapping
 
 import yaml
-
-from .types import SelectionSplit
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     data_root: Path
     output_root: Path
-    selection_split: SelectionSplit
+    selection_split: str
     seeds: tuple[int, ...]
     seq_len: int
     batch_size: int
@@ -36,7 +34,7 @@ def load_config(path: Path) -> ExperimentConfig:
     return ExperimentConfig(
         data_root=Path(str(data["data_root"])),
         output_root=Path(str(data["output_root"])),
-        selection_split=cast(SelectionSplit, selection_split),
+        selection_split=selection_split,
         seeds=tuple(int(seed) for seed in raw_seeds),
         seq_len=int(data["seq_len"]),
         batch_size=int(data["batch_size"]),
