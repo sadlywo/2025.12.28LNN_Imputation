@@ -259,6 +259,33 @@ def test_interval_jitter_is_deterministic_strictly_increasing_and_not_a_value_ma
     torch.testing.assert_close(original_time, torch.arange(10, dtype=torch.float64) * 0.1)
 
 
+def test_interval_jitter_preserves_endpoints_duration_and_changes_two_intervals():
+    original_time = torch.tensor(
+        [0.0, 0.07, 0.21, 0.30, 0.55, 0.8], dtype=torch.float64
+    )
+
+    result = generate_interval_jittered_time(
+        original_time, requested_irregularity=0.01, seed=19
+    )
+
+    assert result.time[0].item() == original_time[0].item()
+    assert result.time[-1].item() == original_time[-1].item()
+    assert torch.all(torch.diff(result.time) > 0)
+    assert torch.sum(result.dt[1:]).item() == pytest.approx(
+        (original_time[-1] - original_time[0]).item()
+    )
+    changed = ~torch.isclose(
+        torch.diff(result.time),
+        torch.diff(original_time),
+        rtol=0.0,
+        atol=torch.finfo(original_time.dtype).eps * 8,
+    )
+    assert int(changed.sum()) >= 2
+    assert result.realized_irregularity == pytest.approx(
+        changed.to(torch.float64).mean().item()
+    )
+
+
 def test_windows_do_not_cross_recording_or_index_discontinuities_and_preserve_fields():
     target = torch.arange(72, dtype=torch.float32).reshape(12, 6)
     mask = torch.ones_like(target)

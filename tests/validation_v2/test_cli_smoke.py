@@ -232,6 +232,66 @@ def test_unlimited_overlap_slice_keeps_every_available_sample():
     assert unlimited_time[-1] == pytest.approx(1.2)
 
 
+def test_stitched_neural_prediction_windows_cover_and_average_every_sample():
+    from validation_v2.experiments.runner import predict_stitched_sequence
+
+    class WindowPositionSpy:
+        name = "bilstm"
+
+        def __init__(self):
+            self.lengths = []
+
+        def predict(self, features, mask, dt, reported_model=None):
+            del mask, dt, reported_model
+            self.lengths.append(features.shape[1])
+            local = torch.arange(
+                features.shape[1], dtype=features.dtype, device=features.device
+            )
+            return local[None, :, None].expand(features.shape[0], -1, 6)
+
+    spy = WindowPositionSpy()
+    length, seq_len = 13, 4
+    features = torch.zeros(length, 25)
+    mask = torch.zeros(length, 6)
+    dt = torch.full((length,), 0.1)
+
+    prediction, coverage = predict_stitched_sequence(
+        spy, features, mask, dt, seq_len=seq_len, batch_size=2,
+        return_coverage=True,
+    )
+
+    starts = [0, 2, 4, 6, 8, 9]
+    expected_sum = torch.zeros(length)
+    expected_count = torch.zeros(length)
+    for start in starts:
+        expected_sum[start : start + seq_len] += torch.arange(seq_len)
+        expected_count[start : start + seq_len] += 1
+    assert prediction.shape == (length, 6)
+    torch.testing.assert_close(prediction[:, 0], expected_sum / expected_count)
+    torch.testing.assert_close(coverage, expected_count)
+    assert torch.all(coverage > 0)
+    assert spy.lengths and max(spy.lengths) == seq_len
+
+
+def test_irregular_linear_signal_is_resampled_at_jittered_timestamps():
+    from validation_v2.experiments.runner import resample_physical_time
+
+    source_time = np.array([0.0, 0.2, 0.5, 0.7, 1.0])
+    physical = np.column_stack(
+        [(axis + 1) * source_time for axis in range(6)]
+    )
+    query_time = np.array([0.0, 0.1, 0.4, 0.85, 1.0])
+
+    resampled = resample_physical_time(source_time, physical, query_time)
+
+    np.testing.assert_allclose(
+        resampled,
+        np.column_stack([(axis + 1) * query_time for axis in range(6)]),
+    )
+    assert query_time[0] == source_time[0]
+    assert query_time[-1] == source_time[-1]
+
+
 def test_matrix_dry_run_ignores_mapping_and_axis_list_order(tmp_path: Path):
     first_config = tmp_path / "first.yaml"
     second_config = tmp_path / "second.yaml"
@@ -479,7 +539,51 @@ def test_every_server_model_constructs_and_forwards(model_name: str):
     assert torch.isfinite(prediction).all()
 
 
-def test_complete_mini_matrix_groups_two_cells_under_one_checkpoint(tmp_path: Path):
+def test_gate_labels_share_identical_hybrid_branch_predictions():
+    from validation_v2.models.hybrid import HybridComponents
+
+    class BranchSpy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inputs = []
+
+        def forward_components(self, features, forward_dt, reverse_dt, observed, mask):
+            self.inputs.append(
+                (features.clone(), forward_dt.clone(), reverse_dt.clone(), mask.clone())
+            )
+            lnn = torch.full_like(observed, 2.0)
+            lstm = torch.full_like(observed, 4.0)
+            gate = torch.full_like(observed, 0.25)
+            raw = gate * lnn + (1.0 - gate) * lstm
+            return HybridComponents(lnn, lstm, gate, raw, raw)
+
+    model = build_execution_model("hybrid", hidden_size=2)
+    spy = BranchSpy()
+    model.core = spy
+    features = torch.zeros(1, 6, 25)
+    mask = torch.zeros(1, 6, 6)
+    dt = torch.full((1, 6), 0.1)
+    labels = [
+        "hybrid", "equal_average", "fixed_gate_0", "fixed_gate_0.5", "fixed_gate_1"
+    ]
+
+    predictions = {
+        label: model.predict(features, mask, dt, reported_model=label)
+        for label in labels
+    }
+
+    assert len(spy.inputs) == 5
+    for inputs in spy.inputs[1:]:
+        for actual, expected in zip(inputs, spy.inputs[0]):
+            torch.testing.assert_close(actual, expected)
+    assert predictions["hybrid"][0, 0, 0].item() == pytest.approx(3.5)
+    assert predictions["equal_average"][0, 0, 0].item() == pytest.approx(3.0)
+    assert predictions["fixed_gate_0"][0, 0, 0].item() == pytest.approx(4.0)
+    assert predictions["fixed_gate_0.5"][0, 0, 0].item() == pytest.approx(3.0)
+    assert predictions["fixed_gate_1"][0, 0, 0].item() == pytest.approx(2.0)
+
+
+def test_complete_mini_matrix_groups_gate_family_under_one_checkpoint(tmp_path: Path):
     if not (REPO_ROOT / "Oxford Dataset" / "handbag-1" / "imu1.csv").is_file():
         pytest.skip("real OxIOD files are not available")
     config = yaml.safe_load(
@@ -487,8 +591,11 @@ def test_complete_mini_matrix_groups_two_cells_under_one_checkpoint(tmp_path: Pa
             encoding="utf-8"
         )
     )
-    config["models"] = ["linear"]
-    config["rates"] = [0.3, 0.4]
+    gate_models = [
+        "hybrid", "equal_average", "fixed_gate_0", "fixed_gate_0.5", "fixed_gate_1"
+    ]
+    config["models"] = gate_models
+    config["rates"] = [0.3]
     config["irregular_cases"] = [
         {
             "method": "interval_jitter",
@@ -509,10 +616,29 @@ def test_complete_mini_matrix_groups_two_cells_under_one_checkpoint(tmp_path: Pa
     assert result.returncode == 0, result.stderr.decode()
     marker = json.loads(result.stdout)
     assert marker["partial"] is False
-    assert marker["selected_cells"] == 3
+    assert marker["selected_cells"] == 10
     assert marker["training_groups"] == 1
+    assert marker["grouping_key"] == [
+        "training_family", "seed", "protocol", "objective"
+    ]
     metrics_paths = list(output_root.glob("*/per_record_metrics.csv"))
     assert len(metrics_paths) == 1
     metrics = pd.read_csv(metrics_paths[0])
-    assert set(metrics["requested_fraction"]) == {0.3, 0.4}
+    assert set(metrics["model"]) == set(gate_models)
+    assert metrics["checkpoint_sha256"].nunique() == 1
+    assert set(metrics["requested_fraction"]) == {0.3}
     assert "irregular:interval_jitter+point" in set(metrics["topology"])
+    irregular_metrics = metrics.loc[
+        metrics["topology"] == "irregular:interval_jitter+point"
+    ]
+    assert set(irregular_metrics["metric"]).issuperset(
+        {"irregularity_requested", "irregularity_realized"}
+    )
+    requested = irregular_metrics.loc[
+        irregular_metrics["metric"] == "irregularity_requested", "value"
+    ]
+    realized = irregular_metrics.loc[
+        irregular_metrics["metric"] == "irregularity_realized", "value"
+    ]
+    assert set(requested) == {0.2}
+    assert set(realized) != {0.2}

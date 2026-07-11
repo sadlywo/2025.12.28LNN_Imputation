@@ -87,30 +87,35 @@ class ExecutionModel(nn.Module):
             raise ValueError(f"unsupported model: {name}")
 
     def predict(
-        self, features: torch.Tensor, mask: torch.Tensor, dt: torch.Tensor
+        self,
+        features: torch.Tensor,
+        mask: torch.Tensor,
+        dt: torch.Tensor,
+        reported_model: str | None = None,
     ) -> torch.Tensor:
+        selected_model = reported_model or self.name
         observed = features[..., :6]
-        if self.name == "linear":
+        if selected_model == "linear":
             return linear_interpolation(observed, mask)
-        if self.name == "locf":
+        if selected_model == "locf":
             return locf(observed, mask)
         reverse_dt = reverse_aligned_dt(dt)
-        if self.name == "bilstm":
+        if selected_model == "bilstm":
             return complete_signal(observed, mask, self.core(features))
-        if self.name == "bilnn":
+        if selected_model == "bilnn":
             return complete_signal(
                 observed, mask, self.core(features, dt, reverse_dt)
             )
         components = self.core.forward_components(
             features, dt, reverse_dt, observed, mask
         )
-        if self.name == "hybrid":
+        if selected_model == "hybrid":
             return components.completed
-        if self.name == "equal_average":
+        if selected_model == "equal_average":
             return equal_average(
                 observed, mask, components.lnn, components.lstm
             )
-        gate = float(self.name.removeprefix("fixed_gate_"))
+        gate = float(selected_model.removeprefix("fixed_gate_"))
         return fixed_gate(
             observed, mask, components.lnn, components.lstm, gate
         )
@@ -130,6 +135,83 @@ def reverse_aligned_dt(dt: torch.Tensor) -> torch.Tensor:
     if not dt.is_floating_point() or not torch.isfinite(dt).all() or not torch.all(dt > 0):
         raise ValueError("dt must be finite, positive, and floating point")
     return torch.cat((dt[..., -1:], dt[..., 1:].flip(-1)), dim=-1)
+
+
+def predict_stitched_sequence(
+    model: Any,
+    features: torch.Tensor,
+    mask: torch.Tensor,
+    dt: torch.Tensor,
+    *,
+    seq_len: int,
+    batch_size: int,
+    reported_model: str | None = None,
+    return_coverage: bool = False,
+):
+    """Predict a full sequence via overlapping training-length neural windows."""
+
+    if features.ndim != 2 or mask.shape != (features.shape[0], 6):
+        raise ValueError("features and mask must have shapes (N, F) and (N, 6)")
+    if dt.shape != (features.shape[0],):
+        raise ValueError("dt must have shape (N,)")
+    if seq_len <= 0 or batch_size <= 0:
+        raise ValueError("seq_len and batch_size must be positive")
+    length = features.shape[0]
+    if getattr(model, "name", None) in {"linear", "locf"} or length <= seq_len:
+        prediction = model.predict(
+            features.unsqueeze(0), mask.unsqueeze(0), dt.unsqueeze(0),
+            reported_model=reported_model,
+        )[0]
+        coverage = torch.ones(length, dtype=features.dtype, device=features.device)
+    else:
+        stride = max(1, seq_len // 2)
+        starts = list(range(0, length - seq_len + 1, stride))
+        tail = length - seq_len
+        if starts[-1] != tail:
+            starts.append(tail)
+        total = torch.zeros((length, 6), dtype=features.dtype, device=features.device)
+        coverage = torch.zeros(length, dtype=features.dtype, device=features.device)
+        for offset in range(0, len(starts), batch_size):
+            group = starts[offset : offset + batch_size]
+            feature_batch = torch.stack(
+                [features[start : start + seq_len] for start in group]
+            )
+            mask_batch = torch.stack([mask[start : start + seq_len] for start in group])
+            dt_batch = torch.stack([dt[start : start + seq_len] for start in group])
+            predicted = model.predict(
+                feature_batch, mask_batch, dt_batch, reported_model=reported_model
+            )
+            for index, start in enumerate(group):
+                total[start : start + seq_len] += predicted[index]
+                coverage[start : start + seq_len] += 1
+        if not torch.all(coverage > 0):
+            raise RuntimeError("stitched inference left uncovered samples")
+        prediction = total / coverage[:, None]
+        prediction = complete_signal(features[:, :6], mask, prediction)
+    return (prediction, coverage) if return_coverage else prediction
+
+
+def resample_physical_time(
+    source_time_s: np.ndarray,
+    physical: np.ndarray,
+    query_time_s: np.ndarray,
+) -> np.ndarray:
+    """Linearly resample all six physical IMU channels without extrapolation."""
+
+    source_time = np.asarray(source_time_s, dtype=np.float64)
+    query_time = np.asarray(query_time_s, dtype=np.float64)
+    values = np.asarray(physical, dtype=np.float64)
+    if source_time.ndim != 1 or query_time.ndim != 1:
+        raise ValueError("source and query time must be one-dimensional")
+    if values.shape != (source_time.size, 6):
+        raise ValueError("physical must have shape (len(source_time), 6)")
+    if np.any(np.diff(source_time) <= 0) or np.any(np.diff(query_time) <= 0):
+        raise ValueError("source and query time must be strictly increasing")
+    if query_time[0] < source_time[0] or query_time[-1] > source_time[-1]:
+        raise ValueError("query time must remain within source endpoints")
+    return np.column_stack(
+        [np.interp(query_time, source_time, values[:, channel]) for channel in range(6)]
+    )
 
 
 def _scenario_name(directory_name: str) -> str:
@@ -264,6 +346,8 @@ def resolved_execution_config(
     conditions: Sequence[Mapping[str, Any]],
     resolved_device: str,
     recording_splits: Sequence[Mapping[str, str]] = (),
+    training_family: str | None = None,
+    reported_models: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Return every behavior-affecting input used for run provenance."""
 
@@ -276,6 +360,8 @@ def resolved_execution_config(
         "mode": "validation_v2",
         "source_config": filtered_source,
         "model": model,
+        "training_family": training_family or model,
+        "reported_models": list(reported_models) or [model],
         "seed": seed,
         "protocol": protocol,
         "objective": str(source_config.get("objective", "reconstruction_only")),
@@ -389,8 +475,28 @@ def _prepared_sequence(
     seed: int,
     topology: str = "point",
     requested_irregularity: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    np.ndarray,
+    Any | None,
+]:
     time_s, physical = _slice_recording(recording, maximum)
+    irregular_result = None
+    if requested_irregularity is not None:
+        irregular_result = generate_interval_jittered_time(
+            torch.from_numpy(time_s),
+            requested_irregularity,
+            _record_seed(seed, f"irregular:{recording.id}"),
+        )
+        query_time = irregular_result.time.numpy()
+        physical = resample_physical_time(time_s, physical, query_time)
+        time_s = query_time
+        dt = irregular_result.dt.to(torch.float32)
+    else:
+        dt = _dt(time_s)
     target = torch.from_numpy(scaler.transform(physical).astype(np.float32))
     generators = {
         "point": point_missing,
@@ -404,17 +510,8 @@ def _prepared_sequence(
         raise ValueError(
             f"{topology} at requested_fraction={rate} realizes no missing values"
         )
-    dt = _dt(time_s)
-    if requested_irregularity is not None:
-        irregular = generate_interval_jittered_time(
-            torch.from_numpy(time_s),
-            requested_irregularity,
-            _record_seed(seed, f"irregular:{recording.id}"),
-        )
-        time_s = irregular.time.numpy()
-        dt = irregular.dt.to(torch.float32)
     features = build_features(target, result.mask, dt).values
-    return features, target, result.mask, dt, time_s
+    return features, target, result.mask, dt, time_s, irregular_result
 
 
 def _windows(
@@ -433,7 +530,7 @@ def _windows(
         if len(prepared) >= maximum_windows:
             break
         maximum = seq_len * per_record
-        features, target, mask, dt, time_s = _prepared_sequence(
+        features, target, mask, dt, time_s, _ = _prepared_sequence(
             recording, scaler, maximum=maximum, rate=rate, seed=seed,
             topology=topology,
         )
@@ -476,9 +573,17 @@ def _model(name: str, hidden_size: int) -> ExecutionModel:
     return build_execution_model(name, hidden_size)
 
 
-def _prediction(model_name: str, model: nn.Module, batch: _Window) -> torch.Tensor:
+def _prediction(
+    model_name: str,
+    model: nn.Module,
+    batch: _Window,
+    *,
+    reported_model: str | None = None,
+) -> torch.Tensor:
     del model_name
-    return model.predict(batch.features, batch.mask, batch.dt)
+    return model.predict(
+        batch.features, batch.mask, batch.dt, reported_model=reported_model
+    )
 
 
 def _epoch_callbacks(model_name: str, device: torch.device):
@@ -638,6 +743,8 @@ def _evaluate_record(
     conditions: Sequence[Mapping[str, Any]],
     seed: int,
     trajectory_enabled: bool,
+    seq_len: int,
+    batch_size: int,
 ):
     metadata = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
 
@@ -647,6 +754,7 @@ def _evaluate_record(
         model.to(device).eval()
         rows: list[dict[str, Any]] = []
         for condition in conditions:
+            reported_model = str(condition.get("model", model_name))
             is_irregular = condition.get("case_type", "missingness") == "irregular"
             if is_irregular:
                 if condition.get("irregular_method") != "interval_jitter":
@@ -660,19 +768,21 @@ def _evaluate_record(
                 rate = float(condition["requested_fraction"])
                 irregularity = None
                 topology_label = topology
-            features, target, mask, dt, time_s = _prepared_sequence(
+            features, target, mask, dt, time_s, irregular_result = _prepared_sequence(
                 recording, scaler, maximum=maximum, rate=rate, seed=seed,
                 topology=topology,
                 requested_irregularity=irregularity,
             )
-            batch = _Window(
-                features.unsqueeze(0).to(device),
-                target.unsqueeze(0).to(device),
-                mask.unsqueeze(0).to(device),
-                dt.unsqueeze(0).to(device),
-            )
             with torch.no_grad():
-                prediction = _prediction(model_name, model, batch)[0].cpu().numpy()
+                prediction = predict_stitched_sequence(
+                    model,
+                    features.to(device),
+                    mask.to(device),
+                    dt.to(device),
+                    seq_len=seq_len,
+                    batch_size=batch_size,
+                    reported_model=reported_model,
+                ).cpu().numpy()
             target_values = target.numpy()
             mask_values = mask.numpy()
             reports = reconstruction_metrics(
@@ -682,6 +792,15 @@ def _evaluate_record(
                 "reconstruction_normalized": float(reports["normalized"]["rmse"]),
                 "reconstruction_physical": float(reports["physical"]["rmse"]),
             }
+            if irregular_result is not None:
+                metric_values.update(
+                    irregularity_requested=float(
+                        irregular_result.requested_irregularity
+                    ),
+                    irregularity_realized=float(
+                        irregular_result.realized_irregularity
+                    ),
+                )
             if trajectory_enabled:
                 metric_values.update(
                     _trajectory_rows(
@@ -700,7 +819,7 @@ def _evaluate_record(
                 "topology": topology_label,
                 "requested_fraction": rate,
                 "realized_fraction": float((mask_values == 0).mean()),
-                "model": model_name,
+                "model": reported_model,
                 "checkpoint_sha256": metadata["checkpoint_sha256"],
             }
             rows.extend(
@@ -874,6 +993,8 @@ def run_smoke(
             protocol=str(training_condition.get("protocol", "strict_file")),
             conditions=conditions,
             resolved_device=str(device),
+            training_family=str(config.get("_training_family", model_name)),
+            reported_models=tuple(config.get("_reported_models", (model_name,))),
             recording_splits=[
                 {"recording_id": row["recording_id"], "split": row["split"]}
                 for row in manifest_rows
@@ -930,6 +1051,8 @@ def run_smoke(
                     conditions=conditions,
                     seed=seed,
                     trajectory_enabled=trajectory_enabled,
+                    seq_len=seq_len,
+                    batch_size=batch_size,
                 ),
                 trajectory_enabled=trajectory_enabled,
             )
@@ -987,10 +1110,15 @@ def run_matrix(
         destination = repository_root / destination
     destination.mkdir(parents=True, exist_ok=True)
     objective = str(config.get("objective", "reconstruction_only"))
+    gate_models = {
+        "hybrid", "equal_average", "fixed_gate_0", "fixed_gate_0.5", "fixed_gate_1"
+    }
     grouped: dict[tuple[str, int, str, str], list[dict[str, Any]]] = {}
     for cell in selected:
+        model_name = str(cell["model"])
+        training_family = "hybrid_shared" if model_name in gate_models else model_name
         key = (
-            str(cell["model"]),
+            training_family,
             int(cell["seed"]),
             str(cell["protocol"]),
             objective,
@@ -1002,21 +1130,27 @@ def run_matrix(
         "selected_cells": len(selected),
         "total_cells": len(combinations),
         "training_groups": len(grouped),
-        "grouping_key": ["model", "seed", "protocol", "objective"],
+        "grouping_key": ["training_family", "seed", "protocol", "objective"],
         "selected_combination_ids": [cell["combination_id"] for cell in selected],
         "status": "started",
     }
     marker_path.write_text(canonical_json(marker) + "\n", encoding="utf-8")
     reports: list[Mapping[str, Any]] = []
     try:
-        for (model, seed, protocol, _), cells in sorted(grouped.items()):
+        for (training_family, seed, protocol, _), cells in sorted(grouped.items()):
+            training_model = (
+                "hybrid" if training_family == "hybrid_shared" else training_family
+            )
+            reported_models = sorted({str(cell["model"]) for cell in cells})
             group_config = dict(config)
             group_config.update(
-                models=[model],
+                models=[training_model],
                 seeds=[seed],
                 protocols=[protocol],
                 _execution_conditions=cells,
                 _skip_descriptive_summary=True,
+                _training_family=training_family,
+                _reported_models=reported_models,
             )
             reports.append(
                 run_smoke(

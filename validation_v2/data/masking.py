@@ -149,6 +149,10 @@ def generate_interval_jittered_time(
     original_intervals = time[1:] - time[:-1]
     intervals = original_intervals.clone()
     count = _half_up_count(intervals.numel(), requested_irregularity)
+    if requested_irregularity > 0:
+        if intervals.numel() < 2:
+            raise ValueError("interval jitter requires at least two intervals")
+        count = max(2, count)
     if count:
         generator = torch.Generator(device="cpu").manual_seed(seed)
         selected_cpu = torch.randperm(intervals.numel(), generator=generator)[:count]
@@ -160,16 +164,27 @@ def generate_interval_jittered_time(
         )
         factors = 1.0 + jitter_fraction * magnitudes * signs
         selected = selected_cpu.to(time.device)
-        intervals[selected] = intervals[selected] * factors.to(
-            device=time.device, dtype=time.dtype
-        )
+        original_selected = intervals[selected]
+        candidate = original_selected * factors.to(device=time.device, dtype=time.dtype)
+        candidate = candidate * (original_selected.sum() / candidate.sum())
+        residual = original_selected.sum() - candidate.sum()
+        candidate[-1] = candidate[-1] + residual
+        if torch.allclose(candidate, original_selected, rtol=0.0, atol=0.0):
+            transfer = torch.minimum(original_selected[0], original_selected[1]) * 0.1
+            candidate[0] = candidate[0] + transfer
+            candidate[1] = candidate[1] - transfer
+        intervals[selected] = candidate
     jittered_time = torch.empty_like(time)
     jittered_time[0] = time[0]
     jittered_time[1:] = time[0] + torch.cumsum(intervals, dim=0)
+    jittered_time[-1] = time[-1]
+    intervals = torch.diff(jittered_time)
     dt = torch.empty_like(time)
     dt[0] = intervals[0]
     dt[1:] = intervals
-    realized = float((intervals != original_intervals).to(torch.float64).mean().item())
+    tolerance = torch.finfo(time.dtype).eps * 8
+    changed = ~torch.isclose(intervals, original_intervals, rtol=0.0, atol=tolerance)
+    realized = float(changed.to(torch.float64).mean().item())
     return IrregularTimeResult(
         time=jittered_time,
         dt=dt,
