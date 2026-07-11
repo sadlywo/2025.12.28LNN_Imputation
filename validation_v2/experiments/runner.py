@@ -534,27 +534,47 @@ def _windows(
 ) -> list[_Window]:
     prepared: list[_Window] = []
     per_record = max(1, (maximum_windows + len(recordings) - 1) // len(recordings))
+    generators = {
+        "point": point_missing,
+        "block": contiguous_block,
+        "channel": channel_outage,
+    }
+    if topology not in generators:
+        raise ValueError(f"unsupported missingness topology: {topology}")
     for recording in recordings:
         if len(prepared) >= maximum_windows:
             break
         maximum = seq_len * per_record
-        features, target, mask, dt, time_s, _ = _prepared_sequence(
-            recording, scaler, maximum=maximum, rate=rate, seed=seed,
-            topology=topology,
-        )
+        time_s, physical = _slice_recording(recording, maximum)
+        target = torch.from_numpy(scaler.transform(physical).astype(np.float32))
+        dt = _dt(time_s)
         batches = make_windows(
             target,
-            mask,
+            torch.ones_like(target),
             dt,
             torch.arange(len(time_s)),
             torch.from_numpy(time_s),
             recording.id,
             window_size=seq_len,
         )
-        for batch in batches:
-            feature = build_features(batch.target, batch.mask, batch.dt)
+        for window_number, batch in enumerate(batches):
+            window_seed = _record_seed(
+                seed,
+                ":".join(
+                    (
+                        "training-window",
+                        recording.id,
+                        str(int(batch.index[0].item())),
+                        str(window_number),
+                        topology,
+                        format(float(rate), ".17g"),
+                    )
+                ),
+            )
+            mask = generators[topology](batch.target, rate, window_seed).mask
+            feature = build_features(batch.target, mask, batch.dt)
             prepared.append(
-                _Window(feature.values, batch.target, batch.mask, batch.dt)
+                _Window(feature.values, batch.target, mask, batch.dt)
             )
     result = prepared[:maximum_windows]
     if not result:

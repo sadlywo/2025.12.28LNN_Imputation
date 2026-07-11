@@ -157,6 +157,13 @@ The validated config already uses the conservative `batch_size: 32`. Do not
 change seeds, rates, topologies, protocols, epochs, or `--max-combinations`.
 Define one fresh, commit-qualified output root:
 
+Training missingness is generated independently inside every `seq_len` window,
+so every training loss batch has hidden targets at the requested topology and
+rate. Evaluation is deliberately different: each complete evaluation recording
+receives one deterministic recording-level mask before full-record prediction
+and metric calculation. Do not make training windows by slicing an
+evaluation-style recording mask.
+
 ```bash
 export RESULT_ROOT="results/validation_v2/server_full-${COMMIT}"
 export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${COMMIT}"
@@ -201,9 +208,16 @@ nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 ACTIVE_CONFIG="$ACTIVE_CONFIG" \
   >"$AUDIT_DIR/nohup.out" 2>&1 &
 ```
 
-After an interruption, safe resume means running the exact same full command
-with the same commit, config, output root, and device. The runner reuses only
-content-matching completed groups. Never add `--max-combinations` to a resume.
+After an interruption that leaves no failed or partial marker, safe resume means
+running the exact same full command with the same commit, config, output root,
+and device. The runner reuses only content-matching completed groups. Never add
+`--max-combinations` to a resume.
+
+A failed or partial result root is not resumable in place. Preserve its logs for
+diagnosis, then either select a fresh output root or explicitly remove the
+failed/partial root after confirming its resolved absolute path. Do not rerun a
+formal matrix into a root containing failed group artifacts, a partial
+`matrix_execution.json`, or output from `--max-combinations`.
 
 Monitor without modifying the run:
 

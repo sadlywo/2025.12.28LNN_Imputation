@@ -232,6 +232,123 @@ def test_unlimited_overlap_slice_keeps_every_available_sample():
     assert unlimited_time[-1] == pytest.approx(1.2)
 
 
+def _synthetic_training_recording(
+    recording_id: str = "synthetic/train", *, length: int = 240
+) -> Recording:
+    intervals = 0.01 + (np.arange(length, dtype=np.float64) % 5) * 0.001
+    time = np.cumsum(intervals)
+    values = np.column_stack(
+        [np.arange(length, dtype=np.float64) + channel for channel in range(6)]
+    )
+    return Recording(
+        id=recording_id,
+        imu_time_s=time,
+        imu_six=values,
+        vicon_time_s=np.array([time[0], time[-1]], dtype=np.float64),
+        vicon_position_m=np.zeros((2, 3), dtype=np.float64),
+        vicon_quaternion_xyzw=np.array(
+            [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]], dtype=np.float64
+        ),
+        overlap_s=(float(time[0]), float(time[-1])),
+        metadata={},
+    )
+
+
+@pytest.mark.parametrize("topology", ["point", "block", "channel"])
+@pytest.mark.parametrize("rate", [0.1, 0.2, 0.3, 0.4])
+def test_every_training_window_has_requested_missingness(topology: str, rate: float):
+    from validation_v2.data.normalization import RobustTrainScaler
+    from validation_v2.experiments.runner import _windows
+
+    recording = _synthetic_training_recording()
+    scaler = RobustTrainScaler(
+        center_=np.zeros(6), scale_=np.ones(6), training_ids=(recording.id,)
+    )
+
+    windows = _windows(
+        [recording], scaler, seq_len=30, maximum_windows=6,
+        rate=rate, seed=2026, topology=topology,
+    )
+
+    assert len(windows) == 6
+    realized = [float((window.mask == 0).float().mean()) for window in windows]
+    assert all(value > 0 for value in realized)
+    if topology in {"point", "block"}:
+        expected = round(30 * (6 if topology == "point" else 1) * rate) / (
+            30 * (6 if topology == "point" else 1)
+        )
+    else:
+        expected = max(1, int(6 * rate)) / 6
+    assert realized == pytest.approx([expected] * 6)
+
+
+def test_training_windows_preserve_timing_boundaries_and_hidden_target_invariance():
+    from validation_v2.data.normalization import RobustTrainScaler
+    from validation_v2.experiments.runner import _windows
+
+    first = _synthetic_training_recording("synthetic/first", length=60)
+    second = _synthetic_training_recording("synthetic/second", length=60)
+    second = Recording(
+        **{**second.__dict__, "imu_six": second.imu_six + 1000.0}
+    )
+    scaler = RobustTrainScaler(
+        center_=np.zeros(6), scale_=np.ones(6),
+        training_ids=tuple(sorted((first.id, second.id))),
+    )
+    windows = _windows(
+        [first, second], scaler, seq_len=30, maximum_windows=4,
+        rate=0.1, seed=2026, topology="block",
+    )
+
+    expected_dt = []
+    for recording in (first, second):
+        dt = np.empty(60, dtype=np.float32)
+        dt[1:] = np.diff(recording.imu_time_s).astype(np.float32)
+        dt[0] = dt[1]
+        expected_dt.extend((dt[:30], dt[30:]))
+    for window, dt in zip(windows, expected_dt):
+        np.testing.assert_allclose(window.dt.numpy(), dt)
+    assert all(float(window.target.mean()) < 500 for window in windows[:2])
+    assert all(float(window.target.mean()) > 500 for window in windows[2:])
+
+    changed_values = first.imu_six.copy()
+    first_masks = torch.cat([window.mask for window in windows[:2]]).numpy()
+    changed_values[first_masks == 0] += 10_000.0
+    changed = Recording(**{**first.__dict__, "imu_six": changed_values})
+    changed_windows = _windows(
+        [changed], scaler, seq_len=30, maximum_windows=2,
+        rate=0.1, seed=2026, topology="block",
+    )
+    for original, hidden_changed in zip(windows[:2], changed_windows):
+        assert torch.equal(original.mask, hidden_changed.mask)
+        assert torch.equal(original.features, hidden_changed.features)
+
+
+def test_formal_like_block_training_callback_has_missing_targets_in_every_batch():
+    from validation_v2.data.normalization import RobustTrainScaler
+    from validation_v2.experiments.runner import _batches, _epoch_callbacks, _windows
+
+    recording = _synthetic_training_recording()
+    scaler = RobustTrainScaler(
+        center_=np.zeros(6), scale_=np.ones(6), training_ids=(recording.id,)
+    )
+    batches = _batches(
+        _windows(
+            [recording], scaler, seq_len=30, maximum_windows=6,
+            rate=0.1, seed=2026, topology="block",
+        ),
+        batch_size=2,
+    )
+    model = build_execution_model("bilnn", hidden_size=2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    train_epoch, _ = _epoch_callbacks("bilnn", torch.device("cpu"))
+
+    assert len(batches) == 3
+    assert all(torch.any(batch.mask == 0) for batch in batches)
+    metrics = train_epoch(model, optimizer, batches, epoch=1)
+    assert np.isfinite(metrics["missing_rmse"])
+
+
 def test_stitched_neural_prediction_windows_cover_and_average_every_sample():
     from validation_v2.experiments.runner import predict_stitched_sequence
 
