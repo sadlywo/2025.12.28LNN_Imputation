@@ -44,6 +44,8 @@ def _complete_root(
     *,
     matrix: bool = True,
     protocol: str = "strict_file",
+    condition_protocol: str | None = None,
+    metrics_protocol: str | None = None,
     condition_label: str = "cell-1",
     condition_id: str | None = None,
     scaler_training_ids: list[str] | None = None,
@@ -110,7 +112,7 @@ def _complete_root(
         "case_type": "missingness",
         "model": "linear",
         "seed": 2026,
-        "protocol": protocol,
+        "protocol": condition_protocol or protocol,
         "topology": "point",
         "requested_fraction": 0.3,
         "realized_fraction": None,
@@ -118,7 +120,7 @@ def _complete_root(
     if not matrix:
         condition = {
             "case_type": "missingness",
-            "protocol": protocol,
+            "protocol": condition_protocol or protocol,
             "topology": "point",
             "requested_fraction": 0.3,
         }
@@ -192,7 +194,7 @@ def _complete_root(
         "seed": 2026,
         "recording_id": "test-record",
         "scenario": "handbag",
-        "protocol": protocol,
+        "protocol": metrics_protocol or protocol,
         "topology": "point",
         "requested_fraction": 0.3,
         "realized_fraction": 0.29,
@@ -530,6 +532,29 @@ def test_different_protocols_may_use_different_split_and_scaler_hashes(
     root = _merge_formal_roots(first, second)
 
     assert validate_artifacts(root)["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    ("condition_protocol", "metrics_protocol"),
+    [
+        ("scenario_holdout:handbag", "scenario_holdout:handbag"),
+        (None, "scenario_holdout:handbag"),
+    ],
+)
+def test_run_config_condition_and_metrics_protocols_must_match(
+    tmp_path: Path,
+    condition_protocol: str | None,
+    metrics_protocol: str,
+) -> None:
+    root, _, _ = _complete_root(
+        tmp_path,
+        protocol="strict_file",
+        condition_protocol=condition_protocol,
+        metrics_protocol=metrics_protocol,
+    )
+
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        validate_artifacts(root)
 
 
 def test_config_required_seeds_are_enforced(tmp_path: Path) -> None:

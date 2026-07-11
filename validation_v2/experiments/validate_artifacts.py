@@ -355,6 +355,7 @@ def _validate_conditions(
     rows: list[dict[str, Any]],
     test_recordings: set[str],
     scenario_by_recording: Mapping[str, str],
+    run_protocol: str,
     *,
     smoke: bool,
 ) -> set[str]:
@@ -364,6 +365,19 @@ def _validate_conditions(
     conditions = config.get("condition_list")
     if not isinstance(conditions, list) or not conditions:
         raise ValueError("run manifest condition_list must be non-empty")
+    condition_protocols = {
+        condition.get("protocol") if isinstance(condition, Mapping) else None
+        for condition in conditions
+    }
+    if condition_protocols != {run_protocol}:
+        raise ValueError(
+            "protocol mismatch between run config and condition_list"
+        )
+    metric_protocols = {row["protocol"] for row in rows}
+    if metric_protocols != {run_protocol}:
+        raise ValueError(
+            "protocol mismatch between run config and per_record_metrics.csv"
+        )
     identifiers: set[str] = set()
     expected_cells: set[tuple[str, str, str, str, float]] = set()
     for condition in conditions:
@@ -438,6 +452,10 @@ def _validate_run(
     _validate_manifest(manifest)
     if manifest["run_id"] != run_dir.name:
         raise ValueError("run directory name does not match run.json run_id")
+    resolved_config = manifest["config"]
+    protocol = resolved_config.get("protocol")
+    if not isinstance(protocol, str) or not protocol:
+        raise ValueError("run manifest resolved config protocol must be non-empty")
 
     history = _strict_json(run_dir / "history.json")
     if not isinstance(history, list):
@@ -500,12 +518,9 @@ def _validate_run(
         rows,
         test_recordings,
         scenario_by_recording,
+        protocol,
         smoke=smoke,
     )
-    resolved_config = manifest["config"]
-    protocol = resolved_config.get("protocol")
-    if not isinstance(protocol, str) or not protocol:
-        raise ValueError("run manifest resolved config protocol must be non-empty")
     return {
         "run_id": manifest["run_id"],
         "seed": manifest["seed"],
