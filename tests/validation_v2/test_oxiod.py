@@ -78,17 +78,46 @@ def test_vicon_nanoseconds_are_converted_to_seconds(tmp_path: Path):
     assert np.all(np.diff(recording.vicon_time_s) > 0)
 
 
+def test_short_epoch_vicon_nanoseconds_are_explicitly_converted(tmp_path: Path):
+    imu_path, vicon_path = _write_synthetic_pair(
+        tmp_path,
+        imu_times=(20.0, 21.0),
+        vicon_times_ns=(20_000_000_000, 21_000_000_000),
+    )
+
+    recording = load_recording(imu_path, vicon_path)
+
+    np.testing.assert_allclose(recording.vicon_time_s, [20.0, 21.0])
+    assert recording.metadata["vicon_source_time_unit"] == "ns"
+
+
 @pytest.mark.parametrize("stream", ["imu", "vicon"])
 def test_time_conversion_rejects_nonincreasing_stream(stream: str):
     with pytest.raises(ValueError, match=f"{stream} timestamps must be strictly increasing"):
         _time_to_seconds(np.array([2.0, 2.0]), stream)
 
 
+def test_time_conversion_rejects_empty_timestamps():
+    with pytest.raises(ValueError, match=r"empty|timestamps"):
+        _time_to_seconds(np.array([]), "imu")
+
+
+@pytest.mark.parametrize("invalid", [np.nan, np.inf, -np.inf])
+def test_time_conversion_rejects_nonfinite_timestamps(invalid: float):
+    with pytest.raises(ValueError, match=r"finite.*timestamps|timestamps.*finite"):
+        _time_to_seconds(np.array([invalid]), "imu")
+
+
+def test_time_conversion_rejects_unknown_source_unit():
+    with pytest.raises(ValueError, match="unknown timestamp source unit"):
+        _time_to_seconds(np.array([1.0, 2.0]), "vicon", source_unit="ms")
+
+
 def test_loader_rejects_empty_time_overlap(tmp_path: Path):
     imu_path, vicon_path = _write_synthetic_pair(
         tmp_path,
         imu_times=(10.0, 11.0),
-        vicon_times_ns=(20_000_000_000, 21_000_000_000),
+        vicon_times_ns=(30_000_000_000, 31_000_000_000),
     )
 
     with pytest.raises(ValueError, match="no IMU/Vicon overlap"):
@@ -136,6 +165,50 @@ def test_loader_reports_missing_columns(tmp_path: Path):
     imu_path.write_text("1,2,3\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match=r"IMU CSV .* expected 16 columns .* found 3"):
+        load_recording(imu_path, vicon_path)
+
+
+@pytest.mark.parametrize(
+    ("empty_stream", "header"),
+    [
+        (
+            "imu",
+            [
+                "Time",
+                "rotation_rate_x",
+                "rotation_rate_y",
+                "rotation_rate_z",
+                "user_acc_x",
+                "user_acc_y",
+                "user_acc_z",
+            ],
+        ),
+        (
+            "vicon",
+            [
+                "Time",
+                "translation.x",
+                "translation.y",
+                "translation.z",
+                "rotation.x",
+                "rotation.y",
+                "rotation.z",
+                "rotation.w",
+            ],
+        ),
+    ],
+)
+def test_loader_rejects_header_only_stream(
+    tmp_path: Path,
+    empty_stream: str,
+    header: list[str],
+):
+    imu_path, vicon_path = _write_synthetic_pair(tmp_path)
+    empty_path = imu_path if empty_stream == "imu" else vicon_path
+    with empty_path.open("w", newline="", encoding="utf-8") as handle:
+        csv.writer(handle).writerow(header)
+
+    with pytest.raises(ValueError, match=f"{empty_stream} timestamps.*empty"):
         load_recording(imu_path, vicon_path)
 
 

@@ -1,5 +1,7 @@
 """Load raw OxIOD IMU and Vicon CSV recordings without implicit alignment."""
 
+from __future__ import annotations
+
 import csv
 from pathlib import Path
 from types import MappingProxyType
@@ -51,10 +53,29 @@ IMU_CHANNEL_NAMES = (
 IMU_CHANNEL_UNITS = ("rad/s", "rad/s", "rad/s", "G", "G", "G")
 
 
-def _time_to_seconds(values: np.ndarray, stream: str) -> np.ndarray:
-    """Normalize one timestamp stream to float64 seconds and validate order."""
+def _time_to_seconds(
+    values: np.ndarray,
+    stream: str,
+    source_unit: str | None = None,
+) -> np.ndarray:
+    """Convert timestamps using explicit units and validate their order.
+
+    When ``source_unit`` is omitted, the raw OxIOD schema is used: IMU time is
+    seconds and Vicon time is nanoseconds.
+    """
     times = np.asarray(values, dtype=np.float64)
-    if stream == "vicon" and times.size and float(np.median(np.abs(times))) > 1e15:
+    if not times.size:
+        raise ValueError(f"{stream} timestamps must not be empty")
+    if not np.all(np.isfinite(times)):
+        raise ValueError(f"{stream} timestamps must contain only finite values")
+    if source_unit is None:
+        try:
+            source_unit = {"imu": "s", "vicon": "ns"}[stream]
+        except KeyError as exc:
+            raise ValueError(f"unknown timestamp stream: {stream}") from exc
+    if source_unit not in {"s", "ns"}:
+        raise ValueError(f"unknown timestamp source unit: {source_unit}")
+    if source_unit == "ns":
         times = times / 1e9
     if not np.all(np.diff(times) > 0):
         raise ValueError(f"{stream} timestamps must be strictly increasing")
@@ -139,6 +160,7 @@ def _order_and_deduplicate(
     *,
     stream: str,
     stream_label: str,
+    source_unit: str,
     path: Path,
 ) -> tuple[pd.DataFrame, np.ndarray, dict[str, int]]:
     raw_times = _numeric_array(
@@ -156,7 +178,11 @@ def _order_and_deduplicate(
         else np.array([], dtype=bool)
     )
     prepared = frame.iloc[order].loc[keep].reset_index(drop=True)
-    times_s = _time_to_seconds(ordered_times[keep], stream)
+    times_s = _time_to_seconds(
+        ordered_times[keep],
+        stream,
+        source_unit=source_unit,
+    )
     return prepared, times_s, {
         f"{stream}_source_rows": int(len(frame)),
         f"{stream}_rows_deduplicated": int(np.count_nonzero(~keep)),
@@ -194,12 +220,14 @@ def load_recording(imu_path: Path, vicon_path: Path) -> Recording:
         imu_frame,
         stream="imu",
         stream_label="IMU",
+        source_unit="s",
         path=imu_path,
     )
     vicon_frame, vicon_time_s, vicon_row_metadata = _order_and_deduplicate(
         vicon_frame,
         stream="vicon",
         stream_label="Vicon",
+        source_unit="ns",
         path=vicon_path,
     )
     imu_six = _numeric_array(
@@ -227,10 +255,7 @@ def load_recording(imu_path: Path, vicon_path: Path) -> Recording:
             "imu_path": str(imu_path),
             "vicon_path": str(vicon_path),
             "imu_time_unit": "s",
-            "vicon_source_time_unit": "ns"
-            if float(np.median(np.abs(vicon_frame["Time"].to_numpy(dtype=np.float64))))
-            > 1e15
-            else "s",
+            "vicon_source_time_unit": "ns",
             "vicon_time_unit": "s",
             "imu_channel_names": IMU_CHANNEL_NAMES,
             "imu_channel_units": IMU_CHANNEL_UNITS,
