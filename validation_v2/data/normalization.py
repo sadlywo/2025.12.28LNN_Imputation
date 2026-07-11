@@ -18,6 +18,46 @@ class RobustTrainScaler:
     scale_: np.ndarray
     training_ids: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        try:
+            center = np.asarray(self.center_, dtype=np.float64)
+            scale = np.asarray(self.scale_, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("center_ and scale_ must be numeric arrays") from exc
+        if center.ndim != 1 or scale.ndim != 1:
+            raise ValueError("center_ and scale_ must be one-dimensional")
+        if center.size == 0 or scale.size == 0:
+            raise ValueError("center_ and scale_ must be non-empty")
+        if center.shape != scale.shape:
+            raise ValueError("center_ and scale_ must have the same shape")
+        if not np.all(np.isfinite(center)) or not np.all(np.isfinite(scale)):
+            raise ValueError("center_ and scale_ must contain only finite values")
+        if np.any(scale <= 0):
+            raise ValueError("scale_ values must be strictly positive")
+
+        training_ids = tuple(self.training_ids)
+        if not training_ids or any(
+            not isinstance(recording_id, str) or not recording_id
+            for recording_id in training_ids
+        ):
+            raise ValueError("training_ids must contain non-empty strings")
+        if len(set(training_ids)) != len(training_ids):
+            raise ValueError("training_ids must be unique")
+        if training_ids != tuple(sorted(training_ids)):
+            raise ValueError("training_ids must be sorted")
+
+        # Arrays backed directly by immutable ``bytes`` cannot have NumPy's
+        # WRITEABLE flag re-enabled, unlike owning arrays marked read-only.
+        frozen_center = np.frombuffer(center.tobytes(), dtype=np.float64).reshape(
+            center.shape
+        )
+        frozen_scale = np.frombuffer(scale.tobytes(), dtype=np.float64).reshape(
+            scale.shape
+        )
+        object.__setattr__(self, "center_", frozen_center)
+        object.__setattr__(self, "scale_", frozen_scale)
+        object.__setattr__(self, "training_ids", training_ids)
+
     @classmethod
     def fit(
         cls,

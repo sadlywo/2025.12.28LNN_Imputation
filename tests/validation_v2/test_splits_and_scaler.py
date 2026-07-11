@@ -166,6 +166,62 @@ def test_scaler_uses_train_values_median_mad_floor_and_sorted_ids():
     assert scaler.training_ids == ("a", "b")
 
 
+@pytest.mark.parametrize("attribute", ["center_", "scale_"])
+def test_fit_returns_arrays_that_cannot_be_made_writable(attribute):
+    training = _recording("train", np.array([[0.0, 1.0], [2.0, 3.0]]))
+    scaler = RobustTrainScaler.fit([training], allowed_ids={"train"})
+
+    with pytest.raises(ValueError):
+        getattr(scaler, attribute).setflags(write=True)
+
+
+def test_direct_constructor_defensively_freezes_scaler_arrays():
+    center = np.array([1.0, 2.0])
+    scale = np.array([3.0, 4.0])
+    scaler = RobustTrainScaler(
+        center_=center,
+        scale_=scale,
+        training_ids=("train",),
+    )
+
+    center[:] = 99.0
+    scale[:] = 88.0
+
+    np.testing.assert_array_equal(scaler.center_, [1.0, 2.0])
+    np.testing.assert_array_equal(scaler.scale_, [3.0, 4.0])
+    with pytest.raises(ValueError):
+        scaler.center_.setflags(write=True)
+    with pytest.raises(ValueError):
+        scaler.scale_.setflags(write=True)
+
+
+@pytest.mark.parametrize(
+    ("center", "scale", "training_ids", "message"),
+    [
+        (np.zeros((1, 2)), np.ones(2), ("a",), "one-dimensional"),
+        (np.zeros(2), np.ones(3), ("a",), "same shape"),
+        (np.array([np.nan]), np.ones(1), ("a",), "finite"),
+        (np.zeros(1), np.array([np.inf]), ("a",), "finite"),
+        (np.zeros(1), np.zeros(1), ("a",), "strictly positive"),
+        (np.zeros(1), np.ones(1), (), "non-empty"),
+        (np.zeros(1), np.ones(1), ("a", "a"), "unique"),
+        (np.zeros(1), np.ones(1), ("b", "a"), "sorted"),
+    ],
+)
+def test_direct_constructor_rejects_invalid_scaler_state(
+    center,
+    scale,
+    training_ids,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        RobustTrainScaler(
+            center_=center,
+            scale_=scale,
+            training_ids=training_ids,
+        )
+
+
 def test_scaler_transform_round_trips_without_mutating_input():
     training = _recording("train", np.array([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]))
     scaler = RobustTrainScaler.fit([training], allowed_ids={"train"})
