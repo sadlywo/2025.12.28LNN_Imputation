@@ -125,3 +125,31 @@ def test_reconstruction_report_never_labels_normalized_values_as_physical():
     )
     assert report["normalized"]["mse"] == pytest.approx(2.5)
     assert report["physical"]["mse"] == pytest.approx(250.0)
+
+
+def test_reconstruction_scaler_inverse_flattens_arbitrary_leading_dimensions():
+    from validation_v2.evaluation.reconstruction import reconstruction_metrics
+
+    class TwoDimensionalScaler:
+        def __init__(self):
+            self.shapes = []
+
+        def inverse_transform(self, values):
+            assert values.ndim == 2
+            self.shapes.append(values.shape)
+            return values * 10.0
+
+    prediction = np.ones((2, 4, 3))
+    target = np.zeros_like(prediction)
+    scaler = TwoDimensionalScaler()
+
+    report = reconstruction_metrics(
+        prediction,
+        target,
+        np.zeros_like(prediction),
+        scaler=scaler,
+    )
+
+    assert scaler.shapes == [(8, 3), (8, 3)]
+    assert report["normalized"]["mse"] == pytest.approx(1.0)
+    assert report["physical"]["mse"] == pytest.approx(100.0)

@@ -11,6 +11,25 @@ class _InverseScaler(Protocol):
     def inverse_transform(self, values: np.ndarray) -> np.ndarray: ...
 
 
+def _inverse_transform_last_axis(
+    scaler: _InverseScaler, values: np.ndarray
+) -> np.ndarray:
+    """Apply a sklearn-style 2D inverse transform to the final feature axis."""
+
+    if values.ndim < 1 or values.shape[-1] == 0:
+        raise ValueError("normalized values must have a non-empty feature axis")
+    flattened = values.reshape(-1, values.shape[-1])
+    try:
+        transformed = np.asarray(scaler.inverse_transform(flattened), dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scaler inverse_transform must return numeric values") from exc
+    if transformed.shape != flattened.shape:
+        raise ValueError("scaler inverse_transform must preserve the flattened input shape")
+    if not np.all(np.isfinite(transformed)):
+        raise ValueError("scaler inverse_transform must return only finite values")
+    return transformed.reshape(values.shape)
+
+
 def _missing_metrics(prediction: np.ndarray, target: np.ndarray, mask: np.ndarray) -> dict[str, float]:
     prediction = np.asarray(prediction, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
@@ -52,7 +71,7 @@ def reconstruction_metrics(
     if physical_prediction is None:
         if scaler is None or not hasattr(scaler, "inverse_transform"):
             raise ValueError("physical metrics require explicit physical tensors or an inverse scaler")
-        physical_prediction = scaler.inverse_transform(normalized_prediction)
-        physical_target = scaler.inverse_transform(normalized_target)
+        physical_prediction = _inverse_transform_last_axis(scaler, normalized_prediction)
+        physical_target = _inverse_transform_last_axis(scaler, normalized_target)
     physical = _missing_metrics(physical_prediction, physical_target, mask)
     return {"normalized": normalized, "physical": physical}

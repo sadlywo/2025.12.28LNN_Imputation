@@ -206,3 +206,69 @@ def test_full_record_diagnostic_uses_only_user_acceleration_and_reports_delta():
     assert result.delta_vs_complete["endpoint_drift_m"] == pytest.approx(0.5)
     assert result.complete_trajectory.position_m.shape == (101, 3)
     assert result.imputed_trajectory.position_m.shape == (101, 3)
+
+
+def test_full_record_diagnostic_default_velocity_matches_analytic_ground_truth():
+    from validation_v2.evaluation.trajectory import (
+        measured_attitude_full_record_diagnostic,
+    )
+
+    time_s = np.linspace(0.0, 1.0, 101)
+    imu = np.zeros((101, 6))
+    imu[:, 3] = 2.0 / 9.81
+    position_m = np.column_stack([np.square(time_s), np.zeros((101, 2))])
+    quaternion_xyzw = np.tile([0.0, 0.0, 0.0, 1.0], (101, 1))
+    metadata = {
+        **FRAME_METADATA,
+        "imu_acceleration_unit": "G",
+        "user_acceleration_semantics": "gravity_removed",
+        "position_unit": "m",
+        "time_unit": "s",
+    }
+
+    result = measured_attitude_full_record_diagnostic(
+        imu,
+        imu.copy(),
+        time_s,
+        time_s,
+        position_m,
+        quaternion_xyzw,
+        frame_metadata=metadata,
+        rpe_interval=10,
+    )
+
+    for metrics in (result.complete_metrics, result.imputed_metrics):
+        assert metrics["ate_rmse_m"] == pytest.approx(0.0, abs=1e-12)
+        assert metrics["endpoint_drift_m"] == pytest.approx(0.0, abs=1e-12)
+        assert metrics["velocity_rmse_mps"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_diagnostic_result_defensively_freezes_metric_mappings():
+    from validation_v2.evaluation.trajectory import DiagnosticResult, Trajectory
+
+    trajectory = Trajectory(np.zeros((2, 3)), np.zeros((2, 3)))
+    complete = {"ate_rmse_m": 1.0}
+    imputed = {"ate_rmse_m": 2.0}
+    delta = {"ate_rmse_m": 1.0}
+    result = DiagnosticResult(
+        complete_trajectory=trajectory,
+        imputed_trajectory=trajectory,
+        reference_trajectory=trajectory,
+        complete_metrics=complete,
+        imputed_metrics=imputed,
+        delta_vs_complete=delta,
+        time_s=np.array([0.0, 1.0]),
+    )
+    complete["ate_rmse_m"] = 99.0
+    imputed["ate_rmse_m"] = 99.0
+    delta["ate_rmse_m"] = 99.0
+
+    assert result.complete_metrics["ate_rmse_m"] == 1.0
+    assert result.imputed_metrics["ate_rmse_m"] == 2.0
+    assert result.delta_vs_complete["ate_rmse_m"] == 1.0
+    with pytest.raises(TypeError):
+        result.complete_metrics["ate_rmse_m"] = 3.0
+    with pytest.raises(TypeError):
+        result.imputed_metrics["ate_rmse_m"] = 3.0
+    with pytest.raises(TypeError):
+        result.delta_vs_complete["ate_rmse_m"] = 3.0

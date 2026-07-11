@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Mapping
 
 import numpy as np
@@ -49,6 +50,15 @@ class DiagnosticResult:
     time_s: np.ndarray
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "complete_metrics", MappingProxyType(dict(self.complete_metrics))
+        )
+        object.__setattr__(
+            self, "imputed_metrics", MappingProxyType(dict(self.imputed_metrics))
+        )
+        object.__setattr__(
+            self, "delta_vs_complete", MappingProxyType(dict(self.delta_vs_complete))
+        )
         object.__setattr__(self, "time_s", _frozen_array(self.time_s))
 
 
@@ -271,8 +281,12 @@ def measured_attitude_full_record_diagnostic(
     dt = np.empty_like(query_time)
     dt[0] = 0.0
     dt[1:] = np.diff(query_time)
+    edge_order = 2 if query_time.size >= 3 else 1
+    reference_velocity = np.gradient(
+        synced.position_m, query_time, axis=0, edge_order=edge_order
+    )
     if initial_velocity_mps is None:
-        v0 = (synced.position_m[1] - synced.position_m[0]) / dt[1]
+        v0 = reference_velocity[0]
     else:
         v0 = np.asarray(initial_velocity_mps, dtype=np.float64)
     integration_metadata = {
@@ -295,8 +309,6 @@ def measured_attitude_full_record_diagnostic(
         initial_velocity_mps=v0,
         frame_metadata=integration_metadata,
     )
-    edge_order = 2 if query_time.size >= 3 else 1
-    reference_velocity = np.gradient(synced.position_m, query_time, axis=0, edge_order=edge_order)
     reference_trajectory = Trajectory(synced.position_m, reference_velocity)
     complete_metrics = trajectory_metrics(
         complete_trajectory.position_m,
