@@ -91,18 +91,26 @@ def _claim_once(path: Path, run_id: str, checkpoint_sha256: str) -> dict[str, An
         "started_at": _now(),
     }
     content = (canonical_json(ledger) + "\n").encode("utf-8")
+    temporary: Path | None = None
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-    except FileExistsError as error:
-        raise ValueError(f"run_id {run_id} already evaluated") from error
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
+        with tempfile.NamedTemporaryFile(
+            "wb",
+            dir=path.parent,
+            prefix=".test-evaluation-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-    except BaseException:
-        # A created claim is intentionally permanent; failed evaluations require cleanup.
-        raise
+        try:
+            os.link(temporary, path)
+        except FileExistsError as error:
+            raise ValueError(f"run_id {run_id} already evaluated") from error
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
     return ledger
 
 

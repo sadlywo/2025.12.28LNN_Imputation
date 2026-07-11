@@ -333,6 +333,71 @@ def test_concurrent_test_evaluations_construct_at_most_one_loader(tmp_path: Path
     assert calls == 1
 
 
+def test_claim_fsync_failure_leaves_no_permanent_ledger_and_can_retry(
+    tmp_path: Path, monkeypatch
+):
+    import validation_v2.experiments.evaluate as evaluation
+
+    run_dir, manifest, metadata = _sealed_run(tmp_path)
+    calls = 0
+
+    def factory():
+        nonlocal calls
+        calls += 1
+        return ["rec-a"]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            evaluation.os,
+            "fsync",
+            lambda descriptor: (_ for _ in ()).throw(OSError("claim fsync failed")),
+        )
+        with pytest.raises(OSError, match="claim fsync failed"):
+            evaluation.evaluate_test_once(
+                run_dir,
+                factory,
+                lambda record, checkpoint: _rows(manifest, metadata, record),
+            )
+
+    assert calls == 0
+    assert not (run_dir / "test_evaluation.json").exists()
+    evaluation.evaluate_test_once(
+        run_dir,
+        factory,
+        lambda record, checkpoint: _rows(manifest, metadata, record),
+    )
+    assert calls == 1
+
+
+def test_claim_is_complete_json_at_atomic_publication(tmp_path: Path, monkeypatch):
+    import validation_v2.experiments.evaluate as evaluation
+
+    run_dir, manifest, metadata = _sealed_run(tmp_path)
+    real_link = evaluation.os.link
+    observed_statuses = []
+
+    def observing_link(source, destination):
+        real_link(source, destination)
+        destination = Path(destination)
+        if destination.name == "test_evaluation.json":
+            observed_statuses.append(
+                json.loads(destination.read_text(encoding="utf-8"))["status"]
+            )
+
+    monkeypatch.setattr(evaluation.os, "link", observing_link)
+    evaluation.evaluate_test_once(
+        run_dir,
+        lambda: ["rec-a"],
+        lambda record, checkpoint: _rows(manifest, metadata, record),
+    )
+
+    assert observed_statuses == ["started"]
+    final_ledger = json.loads(
+        (run_dir / "test_evaluation.json").read_text(encoding="utf-8")
+    )
+    assert final_ledger["status"] == "completed"
+
+
 def test_failed_test_evaluation_is_ledgered_and_not_automatically_retried(tmp_path: Path):
     from validation_v2.experiments.evaluate import evaluate_test_once
 
