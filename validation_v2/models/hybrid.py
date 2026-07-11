@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
@@ -11,15 +11,56 @@ from .bilnn import BidirectionalCfC
 from .bilstm import BiLSTMImputer
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False, repr=False)
 class HybridComponents:
     """Inspectable branch, gate, prediction, and completed outputs."""
 
-    lnn: torch.Tensor
-    lstm: torch.Tensor
-    gate: torch.Tensor
-    raw: torch.Tensor
-    completed: torch.Tensor
+    _lnn: torch.Tensor = field(repr=False)
+    _lstm: torch.Tensor = field(repr=False)
+    _gate: torch.Tensor = field(repr=False)
+    _raw: torch.Tensor = field(repr=False)
+    _completed: torch.Tensor = field(repr=False)
+
+    def __init__(
+        self,
+        lnn: torch.Tensor,
+        lstm: torch.Tensor,
+        gate: torch.Tensor,
+        raw: torch.Tensor,
+        completed: torch.Tensor,
+    ) -> None:
+        for name, value in (
+            ("lnn", lnn),
+            ("lstm", lstm),
+            ("gate", gate),
+            ("raw", raw),
+            ("completed", completed),
+        ):
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{name} must be a torch tensor")
+            # Clone, but deliberately do not detach: public isolation must not
+            # sever the training graph used by HybridImputer.forward().
+            object.__setattr__(self, f"_{name}", value.clone())
+
+    @property
+    def lnn(self) -> torch.Tensor:
+        return self._lnn.clone()
+
+    @property
+    def lstm(self) -> torch.Tensor:
+        return self._lstm.clone()
+
+    @property
+    def gate(self) -> torch.Tensor:
+        return self._gate.clone()
+
+    @property
+    def raw(self) -> torch.Tensor:
+        return self._raw.clone()
+
+    @property
+    def completed(self) -> torch.Tensor:
+        return self._completed.clone()
 
 
 def _require_compatible_tensors(
@@ -33,6 +74,8 @@ def _require_compatible_tensors(
         raise ValueError("observed, mask, and prediction must be on the same device")
     if observed.dtype != mask.dtype or observed.dtype != prediction.dtype:
         raise TypeError("observed, mask, and prediction must have the same dtype")
+    if not observed.is_floating_point() or not prediction.is_floating_point():
+        raise TypeError("observed and prediction must be floating point")
     if not torch.all((mask == 0) | (mask == 1)):
         raise ValueError("mask must contain only 0 and 1")
 
@@ -64,6 +107,26 @@ def fuse(
         raise TypeError("predictions and gate must be torch tensors")
     if lnn_prediction.shape != lstm_prediction.shape:
         raise ValueError("branch predictions must have identical shapes")
+    if lnn_prediction.device != lstm_prediction.device:
+        raise ValueError("branch predictions must be on the same device")
+    if lnn_prediction.dtype != lstm_prediction.dtype:
+        raise TypeError("branch predictions must have the same dtype")
+    if not lnn_prediction.is_floating_point():
+        raise TypeError("branch predictions must be floating point")
+    if lnn_gate.device != lnn_prediction.device:
+        raise ValueError("lnn_gate must be on the predictions device")
+    if lnn_gate.dtype != lnn_prediction.dtype:
+        raise TypeError("lnn_gate must have the predictions dtype")
+    if not lnn_gate.is_floating_point():
+        raise TypeError("lnn_gate must be floating point")
+    try:
+        broadcast_shape = torch.broadcast_shapes(
+            lnn_prediction.shape, lnn_gate.shape
+        )
+    except RuntimeError as error:
+        raise ValueError("lnn_gate must broadcast to the prediction shape") from error
+    if broadcast_shape != lnn_prediction.shape:
+        raise ValueError("lnn_gate must broadcast to exactly the prediction shape")
     if not torch.isfinite(lnn_gate).all() or not torch.all(
         (lnn_gate >= 0) & (lnn_gate <= 1)
     ):

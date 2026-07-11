@@ -16,6 +16,8 @@ def _validate_observed(observed: torch.Tensor, mask: torch.Tensor) -> None:
         raise ValueError("observed and mask must be on the same device")
     if observed.dtype != mask.dtype:
         raise TypeError("observed and mask must have the same dtype")
+    if not observed.is_floating_point():
+        raise TypeError("observed signal must be floating point")
     if not torch.all((mask == 0) | (mask == 1)):
         raise ValueError("mask must contain only 0 and 1")
     if not torch.isfinite(observed[mask.bool()]).all():
@@ -93,6 +95,12 @@ def fixed_gate(
 
     if isinstance(lnn_gate, bool) or not isinstance(lnn_gate, (int, float)):
         raise TypeError("lnn_gate must be a number")
+    if not isinstance(lnn_prediction, torch.Tensor) or not isinstance(
+        lstm_prediction, torch.Tensor
+    ):
+        raise TypeError("branch predictions must be torch tensors")
+    if not lnn_prediction.is_floating_point() or not lstm_prediction.is_floating_point():
+        raise TypeError("branch predictions must be floating point")
     gate = lnn_prediction.new_tensor(lnn_gate)
     return complete_signal(observed, mask, fuse(lnn_prediction, lstm_prediction, gate))
 

@@ -5,6 +5,7 @@ from torch import nn
 from validation_v2.models import (
     BiLSTMImputer,
     BidirectionalCfC,
+    HybridComponents,
     HybridImputer,
     complete_signal,
     fuse,
@@ -47,10 +48,73 @@ def test_complete_signal_rejects_incompatible_shape_dtype_and_nonbinary_mask(
         complete_signal(observed, mask, prediction)
 
 
+def test_complete_signal_and_baselines_reject_integer_signals_and_predictions():
+    observed = torch.tensor([[[1], [0], [3]]], dtype=torch.int64)
+    mask = torch.tensor([[[1], [0], [1]]], dtype=torch.int64)
+    prediction = torch.tensor([[[9], [2], [9]]], dtype=torch.int64)
+
+    calls = [
+        lambda: complete_signal(observed, mask, prediction),
+        lambda: locf(observed, mask),
+        lambda: linear_interpolation(observed, mask),
+        lambda: single_branch(observed, mask, prediction),
+        lambda: equal_average(observed, mask, prediction, prediction),
+        lambda: fixed_gate(observed, mask, prediction, prediction, 0.5),
+    ]
+    for call in calls:
+        with pytest.raises(TypeError, match="floating"):
+            call()
+
+
 @pytest.mark.parametrize("gate,expected", [(0.0, 4.0), (0.5, 3.0), (1.0, 2.0)])
 def test_fuse_declares_gate_as_lnn_weight(gate, expected):
     result = fuse(torch.tensor(2.0), torch.tensor(4.0), torch.tensor(gate))
     assert result.item() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        torch.tensor(0.5),
+        torch.full((3,), 0.5),
+        torch.full((2, 4, 1), 0.5),
+        torch.full((2, 4, 3), 0.5),
+    ],
+)
+def test_fuse_allows_only_gates_that_broadcast_to_exact_prediction_shape(gate):
+    lnn = torch.full((2, 4, 3), 2.0)
+    lstm = torch.full((2, 4, 3), 4.0)
+    torch.testing.assert_close(fuse(lnn, lstm, gate), torch.full_like(lnn, 3.0))
+
+    with pytest.raises(ValueError, match="broadcast"):
+        fuse(lnn, lstm, torch.full((1, 2, 4, 3), 0.5))
+
+
+@pytest.mark.parametrize(
+    ("lnn", "lstm", "gate"),
+    [
+        (torch.ones(2), torch.ones(3), torch.tensor(0.5)),
+        (torch.ones(2), torch.ones(2, dtype=torch.float64), torch.tensor(0.5)),
+        (torch.ones(2), torch.ones(2), torch.tensor(0.5, dtype=torch.float64)),
+        (torch.ones(2, dtype=torch.int64), torch.ones(2, dtype=torch.int64), torch.tensor(0.5)),
+        (torch.ones(2), torch.ones(2), torch.tensor(0, dtype=torch.int64)),
+    ],
+)
+def test_fuse_rejects_prediction_shape_and_dtype_or_gate_dtype_mismatches(
+    lnn, lstm, gate
+):
+    with pytest.raises((TypeError, ValueError)):
+        fuse(lnn, lstm, gate)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_fuse_rejects_cross_device_predictions_and_gate():
+    cpu = torch.ones(2)
+    cuda = torch.ones(2, device="cuda")
+    with pytest.raises(ValueError, match="device"):
+        fuse(cpu, cuda, torch.tensor(0.5))
+    with pytest.raises(ValueError, match="device"):
+        fuse(cpu, cpu, torch.tensor(0.5, device="cuda"))
 
 
 def test_bidirectional_cfc_uses_keyword_timespans_aligned_to_each_direction():
@@ -170,6 +234,65 @@ def test_hybrid_components_define_sigmoid_gate_as_lnn_weight_and_complete():
     torch.testing.assert_close(
         model(features, forward_dt, reverse_dt, observed, mask), components.completed
     )
+
+
+@pytest.mark.parametrize("field", ["lnn", "lstm", "gate", "raw", "completed"])
+def test_hybrid_component_public_tensors_are_isolated_returned_clones(field):
+    components = HybridComponents(
+        lnn=torch.ones(2),
+        lstm=torch.ones(2),
+        gate=torch.ones(2),
+        raw=torch.ones(2),
+        completed=torch.ones(2),
+    )
+
+    getattr(components, field).zero_()
+
+    torch.testing.assert_close(getattr(components, field), torch.ones(2))
+
+
+def test_hybrid_forward_clone_preserves_branch_and_gate_autograd():
+    class Branch(nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = nn.Parameter(torch.tensor(value))
+
+        def prediction(self, features):
+            return self.value.expand(*features.shape[:2], 6)
+
+    class LnnBranch(Branch):
+        def forward(self, features, forward_dt, reverse_dt):
+            return self.prediction(features)
+
+    class LstmBranch(Branch):
+        def forward(self, features):
+            return self.prediction(features)
+
+    class GateLogits(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, features):
+            return self.logit.expand(*features.shape[:2], 6)
+
+    lnn = LnnBranch(2.0)
+    lstm = LstmBranch(4.0)
+    gate = GateLogits()
+    model = HybridImputer(
+        input_size=4, lnn_branch=lnn, lstm_branch=lstm, gate_network=gate
+    )
+    features = torch.randn(1, 3, 4)
+    dt = torch.full((1, 3), 0.1)
+    observed = torch.full((1, 3, 6), torch.nan)
+    mask = torch.zeros_like(observed)
+
+    model(features, dt, dt, observed, mask).sum().backward()
+
+    for parameter in (lnn.value, lstm.value, gate.logit):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad)
+        assert parameter.grad.abs() > 0
 
 
 def test_locf_and_linear_interpolation_are_per_batch_per_channel_and_complete():
