@@ -4,11 +4,13 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 import yaml
 
 from validation_v2.experiments.evaluate import METRIC_COLUMNS
+from validation_v2.experiments.matrix import enumerate_matrix
 from validation_v2.experiments.provenance import canonical_json, collect_provenance
 from validation_v2.experiments.validate_artifacts import main, validate_artifacts
 
@@ -37,7 +39,16 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, dict]:
+def _complete_root(
+    tmp_path: Path,
+    *,
+    matrix: bool = True,
+    protocol: str = "strict_file",
+    condition_label: str = "cell-1",
+    condition_id: str | None = None,
+    scaler_training_ids: list[str] | None = None,
+) -> tuple[Path, Path, dict]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     root = tmp_path / "results"
     root.mkdir()
     sources = tmp_path / "sources"
@@ -45,6 +56,7 @@ def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, 
     split_rows = []
     for recording_id, split in (
         ("train-record", "train"),
+        ("train-record-2", "train"),
         ("validation-record", "validation"),
         ("test-record", "test"),
     ):
@@ -83,7 +95,7 @@ def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, 
             "user_acc_y",
             "user_acc_z",
         ],
-        "training_ids": ["train-record"],
+        "training_ids": scaler_training_ids or ["train-record", "train-record-2"],
         "split_hash": split_hash,
     }
     scaler_path = root / "scaler.json"
@@ -93,11 +105,12 @@ def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, 
         scaler_path.replace(root / f"scaler-{scaler_hash}.json")
 
     condition = {
-        "combination_id": hashlib.sha256(b"cell-1").hexdigest(),
+        "combination_id": condition_id
+        or hashlib.sha256(condition_label.encode("utf-8")).hexdigest(),
         "case_type": "missingness",
         "model": "linear",
         "seed": 2026,
-        "protocol": "strict_file",
+        "protocol": protocol,
         "topology": "point",
         "requested_fraction": 0.3,
         "realized_fraction": None,
@@ -105,7 +118,7 @@ def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, 
     if not matrix:
         condition = {
             "case_type": "missingness",
-            "protocol": "strict_file",
+            "protocol": protocol,
             "topology": "point",
             "requested_fraction": 0.3,
         }
@@ -114,7 +127,7 @@ def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, 
         "source_config": {
             "seeds": [2026],
             "models": ["linear"],
-            "protocols": ["strict_file"],
+            "protocols": [protocol],
             "topologies": ["point"],
             "rates": [0.3],
             "trajectory_enabled": True,
@@ -123,7 +136,7 @@ def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, 
         "training_family": "linear",
         "reported_models": ["linear"],
         "seed": 2026,
-        "protocol": "strict_file",
+        "protocol": protocol,
         "objective": "reconstruction_only",
         "condition_list": [condition],
         "resolved_device": "cpu",
@@ -179,7 +192,7 @@ def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, 
         "seed": 2026,
         "recording_id": "test-record",
         "scenario": "handbag",
-        "protocol": "strict_file",
+        "protocol": protocol,
         "topology": "point",
         "requested_fraction": 0.3,
         "realized_fraction": 0.29,
@@ -213,6 +226,28 @@ def _complete_root(tmp_path: Path, *, matrix: bool = True) -> tuple[Path, Path, 
     return root, run_dir, manifest
 
 
+def _merge_formal_roots(first: Path, second: Path) -> Path:
+    for pattern in ("split_manifest-*.csv", "scaler-*.json"):
+        for path in second.glob(pattern):
+            shutil.copy2(path, first / path.name)
+    second_run = next(path for path in second.iterdir() if (path / "run.json").is_file())
+    shutil.copytree(second_run, first / second_run.name)
+    first_marker = json.loads((first / "matrix_execution.json").read_text(encoding="utf-8"))
+    second_marker = json.loads((second / "matrix_execution.json").read_text(encoding="utf-8"))
+    first_marker.update(
+        selected_cells=2,
+        total_cells=2,
+        training_groups=2,
+        selected_combination_ids=[
+            *first_marker["selected_combination_ids"],
+            *second_marker["selected_combination_ids"],
+        ],
+        run_ids=[*first_marker["run_ids"], *second_marker["run_ids"]],
+    )
+    _write_json(first / "matrix_execution.json", first_marker)
+    return first
+
+
 def test_complete_formal_run_validates_and_report_is_idempotent(tmp_path: Path) -> None:
     root, _, manifest = _complete_root(tmp_path)
 
@@ -232,6 +267,62 @@ def test_complete_formal_run_validates_and_report_is_idempotent(tmp_path: Path) 
         "cells": 1,
         "checkpoints": 1,
     }
+
+
+def test_validation_report_seals_every_input_file(tmp_path: Path) -> None:
+    config_value = {
+        "models": ["linear"],
+        "seeds": [2026],
+        "topologies": ["point"],
+        "rates": [0.3],
+        "protocols": ["strict_file"],
+        "irregular_cases": [],
+    }
+    combination_id = enumerate_matrix(config_value)[0]["combination_id"]
+    root, run_dir, _ = _complete_root(tmp_path, condition_id=combination_id)
+    config = root / "executed_config.yaml"
+    config.write_text(yaml.safe_dump(config_value), encoding="utf-8")
+
+    report = validate_artifacts(root, config=config)
+
+    split = next(root.glob("split_manifest-*.csv"))
+    scaler = next(root.glob("scaler-*.json"))
+    expected = {
+        "matrix_execution.json",
+        "executed_config.yaml",
+        split.name,
+        scaler.name,
+        *{
+            f"{run_dir.name}/{name}"
+            for name in (
+                "run.json",
+                "history.json",
+                "best.pt",
+                "checkpoint.json",
+                "test_evaluation.json",
+                "per_record_metrics.csv",
+            )
+        },
+    }
+    assert set(report["input_sha256"]) == expected
+    assert "validation_report.json" not in report["input_sha256"]
+    for relative, digest in report["input_sha256"].items():
+        assert _sha256(root / relative) == digest
+    assert report["snapshot_sha256"] == hashlib.sha256(
+        canonical_json(report["input_sha256"]).encode("utf-8")
+    ).hexdigest()
+
+
+def test_sealed_report_rejects_a_later_valid_metric_change(tmp_path: Path) -> None:
+    root, run_dir, _ = _complete_root(tmp_path)
+    validate_artifacts(root)
+    path = run_dir / "per_record_metrics.csv"
+    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    rows[0]["value"] = "2.0"
+    _write_csv(path, rows)
+
+    with pytest.raises(ValueError, match="stale|snapshot|inconsistent"):
+        validate_artifacts(root)
 
 
 def test_missing_checkpoint_sha256_is_named_in_failure(tmp_path: Path) -> None:
@@ -407,6 +498,38 @@ def test_scaler_must_be_train_only_finite_and_positive(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="scaler"):
         validate_artifacts(root)
+
+
+def test_scaler_training_ids_must_equal_all_split_train_ids(tmp_path: Path) -> None:
+    root, _, _ = _complete_root(
+        tmp_path, scaler_training_ids=["train-record"]
+    )
+
+    with pytest.raises(ValueError, match="training_ids"):
+        validate_artifacts(root)
+
+
+def test_same_protocol_runs_cannot_mix_split_or_scaler_hashes(tmp_path: Path) -> None:
+    first, _, _ = _complete_root(tmp_path / "first", condition_label="first")
+    second, _, _ = _complete_root(tmp_path / "second", condition_label="second")
+    root = _merge_formal_roots(first, second)
+
+    with pytest.raises(ValueError, match="protocol|split_hash|scaler_hash"):
+        validate_artifacts(root)
+
+
+def test_different_protocols_may_use_different_split_and_scaler_hashes(
+    tmp_path: Path,
+) -> None:
+    first, _, _ = _complete_root(tmp_path / "first", condition_label="first")
+    second, _, _ = _complete_root(
+        tmp_path / "second",
+        protocol="scenario_holdout:handbag",
+        condition_label="second",
+    )
+    root = _merge_formal_roots(first, second)
+
+    assert validate_artifacts(root)["status"] == "complete"
 
 
 def test_config_required_seeds_are_enforced(tmp_path: Path) -> None:

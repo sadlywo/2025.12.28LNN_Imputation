@@ -22,7 +22,8 @@ hash as
 The OpenSSH `256` and PuTTY/plink `255` are tool-specific displays, so the full
 strings are not expected to be identical; the SHA-256 hash must match exactly.
 Accept the first-host prompt only when that hash matches, and stop otherwise.
-When SSH asks for the password, use `<在SSH提示中输入，勿保存>`. Never place the
+When SSH asks for the password, use
+`<enter interactively at the SSH prompt; do not save>`. Never place the
 password in this file, shell history, logs, a config, or the result archive.
 
 ## 2. Freeze the source revision
@@ -296,8 +297,12 @@ cp "$AUDIT_DIR/matrix_plan.txt" "$AUDIT_DIR/matrix_plan.sha256" "$RUN_LOG" "$HAN
 git rev-parse HEAD > "$HANDOFF/validated_commit.txt"
 cp "$REPO/$RESULT_ROOT/validation_report.json" "$HANDOFF/"
 cp -a "$REPO/$RESULT_ROOT" "$HANDOFF/results"
-tar -C /root/autodl-tmp -czf "${HANDOFF}.tar.gz" "$(basename "$HANDOFF")"
-sha256sum "${HANDOFF}.tar.gz" | tee "${HANDOFF}.tar.gz.sha256"
+export ARCHIVE="$(basename "${HANDOFF}.tar.gz")"
+tar -C /root/autodl-tmp -czf "/root/autodl-tmp/$ARCHIVE" "$(basename "$HANDOFF")"
+(
+  cd /root/autodl-tmp
+  sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+)
 ```
 
 Download from the local machine:
@@ -309,7 +314,8 @@ scp -P 10274 \
 scp -P 10274 \
   root@connect.westb.seetacloud.com:/root/autodl-tmp/validation-v2-handoff-<VALIDATED_COMMIT>.tar.gz.sha256 \
   .
+sha256sum -c validation-v2-handoff-<VALIDATED_COMMIT>.tar.gz.sha256
 ```
 
-Enter `<在SSH提示中输入，勿保存>` only at the interactive SSH prompt. Verify the
-downloaded archive against its `.sha256` file before analysis.
+Enter `<enter interactively at the SSH prompt; do not save>` only at the
+interactive SSH prompt. The final command must report `OK` before analysis.

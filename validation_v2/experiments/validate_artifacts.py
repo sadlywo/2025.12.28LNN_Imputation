@@ -248,10 +248,20 @@ def _validate_scaler(path: Path, split_hash: str, split: Mapping[str, str]) -> N
     if scaler["channel_order"] != list(IMU_CHANNEL_NAMES) or len(center) != len(IMU_CHANNEL_NAMES):
         raise ValueError("scaler channel_order does not match the six physical IMU channels")
     training_ids = scaler["training_ids"]
-    if not isinstance(training_ids, list) or not training_ids or len(set(training_ids)) != len(training_ids):
+    if (
+        not isinstance(training_ids, list)
+        or not training_ids
+        or any(not isinstance(item, str) or not item for item in training_ids)
+        or len(set(training_ids)) != len(training_ids)
+    ):
         raise ValueError("scaler training_ids must be non-empty and unique")
-    if any(split.get(item) != "train" for item in training_ids):
-        raise ValueError("scaler training_ids must belong only to the train split")
+    expected_training_ids = {
+        recording_id for recording_id, split_name in split.items() if split_name == "train"
+    }
+    if set(training_ids) != expected_training_ids:
+        raise ValueError(
+            "scaler training_ids must exactly equal all split manifest train recording IDs"
+        )
 
 
 def _load_metrics(
@@ -492,6 +502,10 @@ def _validate_run(
         scenario_by_recording,
         smoke=smoke,
     )
+    resolved_config = manifest["config"]
+    protocol = resolved_config.get("protocol")
+    if not isinstance(protocol, str) or not protocol:
+        raise ValueError("run manifest resolved config protocol must be non-empty")
     return {
         "run_id": manifest["run_id"],
         "seed": manifest["seed"],
@@ -499,6 +513,9 @@ def _validate_run(
         "records": records,
         "condition_ids": condition_ids,
         "checkpoint_sha256": metadata["checkpoint_sha256"],
+        "protocol": protocol,
+        "split_hash": split_hash,
+        "scaler_hash": scaler_hash,
     }
 
 
@@ -517,7 +534,9 @@ def _write_report(path: Path, report: Mapping[str, Any]) -> None:
     content = (canonical_json(report) + "\n").encode("utf-8")
     if path.exists():
         if path.read_bytes() != content:
-            raise ValueError("validation_report.json already has inconsistent content")
+            raise ValueError(
+                "validation_report.json is stale or already has inconsistent content"
+            )
         return
     temporary: Path | None = None
     try:
@@ -532,10 +551,31 @@ def _write_report(path: Path, report: Mapping[str, Any]) -> None:
             os.link(temporary, path)
         except FileExistsError as error:
             if path.read_bytes() != content:
-                raise ValueError("validation_report.json already has inconsistent content") from error
+                raise ValueError(
+                    "validation_report.json is stale or already has inconsistent content"
+                ) from error
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink()
+
+
+def _input_snapshot(root: Path, paths: set[Path]) -> tuple[dict[str, str], str]:
+    root = root.resolve()
+    inputs: dict[str, str] = {}
+    for path in paths:
+        resolved = path.resolve()
+        try:
+            relative = Path(os.path.relpath(resolved, root)).as_posix()
+        except ValueError as error:
+            raise ValueError(f"input artifact must be on the same filesystem: {resolved}") from error
+        if relative in inputs:
+            raise ValueError(f"duplicate input snapshot path: {relative}")
+        inputs[relative] = _sha256(resolved)
+    ordered = dict(sorted(inputs.items()))
+    snapshot_sha256 = hashlib.sha256(
+        canonical_json(ordered).encode("utf-8")
+    ).hexdigest()
+    return ordered, snapshot_sha256
 
 
 def validate_artifacts(
@@ -546,7 +586,7 @@ def validate_artifacts(
 ) -> dict[str, Any]:
     """Validate a complete artifact root and atomically seal its report."""
 
-    root = Path(root)
+    root = Path(root).resolve()
     if not root.is_dir():
         raise ValueError(f"artifact root is not a directory: {root}")
     marker, smoke = _validate_marker(root, allow_smoke)
@@ -576,8 +616,20 @@ def validate_artifacts(
                 "run manifest condition_list union does not match selected_combination_ids"
             )
 
+    assets_by_protocol: dict[str, tuple[str, str]] = {}
+    for item in validated:
+        protocol = item["protocol"]
+        assets = (item["split_hash"], item["scaler_hash"])
+        existing = assets_by_protocol.setdefault(protocol, assets)
+        if existing != assets:
+            raise ValueError(
+                f"protocol {protocol} mixes split_hash or scaler_hash assets across runs"
+            )
+
+    config_path: Path | None = None
     if config is not None:
-        loaded_config = _load_config(config)
+        config_path = Path(config).resolve()
+        loaded_config = _load_config(config_path)
         required_seeds = {int(seed) for seed in loaded_config.get("seeds", ())}
         actual_seeds = {int(item["seed"]) for item in validated}
         if actual_seeds != required_seeds:
@@ -595,6 +647,32 @@ def validate_artifacts(
     models = sorted({model for item in validated for model in item["models"]})
     records = sorted({record for item in validated for record in item["records"]})
     checkpoints = sorted({item["checkpoint_sha256"] for item in validated})
+    input_paths = {
+        root / ("smoke_summary.json" if smoke else "matrix_execution.json"),
+        *{
+            directory / name
+            for directory in directories
+            for name in (
+                "run.json",
+                "history.json",
+                "best.pt",
+                "checkpoint.json",
+                "test_evaluation.json",
+                "per_record_metrics.csv",
+            )
+        },
+        *{
+            _asset_path(root, "split_manifest", split_hash, ".csv", smoke)
+            for split_hash in split_cache
+        },
+        *{
+            _asset_path(root, "scaler", scaler_hash, ".json", smoke)
+            for scaler_hash, _ in scaler_cache
+        },
+    }
+    if config_path is not None:
+        input_paths.add(config_path)
+    input_sha256, snapshot_sha256 = _input_snapshot(root, input_paths)
     report = {
         "status": "complete",
         "descriptive_only": smoke,
@@ -612,6 +690,8 @@ def validate_artifacts(
         "records": records,
         "cells": sorted(set(condition_ids)),
         "checkpoint_hashes": checkpoints,
+        "input_sha256": input_sha256,
+        "snapshot_sha256": snapshot_sha256,
     }
     _write_report(root / "validation_report.json", report)
     return report
