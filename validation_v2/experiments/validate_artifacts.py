@@ -188,7 +188,7 @@ def _asset_path(root: Path, prefix: str, digest: str, suffix: str, smoke: bool) 
     return path
 
 
-def _validate_split(path: Path) -> dict[str, str]:
+def _validate_split(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     try:
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -202,6 +202,7 @@ def _validate_split(path: Path) -> dict[str, str]:
     recording_ids: set[str] = set()
     source_paths: set[Path] = set()
     split_by_recording: dict[str, str] = {}
+    scenario_by_recording: dict[str, str] = {}
     for row in rows:
         recording_id = row["recording_id"].strip()
         if not recording_id or recording_id in recording_ids:
@@ -211,6 +212,10 @@ def _validate_split(path: Path) -> dict[str, str]:
         if split not in {"train", "validation", "test"}:
             raise ValueError("split values must be train, validation, or test")
         split_by_recording[recording_id] = split
+        scenario = row["scenario"].strip()
+        if not scenario:
+            raise ValueError("split manifest scenario values must be non-empty")
+        scenario_by_recording[recording_id] = scenario
         for path_field, hash_field in (("imu_path", "imu_sha256"), ("vicon_path", "vicon_sha256")):
             source = Path(row[path_field]).expanduser()
             if not source.is_absolute():
@@ -224,7 +229,7 @@ def _validate_split(path: Path) -> dict[str, str]:
     present = set(split_by_recording.values())
     if present != {"train", "validation", "test"}:
         raise ValueError("split manifest requires non-empty train, validation, and test splits")
-    return split_by_recording
+    return split_by_recording, scenario_by_recording
 
 
 def _validate_scaler(path: Path, split_hash: str, split: Mapping[str, str]) -> None:
@@ -339,6 +344,7 @@ def _validate_conditions(
     manifest: Mapping[str, Any],
     rows: list[dict[str, Any]],
     test_recordings: set[str],
+    scenario_by_recording: Mapping[str, str],
     *,
     smoke: bool,
 ) -> set[str]:
@@ -376,16 +382,33 @@ def _validate_conditions(
         )
     if len(expected_cells) != len(conditions) * len(test_recordings):
         raise ValueError("run manifest condition_list declares duplicate evaluation cells")
-    actual_cells = {
-        (
+    extended_by_projected: dict[
+        tuple[str, str, str, str, float],
+        set[tuple[str, float, int, str, str]],
+    ] = {}
+    for row in rows:
+        projected = (
             row["recording_id"],
             row["model"],
             row["protocol"],
             row["topology"],
             row["requested_fraction"],
         )
-        for row in rows
-    }
+        extended = (
+            row["scenario"],
+            row["realized_fraction"],
+            row["seed"],
+            row["run_id"],
+            row["checkpoint_sha256"],
+        )
+        if row["scenario"] != scenario_by_recording.get(row["recording_id"]):
+            raise ValueError(
+                "extra or duplicate evaluation cell has scenario inconsistent with split manifest"
+            )
+        extended_by_projected.setdefault(projected, set()).add(extended)
+    if any(len(identities) != 1 for identities in extended_by_projected.values()):
+        raise ValueError("extra or duplicate evaluation cell identity")
+    actual_cells = set(extended_by_projected)
     if actual_cells != expected_cells:
         raise ValueError(
             "metrics evaluation cells do not exactly match run manifest condition_list"
@@ -398,7 +421,7 @@ def _validate_run(
     run_dir: Path,
     *,
     smoke: bool,
-    split_cache: dict[str, dict[str, str]],
+    split_cache: dict[str, tuple[dict[str, str], dict[str, str]]],
     scaler_cache: set[tuple[str, str]],
 ) -> dict[str, Any]:
     manifest = _require_mapping(_strict_json(run_dir / "run.json"), "run.json")
@@ -449,7 +472,7 @@ def _validate_run(
         split_cache[split_hash] = _validate_split(
             _asset_path(root, "split_manifest", split_hash, ".csv", smoke)
         )
-    split = split_cache[split_hash]
+    split, scenario_by_recording = split_cache[split_hash]
     scaler_key = (scaler_hash, split_hash)
     if scaler_key not in scaler_cache:
         _validate_scaler(
@@ -463,7 +486,11 @@ def _validate_run(
     if ledger.get("records") != len(records):
         raise ValueError("test_evaluation.json records does not match metrics recording set")
     condition_ids = _validate_conditions(
-        manifest, rows, test_recordings, smoke=smoke
+        manifest,
+        rows,
+        test_recordings,
+        scenario_by_recording,
+        smoke=smoke,
     )
     return {
         "run_id": manifest["run_id"],
@@ -524,7 +551,7 @@ def validate_artifacts(
         raise ValueError(f"artifact root is not a directory: {root}")
     marker, smoke = _validate_marker(root, allow_smoke)
     directories = _run_directories(root, marker)
-    split_cache: dict[str, dict[str, str]] = {}
+    split_cache: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
     scaler_cache: set[tuple[str, str]] = set()
     validated = [
         _validate_run(

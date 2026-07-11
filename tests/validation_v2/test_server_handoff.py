@@ -300,6 +300,23 @@ def test_undeclared_complete_metrics_cell_is_rejected(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [("scenario", "forged-scenario"), ("realized_fraction", 0.31)],
+)
+def test_projected_cell_cannot_hide_a_second_extended_metrics_group(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    root, run_dir, _ = _complete_root(tmp_path)
+    path = run_dir / "per_record_metrics.csv"
+    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    rows.extend([{**row, field: value} for row in rows])
+    _write_csv(path, rows)
+
+    with pytest.raises(ValueError, match="extra|duplicate evaluation cell"):
+        validate_artifacts(root)
+
+
+@pytest.mark.parametrize(
     "mutation",
     ["missing_key", "extra_key", "naive_time", "reverse_time", "boolean_records"],
 )

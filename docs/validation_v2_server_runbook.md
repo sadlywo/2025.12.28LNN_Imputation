@@ -13,10 +13,15 @@ ssh-keyscan -p 10274 connect.westb.seetacloud.com 2>/dev/null | ssh-keygen -lf -
 ssh -p 10274 root@connect.westb.seetacloud.com
 ```
 
-`ssh-keyscan` is not itself a trusted authentication channel; compare its output
-and the first-host prompt against the independently fixed identity
+`ssh-keyscan` is not itself a trusted authentication channel. In OpenSSH,
+`ssh-keygen -lf -` must report
+`256 SHA256:liZ36vNCsNcNdXeWs4f+g5ZIhPM/ZihP834vxs8Ulqc ... (ED25519)`; the
+middle key comment may identify the host. PuTTY/plink displays the same fixed
+hash as
 `ssh-ed25519 255 SHA256:liZ36vNCsNcNdXeWs4f+g5ZIhPM/ZihP834vxs8Ulqc`.
-Accept the host only on an exact match and stop on any mismatch.
+The OpenSSH `256` and PuTTY/plink `255` are tool-specific displays, so the full
+strings are not expected to be identical; the SHA-256 hash must match exactly.
+Accept the first-host prompt only when that hash matches, and stop otherwise.
 When SSH asks for the password, use `<在SSH提示中输入，勿保存>`. Never place the
 password in this file, shell history, logs, a config, or the result archive.
 
@@ -126,9 +131,10 @@ outside the repository so the checked-out source remains clean:
 
 ```bash
 export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${COMMIT}"
+export ACTIVE_CONFIG="$PWD/configs/validation_v2/server_full.yaml"
 mkdir -p "$AUDIT_DIR"
 python -m validation_v2.cli matrix \
-  --config configs/validation_v2/server_full.yaml \
+  --config "$ACTIVE_CONFIG" \
   --dry-run | tee "$AUDIT_DIR/matrix_plan.txt"
 sha256sum "$AUDIT_DIR/matrix_plan.txt" | tee "$AUDIT_DIR/matrix_plan.sha256"
 head -n 1 "$AUDIT_DIR/matrix_plan.txt"
@@ -150,6 +156,7 @@ Define one fresh, commit-qualified output root:
 export RESULT_ROOT="results/validation_v2/server_full-${COMMIT}"
 export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${COMMIT}"
 export RUN_LOG="$AUDIT_DIR/server_full-${COMMIT}.log"
+export ACTIVE_CONFIG="$PWD/configs/validation_v2/server_full.yaml"
 test ! -e "$RESULT_ROOT"
 ```
 
@@ -164,9 +171,10 @@ export COMMIT=<VALIDATED_COMMIT>
 export RESULT_ROOT="results/validation_v2/server_full-${COMMIT}"
 export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${COMMIT}"
 export RUN_LOG="$AUDIT_DIR/server_full-${COMMIT}.log"
+export ACTIVE_CONFIG="$PWD/configs/validation_v2/server_full.yaml"
 set -o pipefail
 python -m validation_v2.cli matrix \
-  --config configs/validation_v2/server_full.yaml \
+  --config "$ACTIVE_CONFIG" \
   --output-root "$RESULT_ROOT" \
   --device cuda 2>&1 | tee -a "$RUN_LOG"
 ```
@@ -174,8 +182,16 @@ python -m validation_v2.cli matrix \
 Detach with `Ctrl-b d`. A `nohup` alternative is:
 
 ```bash
-mkdir -p /root/autodl-tmp/validation-v2-audit-<VALIDATED_COMMIT>
-nohup bash -lc 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate /root/miniconda3/envs/pinn_imu && cd /root/autodl-tmp/2025.12.28LNN_Imputation && set -o pipefail && python -m validation_v2.cli matrix --config configs/validation_v2/server_full.yaml --output-root "results/validation_v2/server_full-<VALIDATED_COMMIT>" --device cuda 2>&1 | tee -a "/root/autodl-tmp/validation-v2-audit-<VALIDATED_COMMIT>/server_full-<VALIDATED_COMMIT>.log"' >/dev/null 2>&1 &
+cd /root/autodl-tmp/2025.12.28LNN_Imputation
+export COMMIT=<VALIDATED_COMMIT>
+export ACTIVE_CONFIG="$PWD/configs/validation_v2/server_full.yaml"
+export RESULT_ROOT="results/validation_v2/server_full-${COMMIT}"
+export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${COMMIT}"
+export RUN_LOG="$AUDIT_DIR/server_full-${COMMIT}.log"
+mkdir -p "$AUDIT_DIR"
+nohup env ACTIVE_CONFIG="$ACTIVE_CONFIG" RESULT_ROOT="$RESULT_ROOT" RUN_LOG="$RUN_LOG" \
+  bash -lc 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate /root/miniconda3/envs/pinn_imu && cd /root/autodl-tmp/2025.12.28LNN_Imputation && set -o pipefail && python -m validation_v2.cli matrix --config "$ACTIVE_CONFIG" --output-root "$RESULT_ROOT" --device cuda 2>&1 | tee -a "$RUN_LOG"' \
+  >"$AUDIT_DIR/nohup.out" 2>&1 &
 ```
 
 After an interruption, safe resume means running the exact same full command
@@ -197,10 +213,18 @@ with the original config's artifacts. Resume within a group requires the same
 resolved config; this is why beginning with batch 32 is strongly preferred.
 
 ```bash
-cp configs/validation_v2/server_full.yaml configs/validation_v2/server_full_batch16.yaml
-sed -i 's/^batch_size: 32$/batch_size: 16/' configs/validation_v2/server_full_batch16.yaml
-git diff -- configs/validation_v2/server_full_batch16.yaml
-# Use a new RESULT_ROOT ending in -batch16; preserve the original root separately.
+export ACTIVE_CONFIG="/root/autodl-tmp/server_full-${COMMIT}.yaml"
+cp "$PWD/configs/validation_v2/server_full.yaml" "$ACTIVE_CONFIG"
+sed -i 's/^batch_size: 32$/batch_size: 16/' "$ACTIVE_CONFIG"
+grep '^batch_size:' "$ACTIVE_CONFIG"
+export RESULT_ROOT="results/validation_v2/server_full-${COMMIT}-batch16"
+export RUN_LOG="$AUDIT_DIR/server_full-${COMMIT}-batch16.log"
+# Preserve the original root and run/resume this exact replacement command.
+set -o pipefail
+python -m validation_v2.cli matrix \
+  --config "$ACTIVE_CONFIG" \
+  --output-root "$RESULT_ROOT" \
+  --device cuda 2>&1 | tee -a "$RUN_LOG"
 ```
 
 ## 6. Validate before formal summarization
@@ -212,7 +236,7 @@ run the artifact validator first:
 ```bash
 python -m validation_v2.experiments.validate_artifacts \
   --root "$RESULT_ROOT" \
-  --config configs/validation_v2/server_full.yaml
+  --config "$ACTIVE_CONFIG"
 test -f "$RESULT_ROOT/validation_report.json"
 ```
 
@@ -222,7 +246,7 @@ the formal summary run:
 ```bash
 python -m validation_v2.cli summarize \
   --root "$RESULT_ROOT" \
-  --config configs/validation_v2/server_full.yaml \
+  --config "$ACTIVE_CONFIG" \
   --baseline linear
 ```
 
@@ -267,7 +291,7 @@ export HANDOFF="/root/autodl-tmp/validation-v2-handoff-${COMMIT}"
 test ! -e "$HANDOFF"
 mkdir -p "$HANDOFF/config"
 printf '%s' "$SOURCE_STATUS" > "$HANDOFF/git_status_porcelain.txt"
-cp "$REPO/configs/validation_v2/server_full.yaml" "$HANDOFF/config/"
+cp "$ACTIVE_CONFIG" "$HANDOFF/config/executed_config.yaml"
 cp "$AUDIT_DIR/matrix_plan.txt" "$AUDIT_DIR/matrix_plan.sha256" "$RUN_LOG" "$HANDOFF/"
 git rev-parse HEAD > "$HANDOFF/validated_commit.txt"
 cp "$REPO/$RESULT_ROOT/validation_report.json" "$HANDOFF/"
