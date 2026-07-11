@@ -135,6 +135,64 @@ def test_write_run_manifest_rejects_a_tampered_content_id(tmp_path: Path):
         provenance.write_run_manifest(tmp_path / "tampered", manifest)
 
 
+def test_write_run_manifest_validates_preexisting_identical_invalid_bytes(tmp_path: Path):
+    manifest = provenance.collect_provenance({"seq_len": 30}, seed=1)
+    manifest["run_id"] = "0" * 16
+    run_dir = tmp_path / "preexisting"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_bytes(
+        provenance.canonical_json(manifest).encode("utf-8") + b"\n"
+    )
+
+    with pytest.raises(ValueError, match="run_id does not match provenance content"):
+        provenance.write_run_manifest(run_dir, manifest)
+
+
+def test_write_run_manifest_rejects_incorrect_config_sha256(tmp_path: Path):
+    manifest = provenance.collect_provenance({"seq_len": 30}, seed=1)
+    manifest["config_sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="config_sha256 does not match resolved config"):
+        provenance.write_run_manifest(tmp_path / "bad-config-hash", manifest)
+
+
+def test_write_run_manifest_rejects_missing_required_field(tmp_path: Path):
+    manifest = provenance.collect_provenance({"seq_len": 30}, seed=1)
+    del manifest["config_sha256"]
+
+    with pytest.raises(ValueError, match="missing manifest fields: config_sha256"):
+        provenance.write_run_manifest(tmp_path / "missing-field", manifest)
+
+
+@pytest.mark.parametrize("field", ["split_hash", "scaler_hash", "dirty_state_digest"])
+def test_write_run_manifest_rejects_malformed_content_digest(tmp_path: Path, field: str):
+    argument = "dirty_digest" if field == "dirty_state_digest" else field
+    kwargs = {argument: "not-a-sha256"}
+    manifest = provenance.collect_provenance({"seq_len": 30}, seed=1, **kwargs)
+
+    with pytest.raises(ValueError, match=rf"{field} must be empty or 64 lowercase hex"):
+        provenance.write_run_manifest(tmp_path / field, manifest)
+
+
+def test_write_run_manifest_does_not_clobber_target_created_during_publish(
+    tmp_path: Path, monkeypatch
+):
+    manifest = provenance.collect_provenance({"seq_len": 30}, seed=1)
+    run_dir = tmp_path / "racing"
+    target = run_dir / "run.json"
+    competing_content = b'{"winner":"other-process"}\n'
+
+    def competing_link(_source, destination):
+        Path(destination).write_bytes(competing_content)
+        raise FileExistsError
+
+    monkeypatch.setattr(provenance.os, "link", competing_link)
+
+    with pytest.raises(ValueError, match="already has different content"):
+        provenance.write_run_manifest(run_dir, manifest)
+    assert target.read_bytes() == competing_content
+
+
 def _write_run(root: Path, run_name: str, seed: int, rows: list[dict]) -> None:
     run_dir = root / run_name
     run_dir.mkdir()

@@ -10,6 +10,7 @@ import math
 import os
 import platform as platform_module
 from pathlib import Path
+import re
 import sys
 import tempfile
 from typing import Any, Mapping
@@ -23,6 +24,21 @@ PACKAGE_DISTRIBUTIONS = (
     "PyYAML",
     "pytest",
     "ncps",
+)
+MANIFEST_FIELDS = frozenset(
+    {
+        "run_id",
+        "seed",
+        "config",
+        "config_sha256",
+        "split_hash",
+        "scaler_hash",
+        "git_commit",
+        "dirty_state_digest",
+        "package_versions",
+        "python",
+        "platform",
+    }
 )
 
 
@@ -119,9 +135,56 @@ def collect_provenance(
     }
 
 
-def write_run_manifest(run_dir: Path | str, manifest: Mapping[str, Any]) -> Path:
-    """Atomically create an immutable run manifest; identical writes are idempotent."""
+def _validate_manifest(manifest: Mapping[str, Any]) -> None:
+    missing = sorted(MANIFEST_FIELDS - manifest.keys())
+    if missing:
+        raise ValueError("missing manifest fields: " + ", ".join(missing))
 
+    if type(manifest["seed"]) is not int:
+        raise ValueError("manifest seed must be an integer")
+    string_fields = (
+        "run_id",
+        "config_sha256",
+        "split_hash",
+        "scaler_hash",
+        "git_commit",
+        "dirty_state_digest",
+        "python",
+        "platform",
+    )
+    if any(not isinstance(manifest[field], str) for field in string_fields):
+        raise ValueError("manifest provenance identifiers must be strings")
+    for field in ("split_hash", "scaler_hash", "dirty_state_digest"):
+        digest = manifest[field]
+        if digest and re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError(f"{field} must be empty or 64 lowercase hex")
+    versions = manifest["package_versions"]
+    if not isinstance(versions, Mapping) or any(
+        not isinstance(name, str) or not isinstance(version, str)
+        for name, version in versions.items()
+    ):
+        raise ValueError("package_versions must map strings to strings")
+
+    config_json = canonical_json(manifest["config"])
+    expected_config_sha256 = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
+    if manifest["config_sha256"] != expected_config_sha256:
+        raise ValueError("config_sha256 does not match resolved config")
+    expected_run_id = run_id(
+        manifest["config"],
+        manifest["seed"],
+        manifest["split_hash"],
+        manifest["scaler_hash"],
+        manifest["git_commit"],
+        manifest["dirty_state_digest"],
+    )
+    if manifest["run_id"] != expected_run_id:
+        raise ValueError("run_id does not match provenance content (different content)")
+
+
+def write_run_manifest(run_dir: Path | str, manifest: Mapping[str, Any]) -> Path:
+    """Validate and atomically seal a manifest without replacing an existing file."""
+
+    _validate_manifest(manifest)
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "run.json"
@@ -130,17 +193,6 @@ def write_run_manifest(run_dir: Path | str, manifest: Mapping[str, Any]) -> Path
         if path.read_bytes() != content:
             raise ValueError(f"run_id {manifest.get('run_id')} already has different content")
         return path
-
-    expected_run_id = run_id(
-        manifest["config"],
-        int(manifest["seed"]),
-        str(manifest.get("split_hash", "")),
-        str(manifest.get("scaler_hash", "")),
-        str(manifest.get("git_commit", "")),
-        str(manifest.get("dirty_state_digest", "")),
-    )
-    if manifest.get("run_id") != expected_run_id:
-        raise ValueError("run_id does not match provenance content")
 
     temporary: Path | None = None
     try:
@@ -151,7 +203,20 @@ def write_run_manifest(run_dir: Path | str, manifest: Mapping[str, Any]) -> Path
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        while True:
+            try:
+                os.link(temporary, path)
+                break
+            except FileExistsError:
+                try:
+                    existing = path.read_bytes()
+                except FileNotFoundError:
+                    continue
+                if existing == content:
+                    return path
+                raise ValueError(
+                    f"run_id {manifest.get('run_id')} already has different content"
+                )
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink()
