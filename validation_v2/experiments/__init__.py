@@ -1,6 +1,19 @@
 """Reproducible experiment provenance and aggregation."""
 
+from .evaluate import evaluate_test_once
+from .matrix import enumerate_matrix
 from .provenance import collect_provenance, run_id, write_run_manifest
 from .summarize import summarize_runs
+from .train import resume_run, select_best_checkpoint, train_one_run
 
-__all__ = ["collect_provenance", "run_id", "summarize_runs", "write_run_manifest"]
+__all__ = [
+    "collect_provenance",
+    "enumerate_matrix",
+    "evaluate_test_once",
+    "resume_run",
+    "run_id",
+    "select_best_checkpoint",
+    "summarize_runs",
+    "train_one_run",
+    "write_run_manifest",
+]
