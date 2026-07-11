@@ -9,11 +9,14 @@ used in the paper.
 Connect from the local machine:
 
 ```bash
+ssh-keyscan -p 10274 connect.westb.seetacloud.com 2>/dev/null | ssh-keygen -lf -
 ssh -p 10274 root@connect.westb.seetacloud.com
 ```
 
-At the first-host prompt, accept the host only if the displayed fingerprint is
-exactly the registered fingerprint `SHA256:liZ36...`. Stop on any mismatch.
+`ssh-keyscan` is not itself a trusted authentication channel; compare its output
+and the first-host prompt against the independently fixed identity
+`ssh-ed25519 255 SHA256:liZ36vNCsNcNdXeWs4f+g5ZIhPM/ZihP834vxs8Ulqc`.
+Accept the host only on an exact match and stop on any mismatch.
 When SSH asks for the password, use `<在SSH提示中输入，勿保存>`. Never place the
 password in this file, shell history, logs, a config, or the result archive.
 
@@ -249,21 +252,27 @@ server_full-<VALIDATED_COMMIT>/
 
 ## 7. Package and download the audited handoff
 
-Build a handoff directory outside the results root. Include results, the exact
-config, commit identity, frozen plan/hash, validation report, and log. Do not
-include `Oxford Dataset`, any SSH material, passwords, tokens, or other secrets.
+Build the handoff directory outside both the repository and results root.
+Before creating it, capture the repository status and require it to be empty.
+Include results, the exact config, commit identity, frozen plan/hash, validation
+report, and log. Do not include `Oxford Dataset`, any SSH material, passwords,
+tokens, or other secrets.
 
 ```bash
-cd /root/autodl-tmp/2025.12.28LNN_Imputation
-export HANDOFF="validation-v2-handoff-${COMMIT}"
+export REPO="/root/autodl-tmp/2025.12.28LNN_Imputation"
+cd "$REPO"
+SOURCE_STATUS="$(git status --porcelain)"
+test -z "$SOURCE_STATUS"
+export HANDOFF="/root/autodl-tmp/validation-v2-handoff-${COMMIT}"
+test ! -e "$HANDOFF"
 mkdir -p "$HANDOFF/config"
-cp configs/validation_v2/server_full.yaml "$HANDOFF/config/"
+printf '%s' "$SOURCE_STATUS" > "$HANDOFF/git_status_porcelain.txt"
+cp "$REPO/configs/validation_v2/server_full.yaml" "$HANDOFF/config/"
 cp "$AUDIT_DIR/matrix_plan.txt" "$AUDIT_DIR/matrix_plan.sha256" "$RUN_LOG" "$HANDOFF/"
 git rev-parse HEAD > "$HANDOFF/validated_commit.txt"
-git status --porcelain > "$HANDOFF/git_status_porcelain.txt"
-cp "$RESULT_ROOT/validation_report.json" "$HANDOFF/"
-cp -a "$RESULT_ROOT" "$HANDOFF/results"
-tar -czf "${HANDOFF}.tar.gz" "$HANDOFF"
+cp "$REPO/$RESULT_ROOT/validation_report.json" "$HANDOFF/"
+cp -a "$REPO/$RESULT_ROOT" "$HANDOFF/results"
+tar -C /root/autodl-tmp -czf "${HANDOFF}.tar.gz" "$(basename "$HANDOFF")"
 sha256sum "${HANDOFF}.tar.gz" | tee "${HANDOFF}.tar.gz.sha256"
 ```
 
@@ -271,10 +280,10 @@ Download from the local machine:
 
 ```bash
 scp -P 10274 \
-  root@connect.westb.seetacloud.com:/root/autodl-tmp/2025.12.28LNN_Imputation/validation-v2-handoff-<VALIDATED_COMMIT>.tar.gz \
+  root@connect.westb.seetacloud.com:/root/autodl-tmp/validation-v2-handoff-<VALIDATED_COMMIT>.tar.gz \
   .
 scp -P 10274 \
-  root@connect.westb.seetacloud.com:/root/autodl-tmp/2025.12.28LNN_Imputation/validation-v2-handoff-<VALIDATED_COMMIT>.tar.gz.sha256 \
+  root@connect.westb.seetacloud.com:/root/autodl-tmp/validation-v2-handoff-<VALIDATED_COMMIT>.tar.gz.sha256 \
   .
 ```
 

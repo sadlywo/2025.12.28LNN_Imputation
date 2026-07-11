@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -40,6 +41,14 @@ CHECKPOINT_FIELDS = {
     "selection_split",
     "selection_metric",
     "checkpoint_sha256",
+}
+COMPLETED_LEDGER_FIELDS = {
+    "run_id",
+    "checkpoint_sha256",
+    "status",
+    "started_at",
+    "completed_at",
+    "records",
 }
 RECONSTRUCTION_METRICS = {
     "reconstruction_normalized",
@@ -98,6 +107,20 @@ def _positive_integer(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _aware_timestamp(value: Any, name: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"test_evaluation.json {name} must be an ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(
+            f"test_evaluation.json {name} must be an ISO-8601 timestamp"
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"test_evaluation.json {name} timestamp must include a timezone")
+    return parsed
 
 
 def _validate_marker(root: Path, allow_smoke: bool) -> tuple[Mapping[str, Any] | None, bool]:
@@ -326,6 +349,7 @@ def _validate_conditions(
     if not isinstance(conditions, list) or not conditions:
         raise ValueError("run manifest condition_list must be non-empty")
     identifiers: set[str] = set()
+    expected_cells: set[tuple[str, str, str, str, float]] = set()
     for condition in conditions:
         if not isinstance(condition, Mapping):
             raise ValueError("run manifest condition_list entries must be mappings")
@@ -346,18 +370,26 @@ def _validate_conditions(
             default_model=str(config.get("model", "")) if smoke else "",
             default_protocol=str(config.get("protocol", "")) if smoke else "",
         )
-        covered = {
-            row["recording_id"]
-            for row in rows
-            if row["model"] == model
-            and row["protocol"] == protocol
-            and row["topology"] == topology
-            and math.isclose(row["requested_fraction"], fraction, rel_tol=0.0, abs_tol=1e-12)
-        }
-        if covered != test_recordings:
-            raise ValueError(
-                "run manifest condition_list cell is not covered for every test recording"
-            )
+        expected_cells.update(
+            (recording_id, model, protocol, topology, fraction)
+            for recording_id in test_recordings
+        )
+    if len(expected_cells) != len(conditions) * len(test_recordings):
+        raise ValueError("run manifest condition_list declares duplicate evaluation cells")
+    actual_cells = {
+        (
+            row["recording_id"],
+            row["model"],
+            row["protocol"],
+            row["topology"],
+            row["requested_fraction"],
+        )
+        for row in rows
+    }
+    if actual_cells != expected_cells:
+        raise ValueError(
+            "metrics evaluation cells do not exactly match run manifest condition_list"
+        )
     return identifiers
 
 
@@ -399,10 +431,17 @@ def _validate_run(
         raise ValueError("checkpoint SHA-256 does not match checkpoint_sha256")
 
     ledger = _require_mapping(_strict_json(run_dir / "test_evaluation.json"), "test_evaluation.json")
+    if set(ledger) != COMPLETED_LEDGER_FIELDS:
+        raise ValueError("test_evaluation.json completed ledger must use the fixed schema")
     if ledger.get("status") != "completed":
         raise ValueError("test_evaluation.json status must be completed")
     if ledger.get("run_id") != manifest["run_id"] or ledger.get("checkpoint_sha256") != metadata["checkpoint_sha256"]:
         raise ValueError("test_evaluation.json run/checkpoint does not match frozen run")
+    started_at = _aware_timestamp(ledger["started_at"], "started_at")
+    completed_at = _aware_timestamp(ledger["completed_at"], "completed_at")
+    if completed_at < started_at:
+        raise ValueError("test_evaluation.json completed_at timestamp precedes started_at")
+    _positive_integer(ledger["records"], "test_evaluation.json records")
 
     split_hash = manifest["split_hash"]
     scaler_hash = manifest["scaler_hash"]

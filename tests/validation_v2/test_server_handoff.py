@@ -282,6 +282,60 @@ def test_run_corruption_is_rejected(tmp_path: Path, mutation: str, message: str)
         validate_artifacts(root)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("topology", "block"), ("model", "undeclared-model"), ("requested_fraction", 0.4)],
+)
+def test_undeclared_complete_metrics_cell_is_rejected(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    root, run_dir, _ = _complete_root(tmp_path)
+    path = run_dir / "per_record_metrics.csv"
+    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    rows.extend([{**row, field: value} for row in rows])
+    _write_csv(path, rows)
+
+    with pytest.raises(ValueError, match="condition_list|evaluation cells"):
+        validate_artifacts(root)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_key", "extra_key", "naive_time", "reverse_time", "boolean_records"],
+)
+def test_completed_ledger_schema_and_timeline_are_strict(
+    tmp_path: Path, mutation: str
+) -> None:
+    root, run_dir, _ = _complete_root(tmp_path)
+    path = run_dir / "test_evaluation.json"
+    ledger = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "missing_key":
+        del ledger["completed_at"]
+    elif mutation == "extra_key":
+        ledger["error"] = "forged"
+    elif mutation == "naive_time":
+        ledger["started_at"] = "2026-07-11T00:00:00"
+    elif mutation == "reverse_time":
+        ledger["completed_at"] = "2026-07-10T23:59:59+00:00"
+    else:
+        ledger["records"] = True
+    _write_json(path, ledger)
+
+    with pytest.raises(ValueError, match="test_evaluation|ledger|records|timestamp"):
+        validate_artifacts(root)
+
+
+def test_smoke_ledger_uses_the_same_fixed_schema(tmp_path: Path) -> None:
+    root, run_dir, _ = _complete_root(tmp_path, matrix=False)
+    path = run_dir / "test_evaluation.json"
+    ledger = json.loads(path.read_text(encoding="utf-8"))
+    ledger["unexpected"] = "not allowed"
+    _write_json(path, ledger)
+
+    with pytest.raises(ValueError, match="test_evaluation|ledger"):
+        validate_artifacts(root, allow_smoke=True)
+
+
 @pytest.mark.parametrize("status", ["started", "failed"])
 def test_incomplete_matrix_marker_is_rejected(tmp_path: Path, status: str) -> None:
     root, _, _ = _complete_root(tmp_path)
