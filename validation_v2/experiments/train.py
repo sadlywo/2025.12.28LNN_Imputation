@@ -23,7 +23,7 @@ def select_best_checkpoint(history: Sequence[Mapping[str, Any]]) -> int:
         raise ValueError("history must not be empty")
     seen: set[int] = set()
     candidates: list[tuple[float, int]] = []
-    for row in history:
+    for expected_epoch, row in enumerate(history, start=1):
         if "test" in row or row.get("split") == "test":
             raise ValueError("test metrics are forbidden during checkpoint selection")
         if set(row) - {"epoch", "train", "validation"}:
@@ -33,6 +33,8 @@ def select_best_checkpoint(history: Sequence[Mapping[str, Any]]) -> int:
             raise ValueError("each history row requires an integer epoch")
         if epoch in seen:
             raise ValueError("duplicate epoch")
+        if epoch != expected_epoch:
+            raise ValueError("history epochs must be in strict input order 1 through N")
         seen.add(epoch)
         train = row.get("train")
         validation = row.get("validation")

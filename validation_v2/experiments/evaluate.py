@@ -113,7 +113,8 @@ def _validate_rows(
     if not rows:
         raise ValueError("evaluation callback returned no metrics")
     normalized: list[dict[str, Any]] = []
-    by_record: dict[str, set[str]] = {}
+    cell_columns = tuple(column for column in METRIC_COLUMNS if column not in {"metric", "value"})
+    by_cell: dict[tuple[Any, ...], set[str]] = {}
     metric_keys: set[tuple[Any, ...]] = set()
     for row in rows:
         if set(row) != set(METRIC_COLUMNS):
@@ -137,17 +138,20 @@ def _validate_rows(
         recording_id = item["recording_id"]
         if not isinstance(recording_id, str) or not recording_id:
             raise ValueError("recording_id must be a non-empty string")
-        metric_key = tuple(item[column] for column in METRIC_COLUMNS if column != "value")
+        cell_key = tuple(item[column] for column in cell_columns)
+        metric_key = (*cell_key, item["metric"])
         if metric_key in metric_keys:
             raise ValueError("duplicate metric row")
         metric_keys.add(metric_key)
-        by_record.setdefault(recording_id, set()).add(item["metric"])
+        by_cell.setdefault(cell_key, set()).add(item["metric"])
         normalized.append(item)
-    for recording_id, metrics in by_record.items():
+    for cell_key, metrics in by_cell.items():
         required = {"reconstruction_normalized", "reconstruction_physical"}
         missing = sorted(required - metrics)
         if missing:
-            raise ValueError(f"recording {recording_id} missing required metrics: {', '.join(missing)}")
+            raise ValueError(
+                f"evaluation cell {cell_key!r} missing required metrics: {', '.join(missing)}"
+            )
         if trajectory_enabled:
             groups = {
                 "ate": {"ate", "ate_rmse_m"},
@@ -159,7 +163,7 @@ def _validate_rows(
             missing_groups = [name for name, choices in groups.items() if not metrics.intersection(choices)]
             if missing_groups:
                 raise ValueError(
-                    f"recording {recording_id} missing required metrics: {', '.join(missing_groups)}"
+                    f"evaluation cell {cell_key!r} missing required metrics: {', '.join(missing_groups)}"
                 )
     return normalized
 

@@ -125,6 +125,18 @@ def test_selection_rejects_invalid_history(history, message):
         select_best_checkpoint(history)
 
 
+@pytest.mark.parametrize("epochs", [[0, 1], [-1, 1], [1, 3], [2, 1]])
+def test_selection_requires_epochs_in_strict_input_order_one_through_n(epochs):
+    from validation_v2.experiments.train import select_best_checkpoint
+
+    history = [
+        {"epoch": epoch, "train": {}, "validation": {"missing_rmse": float(index)}}
+        for index, epoch in enumerate(epochs)
+    ]
+    with pytest.raises(ValueError, match="epochs.*1.*N"):
+        select_best_checkpoint(history)
+
+
 def test_train_one_run_saves_only_best_validation_state_and_can_strictly_resume(tmp_path: Path):
     from validation_v2.experiments.train import train_one_run
 
@@ -201,6 +213,22 @@ def test_train_one_run_saves_only_best_validation_state_and_can_strictly_resume(
             train_epoch=forbidden,
             evaluate_epoch=forbidden,
             expected_checkpoint_sha256="0" * 64,
+        )
+
+    history[1]["epoch"] = 3
+    (run_dir / "history.json").write_text(json.dumps(history), encoding="utf-8")
+    with pytest.raises(ValueError, match="epochs.*1.*N"):
+        train_one_run(
+            run_dir,
+            manifest,
+            model=model,
+            optimizer=optimizer,
+            train_loader=[],
+            validation_loader=[],
+            epochs=2,
+            train_epoch=forbidden,
+            evaluate_epoch=forbidden,
+            expected_checkpoint_sha256=metadata["checkpoint_sha256"],
         )
 
 
@@ -344,6 +372,52 @@ def test_evaluation_writes_fixed_schema_and_requires_reconstruction_metrics(tmp_
     incomplete = _rows(other_manifest, other_metadata)[:1]
     with pytest.raises(ValueError, match="reconstruction_physical"):
         evaluate_test_once(other_dir, lambda: ["rec-a"], lambda *_: incomplete)
+
+
+@pytest.mark.parametrize(
+    "field, other_value",
+    [
+        ("scenario", "run"),
+        ("model", "other_model"),
+        ("topology", "block"),
+        ("requested_fraction", 0.3),
+        ("realized_fraction", 0.29),
+    ],
+)
+def test_reconstruction_metrics_must_coexist_in_each_evaluation_cell(
+    tmp_path: Path, field: str, other_value
+):
+    from validation_v2.experiments.evaluate import evaluate_test_once
+
+    run_dir, manifest, metadata = _sealed_run(tmp_path)
+    split_rows = _rows(manifest, metadata)
+    split_rows[1][field] = other_value
+
+    with pytest.raises(ValueError, match="evaluation cell.*missing required metrics"):
+        evaluate_test_once(run_dir, lambda: ["rec-a"], lambda *_: split_rows)
+
+
+def test_trajectory_metrics_must_coexist_in_each_evaluation_cell(tmp_path: Path):
+    from validation_v2.experiments.evaluate import evaluate_test_once
+
+    run_dir, manifest, metadata = _sealed_run(tmp_path)
+    base = _rows(manifest, metadata)
+    template = dict(base[0])
+    trajectory = [
+        {**template, "metric": metric, "value": 0.1}
+        for metric in ("ate_rmse_m", "rpe_rmse_m", "endpoint_drift_m", "velocity_rmse_mps")
+    ]
+    trajectory.append(
+        {**template, "scenario": "run", "metric": "delta_ate_rmse_m", "value": 0.1}
+    )
+
+    with pytest.raises(ValueError, match="evaluation cell.*missing required metrics"):
+        evaluate_test_once(
+            run_dir,
+            lambda: ["rec-a"],
+            lambda *_: base + trajectory,
+            trajectory_enabled=True,
+        )
 
 
 def test_trajectory_evaluation_requires_all_trajectory_metrics(tmp_path: Path):
