@@ -2,6 +2,7 @@ data_root: Oxford Dataset
 output_root: results/validation_v2/smoke
 selection_split: validation
 seeds: [2026]
+split_seed: 2026
 seq_len: 30
 batch_size: 4
 epochs: 1

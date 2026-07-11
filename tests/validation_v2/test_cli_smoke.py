@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -8,12 +9,15 @@ import pandas as pd
 import pytest
 import torch
 import yaml
+import numpy as np
 
 from validation_v2.experiments.runner import (
     build_execution_model,
     discover_oxiod_pairs,
     resolve_protocol_records,
 )
+from validation_v2.experiments.provenance import collect_provenance
+from validation_v2.types import Recording
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -86,7 +90,146 @@ def test_server_config_declares_real_scenarios_and_bounded_execution_inputs():
         }
     ]
     assert config["max_train_windows"] > 0
-    assert config["max_eval_samples"] > 0
+    assert config["max_eval_samples"] is None
+    assert config["split_seed"] == 2026
+
+
+def test_resolved_provenance_changes_with_hidden_size_or_learning_rate(tmp_path: Path):
+    from validation_v2.experiments.runner import resolved_execution_config
+    from validation_v2.experiments.train import resume_run, train_one_run
+
+    source = yaml.safe_load(
+        (REPO_ROOT / "configs" / "validation_v2" / "smoke.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    source["output_root"] = "ignored/location"
+    source["_execution_conditions"] = ["internal"]
+    source["_skip_descriptive_summary"] = True
+    conditions = [{"topology": "point", "requested_fraction": 0.3}]
+
+    base = resolved_execution_config(
+        source, model="linear", seed=2026, protocol="strict_file",
+        conditions=conditions, resolved_device="cpu",
+    )
+    hidden_source = {**source, "hidden_size": source["hidden_size"] + 1}
+    learning_source = {**source, "learning_rate": source["learning_rate"] * 2}
+    hidden = resolved_execution_config(
+        hidden_source, model="linear", seed=2026, protocol="strict_file",
+        conditions=conditions, resolved_device="cpu",
+    )
+    learning = resolved_execution_config(
+        learning_source, model="linear", seed=2026, protocol="strict_file",
+        conditions=conditions, resolved_device="cpu",
+    )
+
+    manifests = [collect_provenance(item, seed=2026) for item in (base, hidden, learning)]
+    run_ids = {manifest["run_id"] for manifest in manifests}
+    assert len(run_ids) == 3
+    assert "output_root" not in base["source_config"]
+    assert not any(key.startswith("_") for key in base["source_config"])
+    assert base["source_config"]["epochs"] == source["epochs"]
+    assert base["source_config"]["batch_size"] == source["batch_size"]
+    assert base["evaluation_scope"] == "bounded_overlap_slice"
+    server_source = {**source, "max_eval_samples": None}
+    server = resolved_execution_config(
+        server_source, model="linear", seed=2026, protocol="strict_file",
+        conditions=conditions, resolved_device="cpu",
+    )
+    assert server["evaluation_scope"] == "full_overlap_record"
+
+    model = torch.nn.Linear(1, 1)
+    metadata = train_one_run(
+        tmp_path / manifests[0]["run_id"],
+        manifests[0],
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        train_loader=[],
+        validation_loader=[],
+        epochs=1,
+        train_epoch=lambda *_: {"missing_rmse": 1.0},
+        evaluate_epoch=lambda *_: {"missing_rmse": 1.0},
+    )
+    with pytest.raises(ValueError, match="config hash|run_id"):
+        resume_run(
+            tmp_path / manifests[0]["run_id"],
+            manifests[1],
+            metadata["checkpoint_sha256"],
+        )
+
+
+def test_split_seed_freezes_protocol_across_all_training_seeds():
+    from validation_v2.experiments.runner import resolve_configured_records
+
+    config = {"split_seed": 2026}
+    pairs = discover_oxiod_pairs(REPO_ROOT / "Oxford Dataset")
+    manifests = [
+        resolve_configured_records(
+            config,
+            data_root=REPO_ROOT / "Oxford Dataset",
+            protocol="strict_file",
+            training_seed=training_seed,
+        )
+        for training_seed in range(2026, 2031)
+    ]
+
+    split_views = [
+        [(item["recording_id"], item["split"]) for item in manifest]
+        for manifest in manifests
+    ]
+    test_ids = [
+        [item["recording_id"] for item in manifest if item["split"] == "test"]
+        for manifest in manifests
+    ]
+    split_hashes = [
+        hashlib.sha256(
+            json.dumps(view, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        for view in split_views
+    ]
+    assert all(view == split_views[0] for view in split_views[1:])
+    assert all(ids == test_ids[0] for ids in test_ids[1:])
+    assert len(set(split_hashes)) == 1
+
+
+def test_reverse_dt_aligns_intervals_to_reversed_input():
+    from validation_v2.experiments.runner import reverse_aligned_dt
+
+    dt = torch.tensor([[0.25, 0.1, 0.7, 0.2]], dtype=torch.float64)
+
+    reversed_dt = reverse_aligned_dt(dt)
+
+    torch.testing.assert_close(
+        reversed_dt,
+        torch.tensor([[0.2, 0.2, 0.7, 0.1]], dtype=torch.float64),
+    )
+
+
+def test_unlimited_overlap_slice_keeps_every_available_sample():
+    from validation_v2.experiments.runner import _slice_recording
+
+    imu_time = np.arange(150, dtype=np.float64) * 0.01
+    recording = Recording(
+        id="synthetic/imu1",
+        imu_time_s=imu_time,
+        imu_six=np.zeros((150, 6), dtype=np.float64),
+        vicon_time_s=np.array([0.2, 1.2], dtype=np.float64),
+        vicon_position_m=np.zeros((2, 3), dtype=np.float64),
+        vicon_quaternion_xyzw=np.array(
+            [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        ),
+        overlap_s=(0.2, 1.2),
+        metadata={},
+    )
+
+    unlimited_time, unlimited_values = _slice_recording(recording, None)
+    zero_time, zero_values = _slice_recording(recording, 0)
+
+    assert len(unlimited_time) == len(zero_time) == 101
+    assert unlimited_values.shape == zero_values.shape == (101, 6)
+    assert unlimited_time[0] == pytest.approx(0.2)
+    assert unlimited_time[-1] == pytest.approx(1.2)
 
 
 def test_matrix_dry_run_ignores_mapping_and_axis_list_order(tmp_path: Path):
@@ -183,6 +326,15 @@ def test_real_smoke_writes_frozen_runs_and_descriptive_summary(tmp_path: Path):
     }
     scaler = json.loads((output_root / "scaler.json").read_text(encoding="utf-8"))
     assert scaler["training_ids"] == ["handbag-1/imu1", "handbag-1/imu2"]
+    assert scaler["channel_order"] == [
+        "rotation_rate_x",
+        "rotation_rate_y",
+        "rotation_rate_z",
+        "user_acc_x",
+        "user_acc_y",
+        "user_acc_z",
+    ]
+    assert scaler["split_hash"] == report["split_hash"]
     run_dirs = sorted(path.parent for path in output_root.glob("*/run.json"))
     assert len(run_dirs) == 3
     all_models = set()

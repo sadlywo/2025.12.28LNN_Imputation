@@ -26,7 +26,7 @@ from validation_v2.data.masking import (
     point_missing,
 )
 from validation_v2.data.normalization import RobustTrainScaler
-from validation_v2.data.oxiod import load_recording
+from validation_v2.data.oxiod import IMU_CHANNEL_NAMES, load_recording
 from validation_v2.data.windows import make_windows
 from validation_v2.evaluation.reconstruction import reconstruction_metrics
 from validation_v2.evaluation.trajectory import measured_attitude_full_record_diagnostic
@@ -94,7 +94,7 @@ class ExecutionModel(nn.Module):
             return linear_interpolation(observed, mask)
         if self.name == "locf":
             return locf(observed, mask)
-        reverse_dt = dt.flip(-1)
+        reverse_dt = reverse_aligned_dt(dt)
         if self.name == "bilstm":
             return complete_signal(observed, mask, self.core(features))
         if self.name == "bilnn":
@@ -120,6 +120,16 @@ def build_execution_model(model_name: str, hidden_size: int) -> ExecutionModel:
     """Construct a server model under the common observed-only contract."""
 
     return ExecutionModel(model_name, hidden_size)
+
+
+def reverse_aligned_dt(dt: torch.Tensor) -> torch.Tensor:
+    """Align elapsed intervals with a time-reversed feature sequence."""
+
+    if not isinstance(dt, torch.Tensor) or dt.ndim < 1 or dt.shape[-1] < 2:
+        raise ValueError("dt must have a final time axis with at least two values")
+    if not dt.is_floating_point() or not torch.isfinite(dt).all() or not torch.all(dt > 0):
+        raise ValueError("dt must be finite, positive, and floating point")
+    return torch.cat((dt[..., -1:], dt[..., 1:].flip(-1)), dim=-1)
 
 
 def _scenario_name(directory_name: str) -> str:
@@ -222,6 +232,64 @@ def resolve_protocol_records(
     ]
 
 
+def resolve_configured_records(
+    config: Mapping[str, Any],
+    *,
+    data_root: Path,
+    protocol: str,
+    training_seed: int,
+) -> list[dict[str, Any]]:
+    """Resolve explicit records or a scan using the frozen split seed."""
+
+    del training_seed
+    configured = config.get("recordings")
+    if configured is not None:
+        if not isinstance(configured, list):
+            raise ValueError("recordings must be a list when supplied")
+        return [dict(item) for item in configured]
+    split_seed = config.get("split_seed", 2026)
+    if isinstance(split_seed, bool) or not isinstance(split_seed, int):
+        raise ValueError("split_seed must be an integer")
+    return resolve_protocol_records(
+        discover_oxiod_pairs(data_root), protocol, seed=split_seed
+    )
+
+
+def resolved_execution_config(
+    source_config: Mapping[str, Any],
+    *,
+    model: str,
+    seed: int,
+    protocol: str,
+    conditions: Sequence[Mapping[str, Any]],
+    resolved_device: str,
+    recording_splits: Sequence[Mapping[str, str]] = (),
+) -> dict[str, Any]:
+    """Return every behavior-affecting input used for run provenance."""
+
+    filtered_source = {
+        key: value
+        for key, value in source_config.items()
+        if key != "output_root" and not key.startswith("_")
+    }
+    return {
+        "mode": "validation_v2",
+        "source_config": filtered_source,
+        "model": model,
+        "seed": seed,
+        "protocol": protocol,
+        "objective": str(source_config.get("objective", "reconstruction_only")),
+        "condition_list": list(conditions),
+        "resolved_device": resolved_device,
+        "evaluation_scope": (
+            "full_overlap_record"
+            if source_config.get("max_eval_samples") in (None, 0)
+            else "bounded_overlap_slice"
+        ),
+        "recording_splits": [dict(item) for item in recording_splits],
+    }
+
+
 def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -291,11 +359,15 @@ def _record_seed(seed: int, recording_id: str) -> int:
     return (seed + suffix) % (2**31)
 
 
-def _slice_recording(recording: Recording, maximum: int) -> tuple[np.ndarray, np.ndarray]:
+def _slice_recording(
+    recording: Recording, maximum: int | None
+) -> tuple[np.ndarray, np.ndarray]:
     start, end = recording.overlap_s
     indices = np.flatnonzero(
         (recording.imu_time_s >= start) & (recording.imu_time_s <= end)
-    )[:maximum]
+    )
+    if maximum is not None and maximum > 0:
+        indices = indices[:maximum]
     if indices.size < 2:
         raise ValueError(f"recording {recording.id} has fewer than two overlap samples")
     return recording.imu_time_s[indices], recording.imu_six[indices]
@@ -312,7 +384,7 @@ def _prepared_sequence(
     recording: Recording,
     scaler: RobustTrainScaler,
     *,
-    maximum: int,
+    maximum: int | None,
     rate: float,
     seed: int,
     topology: str = "point",
@@ -511,11 +583,13 @@ def _split_content(rows: Sequence[Mapping[str, str]]) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
-def _scaler_content(scaler: RobustTrainScaler) -> bytes:
+def _scaler_content(scaler: RobustTrainScaler, *, split_hash: str) -> bytes:
     value = {
         "center": scaler.center_.tolist(),
         "scale": scaler.scale_.tolist(),
+        "channel_order": list(IMU_CHANNEL_NAMES),
         "training_ids": list(scaler.training_ids),
+        "split_hash": split_hash,
     }
     return (canonical_json(value) + "\n").encode("utf-8")
 
@@ -560,7 +634,7 @@ def _evaluate_record(
     device: torch.device,
     scenarios: Mapping[str, str],
     scaler: RobustTrainScaler,
-    maximum: int,
+    maximum: int | None,
     conditions: Sequence[Mapping[str, Any]],
     seed: int,
     trajectory_enabled: bool,
@@ -685,7 +759,18 @@ def run_smoke(
     batch_size = _positive_int(config, "batch_size")
     seq_len = _positive_int(config, "seq_len")
     max_train_windows = _positive_int(config, "max_train_windows")
-    max_eval_samples = _positive_int(config, "max_eval_samples")
+    raw_max_eval_samples = config.get("max_eval_samples")
+    if isinstance(raw_max_eval_samples, bool):
+        raise ValueError("max_eval_samples must be null, zero, or a positive integer")
+    if raw_max_eval_samples in (None, 0):
+        max_eval_samples: int | None = None
+    elif (
+        not isinstance(raw_max_eval_samples, int)
+        or raw_max_eval_samples < 0
+    ):
+        raise ValueError("max_eval_samples must be null, zero, or a positive integer")
+    else:
+        max_eval_samples = raw_max_eval_samples
     hidden_size = _positive_int(config, "hidden_size")
     models = _require(config, "models", list)
     supported_models = {
@@ -730,16 +815,12 @@ def run_smoke(
         destination = repository_root / destination
     destination.mkdir(parents=True, exist_ok=True)
 
-    configured_records = config.get("recordings")
-    if configured_records is None:
-        configured_records = resolve_protocol_records(
-            discover_oxiod_pairs(data_root),
-            str(training_condition.get("protocol", "strict_file")),
-            seed=seed,
-        )
-    if not isinstance(configured_records, list):
-        raise ValueError("recordings must be a list when supplied")
-    records_config = configured_records
+    records_config = resolve_configured_records(
+        config,
+        data_root=data_root,
+        protocol=str(training_condition.get("protocol", "strict_file")),
+        training_seed=seed,
+    )
     manifest_rows, loaded = _manifest_rows(records_config, data_root)
     split_content = _split_content(manifest_rows)
     split_hash = _sha256_bytes(split_content)
@@ -755,16 +836,14 @@ def run_smoke(
     scaler = RobustTrainScaler.fit(
         by_split["train"], allowed_ids={recording.id for recording in by_split["train"]}
     )
-    scaler_content = _scaler_content(scaler)
+    scaler_content = _scaler_content(scaler, split_hash=split_hash)
     scaler_hash = _sha256_bytes(scaler_content)
     scaler_name = f"scaler-{scaler_hash}.json" if grouped_execution else "scaler.json"
     _write_stable(destination / scaler_name, scaler_content)
 
     baseline_group = all(model in {"linear", "locf"} for model in models)
     execution_train_windows = 1 if baseline_group else max_train_windows
-    execution_validation_windows = (
-        1 if baseline_group else max(1, max_eval_samples // seq_len)
-    )
+    execution_validation_windows = 1 if baseline_group else max_train_windows
     train_batches = _batches(
         _windows(
             by_split["train"], scaler, seq_len=seq_len,
@@ -788,25 +867,18 @@ def run_smoke(
     scenarios = {row["recording_id"]: row["scenario"] for row in manifest_rows}
     for model_name in models:
         _set_seed(seed)
-        resolved = {
-            "mode": "smoke",
-            "model": model_name,
-            "seed": seed,
-            "protocol": str(training_condition.get("protocol", "strict_file")),
-            "objective": "reconstruction_only",
-            "condition_list": conditions,
-            "seq_len": seq_len,
-            "batch_size": batch_size,
-            "epochs": epochs,
-            "max_train_windows": max_train_windows,
-            "max_eval_samples": max_eval_samples,
-            "trajectory_enabled": trajectory_enabled,
-            "device": str(device),
-            "recording_splits": [
+        resolved = resolved_execution_config(
+            config,
+            model=model_name,
+            seed=seed,
+            protocol=str(training_condition.get("protocol", "strict_file")),
+            conditions=conditions,
+            resolved_device=str(device),
+            recording_splits=[
                 {"recording_id": row["recording_id"], "split": row["split"]}
                 for row in manifest_rows
             ],
-        }
+        )
         provenance = collect_provenance(
             resolved,
             seed,
@@ -875,6 +947,11 @@ def run_smoke(
         "scaler_hash": scaler_hash,
         "device": str(device),
         "max_eval_samples": max_eval_samples,
+        "evaluation_scope": (
+            "full_overlap_record"
+            if max_eval_samples is None
+            else "bounded_overlap_slice"
+        ),
     }
 
 

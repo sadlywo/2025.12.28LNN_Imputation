@@ -2,6 +2,7 @@ data_root: Oxford Dataset
 output_root: results/validation_v2/server_full
 selection_split: validation
 seeds: [2026, 2027, 2028, 2029, 2030]
+split_seed: 2026
 seq_len: 30
 batch_size: 32
 epochs: 100
@@ -38,6 +39,6 @@ kinematic_ablation:
 trajectory_enabled: true
 irregular_sampling_is_value_missing: false
 max_train_windows: 4096
-max_eval_samples: 30000
+max_eval_samples: null
 hidden_size: 32
 learning_rate: 0.001
