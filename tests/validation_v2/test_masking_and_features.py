@@ -11,6 +11,76 @@ from validation_v2.data.masking import (
     point_missing,
 )
 from validation_v2.data.windows import make_windows
+from validation_v2.types import (
+    FeatureBatch,
+    IrregularTimeResult,
+    MaskResult,
+    WindowBatch,
+)
+
+
+def _feature_batch(source):
+    return FeatureBatch(values=source, dt=torch.ones(2), mask=torch.ones(2, 6))
+
+
+def _mask_result(source):
+    return MaskResult(
+        mask=source,
+        requested_fraction=0.5,
+        realized_fraction=0.5,
+        topology="point_missing",
+        seed=1,
+    )
+
+
+def _irregular_time_result(source):
+    return IrregularTimeResult(
+        time=source,
+        dt=torch.ones(2),
+        retained_indices=torch.arange(2),
+        requested_irregularity=0.5,
+        realized_irregularity=0.5,
+        method="interval_jitter",
+        seed=1,
+    )
+
+
+def _window_batch(source):
+    return WindowBatch(
+        target=source,
+        mask=torch.ones(2, 6),
+        dt=torch.ones(2),
+        index=torch.arange(2),
+        time=torch.arange(2, dtype=torch.float32),
+        recording_id="recording",
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory", "attribute", "source"),
+    [
+        (_feature_batch, "values", torch.arange(12, dtype=torch.float32).reshape(2, 6)),
+        (_mask_result, "mask", torch.ones(2, 6)),
+        (_irregular_time_result, "time", torch.tensor([0.0, 1.0])),
+        (_window_batch, "target", torch.arange(12, dtype=torch.float32).reshape(2, 6)),
+    ],
+)
+def test_public_tensor_state_is_isolated_from_callers_and_returned_copies(
+    factory, attribute, source
+):
+    expected = source.clone()
+    result = factory(source)
+
+    source.zero_()
+    first_read = getattr(result, attribute)
+    torch.testing.assert_close(first_read, expected)
+    first_read.zero_()
+    second_read = getattr(result, attribute)
+    torch.testing.assert_close(second_read, expected)
+    second_read.reshape(-1)[0] = -999
+    torch.testing.assert_close(getattr(result, attribute), expected)
+    with pytest.raises(FrozenInstanceError):
+        setattr(result, attribute, expected)
 
 
 def test_hidden_targets_cannot_change_model_input():
