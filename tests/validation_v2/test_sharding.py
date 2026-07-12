@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -298,6 +299,17 @@ def test_preflight_is_read_only_and_returns_complete_promotion_manifest(
     ]
     assert promotion["run_ids"] == sorted(promotion["run_ids"])
     assert len(promotion["run_sources"]) == 2
+    for run in promotion["run_sources"]:
+        assert set(run) == {"run_id", "source", "artifacts"}
+        assert {
+            artifact["relative_path"] for artifact in run["artifacts"]
+        } == set(RUN_FILES)
+        assert all(
+            set(artifact) == {"relative_path", "source", "sha256"}
+            and re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])
+            and artifact["source"].is_file()
+            for artifact in run["artifacts"]
+        )
     assert len(promotion["asset_sources"]) == 4
 
 
@@ -490,6 +502,42 @@ def test_merge_failure_keeps_no_final_and_preserves_failed_diagnostics(
     failed = list(tmp_path.glob(".failed-merge-*"))
     assert len(failed) == 1
     assert failed[0].is_dir()
+
+
+@pytest.mark.parametrize("artifact_name", ["run.json", "best.pt"])
+def test_merge_rejects_run_artifact_changed_after_preflight_without_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_name: str
+):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    output_root = tmp_path / "merged"
+    real_copy = sharding.shutil.copy2
+    changed = False
+
+    def mutate_before_copy(source: Any, destination: Any, *args: Any, **kwargs: Any):
+        nonlocal changed
+        source_path = Path(source)
+        if source_path.name == artifact_name and not changed:
+            changed = True
+            if artifact_name == "run.json":
+                manifest = json.loads(source_path.read_text(encoding="utf-8"))
+                manifest["python"] = "changed-after-preflight"
+                _write_raw(source_path, manifest)
+            else:
+                source_path.write_bytes(b"changed-after-preflight")
+        return real_copy(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(sharding.shutil, "copy2", mutate_before_copy)
+
+    with pytest.raises(ValueError, match="SHA-256|changed|digest"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=output_root,
+        )
+
+    assert changed
+    assert not output_root.exists()
 
 
 @pytest.mark.parametrize(

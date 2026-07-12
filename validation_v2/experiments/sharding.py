@@ -1221,7 +1221,22 @@ def preflight_shards(
             if run_id in run_ids:
                 raise ValueError(f"duplicate run_id across shards: {run_id}")
             run_ids.append(run_id)
-            run_sources.append({"run_id": run_id, "source": resolved_run_dir})
+            run_sources.append(
+                {
+                    "run_id": run_id,
+                    "source": resolved_run_dir,
+                    "artifacts": [
+                        {
+                            "relative_path": name,
+                            "source": resolved_run_entries[run_id][name],
+                            "sha256": _file_sha256(
+                                resolved_run_entries[run_id][name]
+                            ),
+                        }
+                        for name in sorted(_RUN_FILES)
+                    ],
+                }
+            )
         for asset in shard_assets:
             source = asset["source"]
             content = source.read_bytes()
@@ -1354,11 +1369,17 @@ def _merge_publish_lock(parent: Path):
             raise cleanup_error
 
 
-def _copy_verified_file(source: Path, destination: Path) -> None:
+def _copy_verified_file(
+    source: Path, destination: Path, *, expected_sha256: str
+) -> None:
     source = Path(source)
     destination = Path(destination)
+    if _file_sha256(source) != expected_sha256:
+        raise ValueError(f"source artifact changed after preflight: {source}")
     shutil.copy2(source, destination)
-    if _file_sha256(source) != _file_sha256(destination):
+    if _file_sha256(source) != expected_sha256:
+        raise ValueError(f"source artifact changed during copy: {source}")
+    if _file_sha256(destination) != expected_sha256:
         raise ValueError(f"copied artifact SHA-256 mismatch: {source}")
 
 
@@ -1510,13 +1531,21 @@ def merge_shards(
                 name = asset["name"]
                 if name in copied_assets:
                     continue
-                _copy_verified_file(asset["source"], temporary / name)
+                _copy_verified_file(
+                    asset["source"],
+                    temporary / name,
+                    expected_sha256=asset["sha256"],
+                )
                 copied_assets.add(name)
             for run in promotion["run_sources"]:
                 destination = temporary / run["run_id"]
-                shutil.copytree(
-                    run["source"], destination, copy_function=_copy_verified_file
-                )
+                destination.mkdir()
+                for artifact in run["artifacts"]:
+                    _copy_verified_file(
+                        artifact["source"],
+                        destination / artifact["relative_path"],
+                        expected_sha256=artifact["sha256"],
+                    )
             _atomic_write_json(
                 temporary / "matrix_execution.json",
                 {
