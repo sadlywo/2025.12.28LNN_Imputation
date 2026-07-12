@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import contextmanager
+import ctypes
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -13,6 +15,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from typing import Any, Union
 import uuid
@@ -925,6 +928,8 @@ def preflight_shards(
         device=plan.get("device"),
     )
     root = Path(shards_root)
+    if os.path.lexists(root) and _is_linked_source(root):
+        raise ValueError("linked or symlink shards_root is not allowed")
     if not root.is_dir():
         raise ValueError("shards_root must be a directory")
     try:
@@ -1082,40 +1087,75 @@ def preflight_shards(
 @contextmanager
 def _merge_publish_lock(parent: Path):
     lock_path = parent / _MERGE_LOCK_FILE
-    handle = lock_path.open("a+b")
-    locked = False
+    if os.path.lexists(lock_path):
+        if _is_linked_source(lock_path):
+            raise ValueError("linked or symlink merge lock is not allowed")
+        if not stat.S_ISREG(os.lstat(lock_path).st_mode):
+            raise ValueError("merge lock must be a regular file")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"\0")
-            handle.flush()
-            os.fsync(handle.fileno())
-        handle.seek(0)
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        if os.path.lexists(lock_path) and _is_linked_source(lock_path):
+            raise ValueError("linked or symlink merge lock is not allowed") from error
+        raise
+    locked = False
+    primary_error: BaseException | None = None
+    try:
+        path_status = os.lstat(lock_path)
+        descriptor_status = os.fstat(descriptor)
+        if (
+            _is_linked_source(lock_path)
+            or not stat.S_ISREG(path_status.st_mode)
+            or not stat.S_ISREG(descriptor_status.st_mode)
+            or (path_status.st_dev, path_status.st_ino)
+            != (descriptor_status.st_dev, descriptor_status.st_ino)
+        ):
+            raise ValueError("merge lock path changed or is not a regular file")
+        if descriptor_status.st_size == 0:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
         try:
             if os.name == "nt":
                 import msvcrt
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             locked = True
         except OSError as error:
             raise ValueError("merge parent is active or locked") from error
         yield
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
+        cleanup_error: BaseException | None = None
         if locked:
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except BaseException as error:
+                cleanup_error = error
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if primary_error is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 def _copy_verified_file(source: Path, destination: Path) -> None:
@@ -1160,6 +1200,52 @@ def _reject_linked_components(path: Path, *, label: str) -> None:
 
 def _destination_exists(raw_output: Path, resolved_output: Path) -> bool:
     return os.path.lexists(raw_output) or os.path.lexists(resolved_output)
+
+
+def _rename_noreplace(source: Union[Path, str], destination: Union[Path, str]) -> None:
+    source_path = os.fspath(source)
+    destination_path = os.fspath(destination)
+    if os.name == "nt":
+        os.rename(source_path, destination_path)
+        return
+    if sys.platform.startswith("linux"):
+        library = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = library.renameat2
+        except AttributeError as error:
+            raise OSError(errno.ENOSYS, "libc renameat2 is unavailable") from error
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            -100,
+            os.fsencode(source_path),
+            -100,
+            os.fsencode(destination_path),
+            1,
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(
+                error_number, os.strerror(error_number), destination_path
+            )
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            f"{source_path} -> {destination_path}",
+        )
+    raise OSError(
+        errno.ENOTSUP,
+        f"atomic no-replace rename is unsupported on {sys.platform}",
+    )
 
 
 def merge_shards(
@@ -1267,7 +1353,7 @@ def merge_shards(
                 raise ValueError("output parent changed during merge")
             if _destination_exists(raw_output, output):
                 raise ValueError("output_root appeared during merge")
-            os.rename(temporary, raw_output)
+            _rename_noreplace(temporary, raw_output)
             return dict(report)
         except BaseException:
             try:

@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import threading
 from typing import Any, Mapping
 
 import pytest
@@ -768,6 +770,190 @@ def test_merge_rejects_raw_link_created_during_publish_window(
     assert _link_snapshot(output_root) == link_before_publish["snapshot"]
     assert not target.exists()
     assert len(list(tmp_path.glob(".failed-merge-*"))) == 1
+
+
+def test_rename_noreplace_never_replaces_existing_destination(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "payload.txt").write_text("source", encoding="utf-8")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_text("competitor", encoding="utf-8")
+
+    with pytest.raises((FileExistsError, OSError)):
+        sharding._rename_noreplace(source, destination)
+
+    assert (source / "payload.txt").read_text(encoding="utf-8") == "source"
+    assert sentinel.read_text(encoding="utf-8") == "competitor"
+    assert list(destination.iterdir()) == [sentinel]
+
+
+def test_merge_publish_race_uses_noreplace_and_preserves_competitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    output_root = tmp_path / "merged"
+    real_rename = getattr(sharding, "_rename_noreplace", None)
+    called: list[tuple[Path, Path]] = []
+
+    def racing_rename(source: Path, destination: Path) -> None:
+        called.append((Path(source), Path(destination)))
+        output_root.mkdir()
+        (output_root / "sentinel.txt").write_text("competitor", encoding="utf-8")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(sharding, "_rename_noreplace", racing_rename, raising=False)
+    with pytest.raises((FileExistsError, OSError)):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=output_root,
+        )
+
+    assert len(called) == 1
+    assert (output_root / "sentinel.txt").read_text(encoding="utf-8") == "competitor"
+    assert list(output_root.iterdir()) == [output_root / "sentinel.txt"]
+    assert len(list(tmp_path.glob(".failed-merge-*"))) == 1
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux renameat2 race")
+def test_linux_rename_noreplace_survives_real_directory_race(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "payload.txt").write_text("source", encoding="utf-8")
+    destination = tmp_path / "destination"
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def publish() -> None:
+        barrier.wait()
+        try:
+            sharding._rename_noreplace(source, destination)
+            outcomes.append("published")
+        except FileExistsError:
+            outcomes.append("blocked")
+
+    def compete() -> None:
+        barrier.wait()
+        try:
+            destination.mkdir()
+            (destination / "sentinel.txt").write_text("competitor", encoding="utf-8")
+            outcomes.append("competitor")
+        except FileExistsError:
+            outcomes.append("competitor-blocked")
+
+    threads = [threading.Thread(target=publish), threading.Thread(target=compete)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    if (destination / "sentinel.txt").exists():
+        assert source.is_dir()
+        assert not (destination / "payload.txt").exists()
+    else:
+        assert (destination / "payload.txt").read_text(encoding="utf-8") == "source"
+    assert set(outcomes) in (
+        {"blocked", "competitor"},
+        {"published", "competitor-blocked"},
+    )
+
+
+def _file_link_or_flag(
+    link: Path,
+    target: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError:
+        link.write_bytes(b"")
+        real_is_linked = sharding._is_linked_source
+        linked_path = link.absolute()
+        monkeypatch.setattr(
+            sharding,
+            "_is_linked_source",
+            lambda path: Path(path).absolute() == linked_path
+            or real_is_linked(Path(path)),
+        )
+
+
+def test_merge_lock_rejects_link_without_writing_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = tmp_path / "external.lock"
+    target.write_bytes(b"")
+    lock_path = parent / sharding._MERGE_LOCK_FILE
+    _file_link_or_flag(lock_path, target, monkeypatch)
+
+    with pytest.raises(ValueError, match="lock|linked|symlink"):
+        with sharding._merge_publish_lock(parent):
+            pass
+
+    assert target.read_bytes() == b""
+
+
+def test_merge_lock_close_runs_and_unlock_does_not_mask_primary_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    real_close = os.close
+    closed: list[int] = []
+
+    def record_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    if os.name == "nt":
+        import msvcrt
+
+        real_locking = msvcrt.locking
+
+        def failing_unlock(fd: int, mode: int, size: int) -> None:
+            if mode == msvcrt.LK_UNLCK:
+                raise OSError("unlock boom")
+            real_locking(fd, mode, size)
+
+        monkeypatch.setattr(msvcrt, "locking", failing_unlock)
+    else:
+        import fcntl
+
+        real_flock = fcntl.flock
+
+        def failing_flock(fd: int, operation: int) -> None:
+            if operation == fcntl.LOCK_UN:
+                raise OSError("unlock boom")
+            real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", failing_flock)
+    monkeypatch.setattr(sharding.os, "close", record_close)
+    with pytest.raises(RuntimeError, match="primary boom"):
+        with sharding._merge_publish_lock(parent):
+            raise RuntimeError("primary boom")
+
+    assert len(closed) == 1
+
+
+def test_preflight_rejects_linked_shards_root(tmp_path: Path):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    external = tmp_path / "external-shards"
+    shards_root.replace(external)
+    _symlink_or_simulate(shards_root, external, directory=True)
+    before = _tree_snapshot(external)
+
+    with pytest.raises(ValueError, match="shards_root|linked|symlink"):
+        preflight_shards(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            plan=plan,
+            shards_root=shards_root,
+        )
+
+    assert _tree_snapshot(external) == before
 
 
 def test_server_plan_has_expected_counts_and_round_robin_assignment():
