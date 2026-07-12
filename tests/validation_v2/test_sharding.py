@@ -102,15 +102,41 @@ def _execution_plan(config: Mapping[str, Any], shard_count: int = 2) -> dict[str
     )
 
 
-def _write_complete_run(output_root: Path, run_id: str) -> None:
+def _write_complete_run(
+    output_root: Path,
+    run_id: str,
+    group: Any,
+    *,
+    git_commit: str | None = None,
+    device: str = "cpu",
+) -> None:
     run_dir = output_root / run_id
+    if run_dir.exists():
+        return
     run_dir.mkdir(parents=True)
-    for name in RUN_FILES:
-        if name == "test_evaluation.json":
-            content = canonical_json({"status": "completed"}) + "\n"
-        else:
-            content = "artifact\n"
-        (run_dir / name).write_text(content, encoding="utf-8")
+    manifest = {
+        "run_id": run_id,
+        "git_commit": git_commit or _head(),
+        "seed": group.seed,
+        "config": {
+            "model": group.training_model,
+            "training_family": group.training_family,
+            "reported_models": list(group.reported_models),
+            "seed": group.seed,
+            "protocol": group.protocol,
+            "objective": group.objective,
+            "condition_list": list(group.conditions),
+            "resolved_device": device,
+        },
+    }
+    _write_raw(run_dir / "run.json", manifest)
+    _write_raw(run_dir / "history.json", [])
+    (run_dir / "best.pt").write_bytes(b"checkpoint")
+    _write_raw(run_dir / "checkpoint.json", {})
+    _write_raw(run_dir / "test_evaluation.json", {"status": "completed"})
+    (run_dir / "per_record_metrics.csv").write_text(
+        "run_id,metric,value\n", encoding="utf-8"
+    )
 
 
 def _fake_group_runner(calls: list[str]):
@@ -123,7 +149,13 @@ def _fake_group_runner(calls: list[str]):
     ) -> Mapping[str, Any]:
         calls.append(group.group_id)
         run_id = group.group_id[:16]
-        _write_complete_run(output_root, run_id)
+        _write_complete_run(
+            output_root,
+            run_id,
+            group,
+            git_commit=_head(),
+            device=requested_device,
+        )
         (output_root / "split_manifest-test.csv").write_text("split\n", encoding="utf-8")
         (output_root / "scaler-test.json").write_text("{}\n", encoding="utf-8")
         return {"status": "completed", "run_ids": [run_id]}
@@ -636,6 +668,10 @@ def test_two_shards_execute_only_disjoint_exhaustive_assigned_groups(
         assert report["status"] == "completed"
         assert report["shard_index"] == index
         assert report["completed_group_ids"] == report["group_ids"]
+        assert report["group_runs"] == [
+            {"group_id": group_id, "run_ids": [group_id[:16]]}
+            for group_id in report["group_ids"]
+        ]
         assert report["completed_at"].endswith("Z")
         assert json.loads(
             (tmp_path / f"shard-{index}" / "shard_execution.json").read_text(
@@ -724,6 +760,149 @@ def test_interrupt_preserves_started_marker_and_resumes_only_remaining_groups(
 
     assert calls == [group.group_id for group in groups[1:]]
     assert report["completed_group_ids"] == [group.group_id for group in groups]
+
+
+def test_completed_run_before_marker_update_is_claimed_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _mini_config()
+    plan = _execution_plan(config, shard_count=1)
+    root = tmp_path / "shard"
+    groups = enumerate_training_groups(config)
+    calls: list[str] = []
+    runner = _fake_group_runner(calls)
+    attempts = 0
+
+    def interrupt_after_completed_run(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        report = runner(*args, **kwargs)
+        if attempts == 2:
+            raise KeyboardInterrupt
+        return report
+
+    monkeypatch.setattr(
+        "validation_v2.experiments.sharding._run_group", interrupt_after_completed_run
+    )
+    with pytest.raises(KeyboardInterrupt):
+        execute_shard(
+            config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+            output_root=root, requested_device="cpu"
+        )
+    interrupted = json.loads(
+        (root / "shard_execution.json").read_text(encoding="utf-8")
+    )
+    assert interrupted["completed_group_ids"] == [groups[0].group_id]
+    assert (root / groups[1].group_id[:16]).is_dir()
+    calls.clear()
+    monkeypatch.setattr("validation_v2.experiments.sharding._run_group", runner)
+
+    report = execute_shard(
+        config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+        output_root=root, requested_device="cpu"
+    )
+
+    assert calls == [groups[1].group_id, groups[2].group_id]
+    assert report["group_runs"] == [
+        {"group_id": group.group_id, "run_ids": [group.group_id[:16]]}
+        for group in groups
+    ]
+
+
+def test_unregistered_complete_run_for_wrong_next_group_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _mini_config()
+    plan = _execution_plan(config, shard_count=1)
+    root = tmp_path / "shard"
+    groups = enumerate_training_groups(config)
+    runner = _fake_group_runner([])
+    attempts = 0
+
+    def forge_next_group(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            wrong = groups[2]
+            _write_complete_run(root, wrong.group_id[:16], wrong)
+            raise KeyboardInterrupt
+        return runner(*args, **kwargs)
+
+    monkeypatch.setattr("validation_v2.experiments.sharding._run_group", forge_next_group)
+    with pytest.raises(KeyboardInterrupt):
+        execute_shard(
+            config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+            output_root=root, requested_device="cpu"
+        )
+
+    with pytest.raises(ValueError, match="manifest|assigned group|group binding"):
+        execute_shard(
+            config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+            output_root=root, requested_device="cpu"
+        )
+
+
+def test_active_shard_lock_rejects_second_holder_and_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _mini_config()
+    plan = _execution_plan(config)
+    root = tmp_path / "shard"
+    root.mkdir()
+    monkeypatch.setattr(
+        "validation_v2.experiments.sharding._run_group", _fake_group_runner([])
+    )
+
+    with sharding._shard_execution_lock(root):
+        with pytest.raises(ValueError, match="active|locked"):
+            execute_shard(
+                config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+                output_root=root, requested_device="cpu"
+            )
+
+    report = execute_shard(
+        config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+        output_root=root, requested_device="cpu"
+    )
+    assert report["status"] == "completed"
+    assert (root / ".shard_execution.lock").is_file()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", True),
+        ("schema_version", 1.0),
+        ("shard_index", False),
+        ("shard_count", 2.0),
+    ],
+)
+def test_marker_integer_immutables_reject_bool_and_float_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: Any,
+):
+    config = _mini_config()
+    plan = _execution_plan(config)
+    root = tmp_path / "shard"
+    monkeypatch.setattr(
+        "validation_v2.experiments.sharding._run_group", _fake_group_runner([])
+    )
+    execute_shard(
+        config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+        output_root=root, requested_device="cpu"
+    )
+    marker_path = root / "shard_execution.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker[field] = value
+    _write_raw(marker_path, marker)
+
+    with pytest.raises(ValueError, match=field):
+        execute_shard(
+            config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+            output_root=root, requested_device="cpu"
+        )
 
 
 def test_started_resume_rejects_partial_run_artifacts(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -62,6 +63,7 @@ _RUN_FILES = frozenset(
 _FORBIDDEN_ROOT_FILES = frozenset(
     {"matrix_execution.json", "smoke_summary.json", "validation_report.json"}
 )
+_LOCK_FILE = ".shard_execution.lock"
 
 
 def _validate_shard_count(shard_count: Any) -> int:
@@ -407,6 +409,52 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
                 pass
 
 
+@contextmanager
+def _shard_execution_lock(output_root: Path):
+    """Hold a non-blocking process lock for one shard output root."""
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    lock_path = output_root / _LOCK_FILE
+    handle = lock_path.open("a+b")
+    locked = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except OSError as error:
+            raise ValueError("shard output root is active or locked") from error
+        yield
+    finally:
+        if locked:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+        else:
+            handle.close()
+
+
 def _run_group(
     config: Mapping[str, Any],
     group: TrainingGroup,
@@ -440,7 +488,13 @@ def _immutable_marker_fields(
     }
 
 
-def _validate_run_directory(run_dir: Path) -> None:
+def _validate_run_directory(
+    run_dir: Path,
+    group: TrainingGroup,
+    *,
+    git_commit: str,
+    device: str,
+) -> None:
     missing = sorted(name for name in _RUN_FILES if not (run_dir / name).is_file())
     if missing:
         raise ValueError(f"incomplete run artifacts in {run_dir.name}: {missing}")
@@ -452,12 +506,49 @@ def _validate_run_directory(run_dir: Path) -> None:
         raise ValueError(f"invalid test_evaluation ledger in {run_dir.name}") from error
     if not isinstance(ledger, Mapping) or ledger.get("status") != "completed":
         raise ValueError(f"test_evaluation ledger is not completed in {run_dir.name}")
+    try:
+        manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid run manifest in {run_dir.name}") from error
+    if not isinstance(manifest, Mapping):
+        raise ValueError(f"run manifest must be a mapping in {run_dir.name}")
+    if manifest.get("run_id") != run_dir.name:
+        raise ValueError("run manifest run_id does not match its directory")
+    if manifest.get("git_commit") != git_commit:
+        raise ValueError("run manifest git_commit does not match shard")
+    if type(manifest.get("seed")) is not int or manifest.get("seed") != group.seed:
+        raise ValueError("run manifest seed does not match assigned group")
+    resolved = manifest.get("config")
+    if not isinstance(resolved, Mapping):
+        raise ValueError("run manifest config must be a mapping")
+    expected = {
+        "model": group.training_model,
+        "training_family": group.training_family,
+        "reported_models": list(group.reported_models),
+        "seed": group.seed,
+        "protocol": group.protocol,
+        "objective": group.objective,
+        "condition_list": list(group.conditions),
+        "resolved_device": device,
+    }
+    for field, expected_value in expected.items():
+        actual = resolved.get(field)
+        if field == "seed" and type(actual) is not int:
+            raise ValueError("run manifest config seed has invalid type")
+        try:
+            matches = canonical_json(actual) == canonical_json(expected_value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid run manifest config field: {field}") from error
+        if not matches:
+            raise ValueError(
+                f"run manifest {field} does not match assigned group binding"
+            )
 
 
 def _root_run_ids(output_root: Path) -> list[str]:
     run_ids: list[str] = []
     for child in output_root.iterdir():
-        if child.name == "shard_execution.json":
+        if child.name in {"shard_execution.json", _LOCK_FILE}:
             continue
         if child.name in _FORBIDDEN_ROOT_FILES:
             raise ValueError(f"forbidden marker in shard output root: {child.name}")
@@ -476,6 +567,7 @@ def _validate_marker(
     marker: Any,
     immutable: Mapping[str, Any],
     output_root: Path,
+    assigned_groups: list[TrainingGroup],
 ) -> dict[str, Any]:
     if not isinstance(marker, Mapping):
         raise ValueError("shard execution marker must be a mapping")
@@ -486,6 +578,7 @@ def _validate_marker(
         "started_at",
         "completed_group_ids",
         "run_ids",
+        "group_runs",
     }
     expected_fields = {
         "started": common,
@@ -494,8 +587,17 @@ def _validate_marker(
     }.get(status)
     if expected_fields is None or set(value) != expected_fields:
         raise ValueError("invalid shard execution marker fields or status")
+    for field in ("schema_version", "shard_index", "shard_count"):
+        if type(value.get(field)) is not int or value.get(field) != immutable[field]:
+            raise ValueError(f"immutable shard marker mismatch: {field}")
     for field, expected in immutable.items():
-        if value.get(field) != expected:
+        if field in {"schema_version", "shard_index", "shard_count"}:
+            continue
+        try:
+            matches = canonical_json(value.get(field)) == canonical_json(expected)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid immutable shard marker: {field}") from error
+        if not matches:
             raise ValueError(f"immutable shard marker mismatch: {field}")
     _validate_created_at(value["started_at"])
     if status == "completed":
@@ -504,29 +606,61 @@ def _validate_marker(
         not isinstance(value["error_type"], str) or not value["error_type"]
     ):
         raise ValueError("invalid shard execution error_type")
-    assigned = list(immutable["group_ids"])
     completed = value["completed_group_ids"]
     run_ids = value["run_ids"]
-    if not isinstance(completed, list) or completed != assigned[: len(completed)]:
-        raise ValueError("completed_group_ids must be an assigned prefix")
-    if status == "completed" and completed != assigned:
-        raise ValueError("completed_group_ids do not cover the completed shard")
-    if not isinstance(run_ids, list) or any(
-        not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id)
-        for run_id in run_ids
-    ):
-        raise ValueError("invalid run_ids in shard execution marker")
+    group_runs = value["group_runs"]
+    if not isinstance(group_runs, list) or len(group_runs) > len(assigned_groups):
+        raise ValueError("invalid group_runs in shard execution marker")
+    expected_completed: list[str] = []
+    expected_run_ids: list[str] = []
+    for index, binding in enumerate(group_runs):
+        if not isinstance(binding, Mapping) or set(binding) != {"group_id", "run_ids"}:
+            raise ValueError("invalid group binding fields in group_runs")
+        group = assigned_groups[index]
+        binding_run_ids = binding["run_ids"]
+        if binding["group_id"] != group.group_id:
+            raise ValueError("group_runs do not match assigned group order")
+        if (
+            not isinstance(binding_run_ids, list)
+            or len(binding_run_ids) != 1
+            or not isinstance(binding_run_ids[0], str)
+            or not _RUN_ID.fullmatch(binding_run_ids[0])
+        ):
+            raise ValueError("each group binding requires exactly one run_id")
+        expected_completed.append(group.group_id)
+        expected_run_ids.append(binding_run_ids[0])
+    if completed != expected_completed:
+        raise ValueError("completed_group_ids do not match group_runs")
+    if run_ids != expected_run_ids:
+        raise ValueError("run_ids do not match group_runs")
     if len(set(run_ids)) != len(run_ids):
         raise ValueError("duplicate run_ids in shard execution marker")
-    if completed and not run_ids:
-        raise ValueError("completed groups require non-empty run_ids")
-    if not assigned and run_ids:
-        raise ValueError("empty shard must have empty run_ids")
+    if status == "completed" and len(group_runs) != len(assigned_groups):
+        raise ValueError("group_runs do not cover the completed shard")
     actual_run_ids = _root_run_ids(output_root)
-    if sorted(run_ids) != actual_run_ids:
-        raise ValueError("run_ids do not match shard run directories")
-    for run_id in run_ids:
-        _validate_run_directory(output_root / run_id)
+    missing = set(run_ids) - set(actual_run_ids)
+    if missing:
+        raise ValueError("registered run_ids do not match shard run directories")
+    for index, run_id in enumerate(run_ids):
+        _validate_run_directory(
+            output_root / run_id,
+            assigned_groups[index],
+            git_commit=str(immutable["git_commit"]),
+            device=str(immutable["device"]),
+        )
+    unregistered = sorted(set(actual_run_ids) - set(run_ids))
+    if unregistered:
+        if status != "started" or len(unregistered) != 1:
+            raise ValueError("unregistered run directories do not match marker")
+        next_index = len(group_runs)
+        if next_index >= len(assigned_groups):
+            raise ValueError("unregistered run has no assigned group")
+        _validate_run_directory(
+            output_root / unregistered[0],
+            assigned_groups[next_index],
+            git_commit=str(immutable["git_commit"]),
+            device=str(immutable["device"]),
+        )
     return value
 
 
@@ -534,15 +668,16 @@ def _load_execution_marker(
     marker_path: Path,
     immutable: Mapping[str, Any],
     output_root: Path,
+    assigned_groups: list[TrainingGroup],
 ) -> dict[str, Any]:
     try:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("unable to load shard execution marker") from error
-    return _validate_marker(marker, immutable, output_root)
+    return _validate_marker(marker, immutable, output_root, assigned_groups)
 
 
-def execute_shard(
+def _execute_shard_locked(
     config: Mapping[str, Any],
     *,
     plan: Mapping[str, Any],
@@ -571,16 +706,21 @@ def execute_shard(
     shard = validated_plan["shards"][shard_index]
     immutable = _immutable_marker_fields(validated_plan, shard, shard_index)
     marker_path = output_root / "shard_execution.json"
+    groups = enumerate_training_groups(config)
+    assigned_groups = [groups[index] for index in shard["group_indices"]]
 
     if marker_path.exists():
-        marker = _load_execution_marker(marker_path, immutable, output_root)
+        marker = _load_execution_marker(
+            marker_path, immutable, output_root, assigned_groups
+        )
         if marker["status"] == "failed":
             raise ValueError("failed shard execution cannot be resumed")
         if marker["status"] == "completed":
             return marker
     else:
-        if output_root.exists() and any(output_root.iterdir()):
-            names = {child.name for child in output_root.iterdir()}
+        existing = [child for child in output_root.iterdir() if child.name != _LOCK_FILE]
+        if existing:
+            names = {child.name for child in existing}
             forbidden = sorted(names & _FORBIDDEN_ROOT_FILES)
             if forbidden:
                 raise ValueError(f"forbidden marker in shard output root: {forbidden[0]}")
@@ -592,12 +732,11 @@ def execute_shard(
             "started_at": _timestamp(),
             "completed_group_ids": [],
             "run_ids": [],
+            "group_runs": [],
         }
         _atomic_write_json(marker_path, marker)
 
-    groups = enumerate_training_groups(config)
-    assigned_groups = [groups[index] for index in shard["group_indices"]]
-    completed_count = len(marker["completed_group_ids"])
+    completed_count = len(marker["group_runs"])
     try:
         for group in assigned_groups[completed_count:]:
             report = _run_group(
@@ -606,17 +745,24 @@ def execute_shard(
             if not isinstance(report, Mapping):
                 raise ValueError("group execution report must be a mapping")
             new_run_ids = report.get("run_ids")
-            if not isinstance(new_run_ids, list) or not new_run_ids:
-                raise ValueError("group execution must return non-empty run_ids")
-            if any(
-                not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id)
-                for run_id in new_run_ids
+            if (
+                not isinstance(new_run_ids, list)
+                or len(new_run_ids) != 1
+                or not isinstance(new_run_ids[0], str)
+                or not _RUN_ID.fullmatch(new_run_ids[0])
             ):
-                raise ValueError("group execution returned invalid run_ids")
+                raise ValueError("group execution must return exactly one run_id")
             if set(new_run_ids) & set(marker["run_ids"]):
                 raise ValueError("group execution returned duplicate run_ids")
-            for run_id in new_run_ids:
-                _validate_run_directory(output_root / run_id)
+            _validate_run_directory(
+                output_root / new_run_ids[0],
+                group,
+                git_commit=git_commit,
+                device=requested_device,
+            )
+            marker["group_runs"].append(
+                {"group_id": group.group_id, "run_ids": list(new_run_ids)}
+            )
             marker["completed_group_ids"].append(group.group_id)
             marker["run_ids"].extend(new_run_ids)
             if sorted(marker["run_ids"]) != _root_run_ids(output_root):
@@ -632,6 +778,34 @@ def execute_shard(
     marker["completed_at"] = _timestamp()
     _atomic_write_json(marker_path, marker)
     return marker
+
+
+def execute_shard(
+    config: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    shard_index: int,
+    repository_root: Union[Path, str],
+    output_root: Union[Path, str],
+    requested_device: str,
+) -> Mapping[str, Any]:
+    """Execute one shard while holding its process-wide output-root lock."""
+
+    repository_path = Path(repository_root)
+    output_path = Path(output_root)
+    if not output_path.is_absolute():
+        output_path = repository_path / output_path
+    if output_path.exists() and not output_path.is_dir():
+        raise ValueError("shard output root must be a directory")
+    with _shard_execution_lock(output_path):
+        return _execute_shard_locked(
+            config,
+            plan=plan,
+            shard_index=shard_index,
+            repository_root=repository_path,
+            output_root=output_path,
+            requested_device=requested_device,
+        )
 
 
 __all__ = [
