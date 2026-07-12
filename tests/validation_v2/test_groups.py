@@ -1,12 +1,15 @@
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import FrozenInstanceError
 import hashlib
 from pathlib import Path
+from typing import Any, get_type_hints, Optional
 
 import pytest
 import yaml
 
 from validation_v2.experiments.groups import (
+    TrainingGroup,
     enumerate_training_groups,
     group_execution_config,
 )
@@ -32,6 +35,7 @@ def test_server_matrix_enumerates_expected_training_groups():
     groups = enumerate_training_groups(config)
 
     assert len(combinations) == 4095
+    assert isinstance(groups, tuple)
     assert len(groups) == 175
     assert [group.group_index for group in groups] == list(range(175))
     assert Counter(group.training_family for group in groups) == {
@@ -145,3 +149,104 @@ def test_duplicate_selected_combination_ids_are_rejected():
 
     with pytest.raises(ValueError, match="duplicate combination_id"):
         enumerate_training_groups(config, combinations=[combination, combination])
+
+
+def _nested_group() -> TrainingGroup:
+    return TrainingGroup(
+        group_index=0,
+        group_id="group-id",
+        training_family="linear",
+        training_model="linear",
+        reported_models=("linear",),
+        seed=2026,
+        protocol="strict_file",
+        objective="reconstruction_only",
+        conditions=(
+            {
+                "combination_id": "combination-id",
+                "nested": {"items": [{"value": 1}]},
+            },
+        ),
+        combination_ids=("combination-id",),
+    )
+
+
+def test_training_group_conditions_are_recursively_immutable():
+    group = _nested_group()
+
+    with pytest.raises(TypeError):
+        group.conditions[0]["combination_id"] = "changed"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        group.conditions[0]["nested"]["items"][0]["value"] = 2  # type: ignore[index]
+
+
+def test_selected_cell_mutation_does_not_change_group_snapshot():
+    config = _server_config()
+    selected = dict(enumerate_matrix(config)[0])
+    original_model = selected["model"]
+
+    group = enumerate_training_groups(config, combinations=[selected])[0]
+    selected["model"] = "changed-after-enumeration"
+
+    assert group.conditions[0]["model"] == original_model
+
+
+def test_execution_configs_recursively_thaw_to_independent_plain_containers():
+    group = _nested_group()
+
+    first = group_execution_config({}, group)
+    second = group_execution_config({}, group)
+    first_condition = first["_execution_conditions"][0]
+    second_condition = second["_execution_conditions"][0]
+
+    assert type(first_condition) is dict
+    assert type(first_condition["nested"]) is dict
+    assert type(first_condition["nested"]["items"]) is list
+    first_condition["nested"]["items"][0]["value"] = 2
+    assert second_condition["nested"]["items"][0]["value"] == 1
+    assert group.conditions[0]["nested"]["items"][0]["value"] == 1
+
+
+def test_foreign_selected_combination_id_is_rejected():
+    config = _server_config()
+    selected = dict(enumerate_matrix(config)[0])
+    selected["combination_id"] = "0" * 64
+
+    with pytest.raises(ValueError, match="foreign combination_id"):
+        enumerate_training_groups(config, combinations=[selected])
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("requested_fraction", 0.987),
+        ("model", "changed-model"),
+        ("protocol", "changed-protocol"),
+    ],
+)
+def test_tampered_selected_combination_is_rejected(field: str, changed_value: Any):
+    config = _server_config()
+    selected = dict(enumerate_matrix(config)[0])
+    selected[field] = changed_value
+
+    with pytest.raises(ValueError, match="tampered combination"):
+        enumerate_training_groups(config, combinations=[selected])
+
+
+def test_non_string_selected_combination_id_is_rejected():
+    config = _server_config()
+    selected = dict(enumerate_matrix(config)[0])
+    selected["combination_id"] = 7
+
+    with pytest.raises(ValueError, match="invalid combination_id"):
+        enumerate_training_groups(config, combinations=[selected])
+
+
+def test_group_enumerator_annotations_are_python_39_compatible():
+    hints = get_type_hints(enumerate_training_groups)
+
+    assert hints["combinations"] == Optional[Sequence[Mapping[str, Any]]]
+    assert hints["return"] == tuple[TrainingGroup, ...]
+    assert enumerate_training_groups.__annotations__["combinations"].startswith(
+        "Optional["
+    )

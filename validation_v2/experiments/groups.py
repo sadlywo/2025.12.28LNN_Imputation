@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Optional
 
 from .matrix import enumerate_matrix
 from .provenance import canonical_json
@@ -22,6 +23,22 @@ _GATE_MODELS = frozenset(
 )
 
 
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class TrainingGroup:
     group_index: int
@@ -35,16 +52,45 @@ class TrainingGroup:
     conditions: tuple[Mapping[str, Any], ...]
     combination_ids: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "conditions",
+            tuple(_freeze(condition) for condition in self.conditions),
+        )
+
 
 def enumerate_training_groups(
     config: Mapping[str, Any],
     *,
-    combinations: Sequence[Mapping[str, Any]] | None = None,
-) -> list[TrainingGroup]:
+    combinations: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> tuple[TrainingGroup, ...]:
     """Group matrix cells that share one trained checkpoint."""
 
-    cells = list(enumerate_matrix(config) if combinations is None else combinations)
-    combination_ids = [str(cell["combination_id"]) for cell in cells]
+    canonical_cells = enumerate_matrix(config)
+    canonical_by_id = {
+        cell["combination_id"]: cell for cell in canonical_cells
+    }
+    if combinations is None:
+        cells = canonical_cells
+    else:
+        cells = []
+        for selected in combinations:
+            combination_id = selected.get("combination_id")
+            if not isinstance(combination_id, str):
+                raise ValueError("invalid combination_id")
+            canonical_cell = canonical_by_id.get(combination_id)
+            if canonical_cell is None:
+                raise ValueError("foreign combination_id")
+            try:
+                matches = canonical_json(selected) == canonical_json(canonical_cell)
+            except (TypeError, ValueError) as error:
+                raise ValueError("tampered combination") from error
+            if not matches:
+                raise ValueError("tampered combination")
+            cells.append(canonical_cell)
+
+    combination_ids = [cell["combination_id"] for cell in cells]
     if len(set(combination_ids)) != len(combination_ids):
         raise ValueError("duplicate combination_id")
 
@@ -103,7 +149,7 @@ def enumerate_training_groups(
                 combination_ids=ordered_combination_ids,
             )
         )
-    return groups
+    return tuple(groups)
 
 
 def group_execution_config(
@@ -111,12 +157,14 @@ def group_execution_config(
 ) -> dict[str, Any]:
     """Build the private runner configuration for one training group."""
 
-    execution = dict(config)
+    execution = _thaw(config)
     execution.update(
         models=[group.training_model],
         seeds=[group.seed],
         protocols=[group.protocol],
-        _execution_conditions=list(group.conditions),
+        _execution_conditions=[
+            _thaw(condition) for condition in group.conditions
+        ],
         _skip_descriptive_summary=True,
         _training_family=group.training_family,
         _reported_models=list(group.reported_models),
