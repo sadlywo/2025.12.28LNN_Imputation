@@ -57,6 +57,10 @@ def _write_raw(path: Path, value: Any) -> None:
     path.write_text(canonical_json(value) + "\n", encoding="utf-8")
 
 
+def _temporary_files(path: Path) -> list[Path]:
+    return list(path.parent.glob(f".{path.name}-*.tmp"))
+
+
 def test_server_plan_has_expected_counts_and_round_robin_assignment():
     config = _server_config()
     groups = enumerate_training_groups(config)
@@ -181,6 +185,7 @@ def test_write_is_canonical_idempotent_and_creates_parents(tmp_path: Path):
     assert second == path
     assert original == (canonical_json(plan) + "\n").encode("utf-8")
     assert path.read_bytes() == original
+    assert _temporary_files(path) == []
 
 
 def test_write_never_clobbers_different_existing_content(tmp_path: Path):
@@ -191,6 +196,76 @@ def test_write_never_clobbers_different_existing_content(tmp_path: Path):
         write_shard_plan(path, _plan(shard_count=2))
 
     assert path.read_bytes() == b"existing bytes\n"
+    assert _temporary_files(path) == []
+
+
+def test_write_survives_destination_deleted_after_exists_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "plan.json"
+    path.write_bytes(b"transient writer\n")
+    plan = _plan(shard_count=2)
+    expected = (canonical_json(plan) + "\n").encode("utf-8")
+    real_exists = Path.exists
+    real_link = os.link
+    raced = False
+
+    def delete_destination_once() -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            path.unlink()
+
+    def racing_exists(candidate: Path) -> bool:
+        if candidate == path:
+            delete_destination_once()
+            return True
+        return real_exists(candidate)
+
+    def racing_link(source: Any, destination: Any) -> None:
+        delete_destination_once()
+        real_link(source, destination)
+
+    monkeypatch.setattr(Path, "exists", racing_exists)
+    monkeypatch.setattr(os, "link", racing_link)
+
+    assert write_shard_plan(path, plan) == path
+    assert path.read_bytes() == expected
+    assert _temporary_files(path) == []
+
+
+def test_write_retries_when_destination_is_deleted_before_conflict_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "plan.json"
+    path.write_bytes(b"transient writer\n")
+    plan = _plan(shard_count=2)
+    expected = (canonical_json(plan) + "\n").encode("utf-8")
+    real_link = os.link
+    real_read_bytes = Path.read_bytes
+    link_attempts = 0
+    deleted = False
+
+    def counting_link(source: Any, destination: Any) -> None:
+        nonlocal link_attempts
+        link_attempts += 1
+        real_link(source, destination)
+
+    def deleting_read_bytes(candidate: Path) -> bytes:
+        nonlocal deleted
+        if candidate == path and not deleted:
+            deleted = True
+            candidate.unlink()
+            raise FileNotFoundError(candidate)
+        return real_read_bytes(candidate)
+
+    monkeypatch.setattr(os, "link", counting_link)
+    monkeypatch.setattr(Path, "read_bytes", deleting_read_bytes)
+
+    assert write_shard_plan(path, plan) == path
+    assert link_attempts == 2
+    assert path.read_bytes() == expected
+    assert _temporary_files(path) == []
 
 
 def _race_at_commit(
@@ -199,7 +274,6 @@ def _race_at_commit(
     racing_content: bytes,
 ) -> None:
     real_link = os.link
-    real_replace = os.replace
     raced = False
 
     def create_racing_destination() -> None:
@@ -212,12 +286,7 @@ def _race_at_commit(
         create_racing_destination()
         real_link(source, destination)
 
-    def racing_replace(source: Any, destination: Any) -> None:
-        create_racing_destination()
-        real_replace(source, destination)
-
     monkeypatch.setattr(os, "link", racing_link)
-    monkeypatch.setattr(os, "replace", racing_replace)
 
 
 def test_write_does_not_clobber_different_content_created_at_commit(
@@ -231,6 +300,7 @@ def test_write_does_not_clobber_different_content_created_at_commit(
         write_shard_plan(path, _plan(shard_count=2))
 
     assert path.read_bytes() == racing_content
+    assert _temporary_files(path) == []
 
 
 def test_write_accepts_same_content_created_at_commit(
@@ -243,6 +313,24 @@ def test_write_accepts_same_content_created_at_commit(
 
     assert write_shard_plan(path, plan) == path
     assert path.read_bytes() == content
+    assert _temporary_files(path) == []
+
+
+def test_write_cleans_temporary_file_when_link_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "plan.json"
+
+    def fail_link(source: Any, destination: Any) -> None:
+        raise PermissionError("link denied")
+
+    monkeypatch.setattr(os, "link", fail_link)
+
+    with pytest.raises(PermissionError, match="link denied"):
+        write_shard_plan(path, _plan(shard_count=2))
+
+    assert not path.exists()
+    assert _temporary_files(path) == []
 
 
 def test_load_round_trip_accepts_json_and_yaml(tmp_path: Path):
@@ -282,6 +370,24 @@ def test_load_rejects_plan_hash_tampering(tmp_path: Path):
     _write_raw(path, changed)
 
     with pytest.raises(ValueError, match="plan_sha256"):
+        load_shard_plan(
+            path, config=_server_config(), git_commit=GIT_COMMIT, device="cuda"
+        )
+
+
+def test_load_rejects_yaml_implicit_date_as_invalid_plan_value(tmp_path: Path):
+    path = tmp_path / "plan.yaml"
+    changed = _plan(shard_count=2)
+    changed["shards"][0]["combination_ids"][0] = "2026-01-01"
+    changed = _resign(changed)
+    rendered = yaml.safe_dump(changed, sort_keys=False)
+    quoted_date = "- '2026-01-01'"
+    assert quoted_date in rendered
+    path.write_text(
+        rendered.replace(quoted_date, "- 2026-01-01", 1), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="invalid shard plan values"):
         load_shard_plan(
             path, config=_server_config(), git_commit=GIT_COMMIT, device="cuda"
         )

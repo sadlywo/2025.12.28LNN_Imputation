@@ -159,10 +159,6 @@ def write_shard_plan(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     content = (canonical_json(plan) + "\n").encode("utf-8")
-    if path.exists():
-        if path.read_bytes() == content:
-            return path
-        raise ValueError("shard plan already exists with different content")
 
     temporary: Union[Path, None] = None
     try:
@@ -280,7 +276,11 @@ def load_shard_plan(
 
     plan = dict(loaded)
     _validate_plan_structure(plan)
-    if plan["plan_sha256"] != _plan_hash(plan):
+    try:
+        actual_plan_sha256 = _plan_hash(plan)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid shard plan values") from error
+    if plan["plan_sha256"] != actual_plan_sha256:
         raise ValueError("plan_sha256 does not match shard plan content")
     if plan["source_config_sha256"] != _sha256(_source_config(config)):
         raise ValueError("source_config_sha256 does not match current config")
