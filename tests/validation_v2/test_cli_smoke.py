@@ -1,9 +1,11 @@
 import json
 import hashlib
 import os
+from collections.abc import Iterator
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 import pandas as pd
 import pytest
@@ -23,12 +25,20 @@ from validation_v2.types import Recording
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _cli(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+@pytest.fixture
+def external_repo_tmp_path() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(
+        prefix="validation-v2-cli-", dir=REPO_ROOT.parents[2]
+    ) as directory:
+        yield Path(directory)
+
+
+def _cli(*arguments: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(REPO_ROOT)
     return subprocess.run(
         [sys.executable, "-m", "validation_v2.cli", *arguments],
-        cwd=REPO_ROOT,
+        cwd=cwd,
         env=environment,
         capture_output=True,
         check=False,
@@ -45,6 +55,9 @@ def test_shard_plan_writes_formal_server_plan_as_one_canonical_json_line(
     tmp_path: Path,
 ):
     plan_path = tmp_path / "server-plan.json"
+    (tmp_path / "server_full.yaml").write_text(
+        "models: [malicious-cwd-shadow]\n", encoding="utf-8"
+    )
 
     result = _cli(
         "shard-plan",
@@ -56,6 +69,7 @@ def test_shard_plan_writes_formal_server_plan_as_one_canonical_json_line(
         str(plan_path),
         "--device",
         "cuda",
+        cwd=tmp_path,
     )
 
     assert result.returncode == 0, result.stderr.decode()
@@ -144,33 +158,45 @@ def test_shard_commands_reject_invalid_arguments(arguments: tuple[str, ...]):
     assert result.stdout == b""
 
 
-def test_two_cli_shards_execute_and_merge_through_strict_validator(tmp_path: Path):
+def test_two_cli_shards_execute_and_merge_through_strict_validator(
+    external_repo_tmp_path: Path,
+):
+    tmp_path = external_repo_tmp_path
     if not (REPO_ROOT / "Oxford Dataset" / "handbag-1" / "imu1.csv").is_file():
         pytest.skip("real OxIOD files are not available")
-    config = yaml.safe_load(
-        (REPO_ROOT / "configs" / "validation_v2" / "smoke.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
-    config["models"] = ["linear", "locf"]
-    config_path = tmp_path / "two-shards.yaml"
-    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    config_value = "configs/validation_v2/smoke.yaml"
+    shadow = tmp_path / config_value
+    shadow.parent.mkdir(parents=True)
+    shadow.write_text("models: [malicious-cwd-shadow]\n", encoding="utf-8")
     plan_path = tmp_path / "plan.json"
     shards_root = tmp_path / "shards"
     merged_root = tmp_path / "merged"
+    dirty_text = subprocess.check_output(
+        [
+            "git", "-C", str(REPO_ROOT), "status", "--porcelain=v1",
+            "--untracked-files=no",
+        ],
+        text=True,
+    ).strip()
+    expected_dirty_digest = (
+        hashlib.sha256(dirty_text.encode("utf-8")).hexdigest()
+        if dirty_text else ""
+    )
 
     planned = _cli(
-        "shard-plan", "--config", str(config_path), "--shard-count", "2",
+        "shard-plan", "--config", config_value, "--shard-count", "2",
         "--output", str(plan_path), "--device", "cpu",
+        cwd=tmp_path,
     )
     assert planned.returncode == 0, planned.stderr.decode()
-    assert json.loads(planned.stdout)["total_groups"] == 2
+    assert json.loads(planned.stdout)["total_groups"] == 3
 
     for shard_index in range(2):
         executed = _cli(
-            "shard", "--config", str(config_path), "--plan", str(plan_path),
+            "shard", "--config", config_value, "--plan", str(plan_path),
             "--shard-index", str(shard_index), "--output-root",
             str(shards_root / f"{shard_index:03d}"), "--device", "cpu",
+            cwd=tmp_path,
         )
         assert executed.returncode == 0, executed.stderr.decode()
         assert executed.stderr == b""
@@ -179,9 +205,16 @@ def test_two_cli_shards_execute_and_merge_through_strict_validator(tmp_path: Pat
         assert report["status"] == "completed"
         assert report["shard_index"] == shard_index
 
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    for manifest_path in shards_root.glob("*/*/run.json"):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["git_commit"] == plan["git_commit"]
+        assert manifest["dirty_state_digest"] == expected_dirty_digest
+
     merged = _cli(
-        "merge-shards", "--config", str(config_path), "--plan", str(plan_path),
+        "merge-shards", "--config", config_value, "--plan", str(plan_path),
         "--shards-root", str(shards_root), "--output-root", str(merged_root),
+        cwd=tmp_path,
     )
 
     assert merged.returncode == 0, merged.stderr.decode()
@@ -207,6 +240,20 @@ def test_merge_shards_error_is_one_prefixed_stderr_line(tmp_path: Path):
     assert result.stdout == b""
     assert result.stderr.startswith(b"validation-v2: ")
     assert len(result.stderr.decode("utf-8").splitlines()) == 1
+
+
+def test_missing_config_from_temporary_cwd_is_a_clear_exit_two(tmp_path: Path):
+    result = _cli(
+        "shard-plan", "--config", "missing.yaml", "--shard-count", "1",
+        "--output", str(tmp_path / "plan.json"), "--device", "cpu",
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert result.stderr.decode("utf-8").splitlines() == [
+        "validation-v2: config file does not exist: missing.yaml"
+    ]
 
 
 def test_server_matrix_dry_run_is_byte_stable_and_complete():

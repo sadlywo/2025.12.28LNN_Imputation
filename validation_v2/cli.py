@@ -29,11 +29,14 @@ _CONFIG_DIRECTORY = _REPOSITORY_ROOT / "configs" / "validation_v2"
 
 def _config_path(value: str) -> Path:
     supplied = Path(value)
-    if supplied.is_file():
-        return supplied
-    packaged = _CONFIG_DIRECTORY / supplied
-    if packaged.is_file():
-        return packaged
+    if supplied.is_absolute():
+        candidate = supplied
+    elif supplied.parent == Path("."):
+        candidate = _CONFIG_DIRECTORY / supplied
+    else:
+        candidate = _REPOSITORY_ROOT / supplied
+    if candidate.is_file():
+        return candidate
     raise ValueError(f"config file does not exist: {value}")
 
 

@@ -442,10 +442,19 @@ def _set_seed(seed: int) -> None:
     torch.use_deterministic_algorithms(True)
 
 
-def _git_value(arguments: Sequence[str], default: str = "") -> str:
+def _git_value(
+    arguments: Sequence[str],
+    default: str = "",
+    *,
+    repository_root: Path | None = None,
+) -> str:
+    command = ["git"]
+    if repository_root is not None:
+        command.extend(("-C", str(repository_root)))
+    command.extend(arguments)
     try:
         result = subprocess.run(
-            ["git", *arguments], capture_output=True, check=True, text=True
+            command, capture_output=True, check=True, text=True
         )
     except (OSError, subprocess.CalledProcessError):
         return default
@@ -1011,8 +1020,13 @@ def run_smoke(
         ),
         batch_size,
     )
-    commit = _git_value(("rev-parse", "HEAD"))
-    dirty_text = _git_value(("status", "--porcelain=v1", "--untracked-files=no"))
+    commit = _git_value(
+        ("rev-parse", "HEAD"), repository_root=repository_root
+    )
+    dirty_text = _git_value(
+        ("status", "--porcelain=v1", "--untracked-files=no"),
+        repository_root=repository_root,
+    )
     dirty_digest = _sha256_bytes(dirty_text.encode("utf-8")) if dirty_text else ""
     run_dirs: list[Path] = []
     scenarios = {row["recording_id"]: row["scenario"] for row in manifest_rows}
