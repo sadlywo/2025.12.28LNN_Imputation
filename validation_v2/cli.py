@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+import subprocess
 import sys
 
 import yaml
@@ -12,10 +13,18 @@ import yaml
 from validation_v2.experiments.matrix import enumerate_matrix
 from validation_v2.experiments.provenance import canonical_json
 from validation_v2.experiments.runner import run_matrix, run_smoke
+from validation_v2.experiments.sharding import (
+    build_shard_plan,
+    execute_shard,
+    load_shard_plan,
+    merge_shards,
+    write_shard_plan,
+)
 from validation_v2.experiments.summarize import summarize_runs
 
 
-_CONFIG_DIRECTORY = Path(__file__).resolve().parents[1] / "configs" / "validation_v2"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_CONFIG_DIRECTORY = _REPOSITORY_ROOT / "configs" / "validation_v2"
 
 
 def _config_path(value: str) -> Path:
@@ -34,6 +43,26 @@ def _mapping_config(value: str) -> Mapping[str, object]:
     if not isinstance(loaded, Mapping):
         raise ValueError("config must be a YAML mapping")
     return loaded
+
+
+def _repository_path(value: Path) -> Path:
+    return value if value.is_absolute() else _REPOSITORY_ROOT / value
+
+
+def _current_git_commit() -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(_REPOSITORY_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("unable to determine current git_commit") from error
+    commit = completed.stdout.strip()
+    if not commit:
+        raise ValueError("unable to determine current git_commit")
+    return commit
 
 
 def _write_matrix(config_path: str, *, dry_run: bool) -> None:
@@ -69,6 +98,22 @@ def _parser() -> argparse.ArgumentParser:
     summarize.add_argument("--config")
     summarize.add_argument("--required-seeds", nargs="+", type=int)
     summarize.add_argument("--baseline", default="linear")
+    shard_plan = subcommands.add_parser("shard-plan")
+    shard_plan.add_argument("--config", required=True)
+    shard_plan.add_argument("--shard-count", required=True, type=int)
+    shard_plan.add_argument("--output", required=True, type=Path)
+    shard_plan.add_argument("--device", required=True, choices=("cpu", "cuda"))
+    shard = subcommands.add_parser("shard")
+    shard.add_argument("--config", required=True)
+    shard.add_argument("--plan", required=True, type=Path)
+    shard.add_argument("--shard-index", required=True, type=int)
+    shard.add_argument("--output-root", required=True, type=Path)
+    shard.add_argument("--device", required=True, choices=("cpu", "cuda"))
+    merge = subcommands.add_parser("merge-shards")
+    merge.add_argument("--config", required=True)
+    merge.add_argument("--plan", required=True, type=Path)
+    merge.add_argument("--shards-root", required=True, type=Path)
+    merge.add_argument("--output-root", required=True, type=Path)
     return parser
 
 
@@ -124,6 +169,58 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {"status": "completed", "summary_rows": len(summary)}
                 )
             )
+            return 0
+        if arguments.command == "shard-plan":
+            config = _mapping_config(arguments.config)
+            git_commit = _current_git_commit()
+            output = _repository_path(arguments.output)
+            if output.exists():
+                plan = load_shard_plan(
+                    output,
+                    config=config,
+                    git_commit=git_commit,
+                    device=arguments.device,
+                )
+                if plan["shard_count"] != arguments.shard_count:
+                    raise ValueError(
+                        "shard plan already exists with different shard_count"
+                    )
+            else:
+                plan = build_shard_plan(
+                    config,
+                    shard_count=arguments.shard_count,
+                    git_commit=git_commit,
+                    device=arguments.device,
+                )
+                write_shard_plan(output, plan)
+            print(canonical_json(plan))
+            return 0
+        if arguments.command == "shard":
+            config = _mapping_config(arguments.config)
+            plan = load_shard_plan(
+                _repository_path(arguments.plan),
+                config=config,
+                git_commit=_current_git_commit(),
+                device=arguments.device,
+            )
+            report = execute_shard(
+                config,
+                plan=plan,
+                shard_index=arguments.shard_index,
+                repository_root=_REPOSITORY_ROOT,
+                output_root=arguments.output_root,
+                requested_device=arguments.device,
+            )
+            print(canonical_json(report))
+            return 0
+        if arguments.command == "merge-shards":
+            report = merge_shards(
+                config_path=_config_path(arguments.config),
+                plan_path=_repository_path(arguments.plan),
+                shards_root=_repository_path(arguments.shards_root),
+                output_root=_repository_path(arguments.output_root),
+            )
+            print(canonical_json(report))
             return 0
     except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
         print(f"validation-v2: {error}", file=sys.stderr)

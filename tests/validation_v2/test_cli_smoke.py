@@ -35,6 +35,180 @@ def _cli(*arguments: str) -> subprocess.CompletedProcess[bytes]:
     )
 
 
+def _git_head() -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+
+def test_shard_plan_writes_formal_server_plan_as_one_canonical_json_line(
+    tmp_path: Path,
+):
+    plan_path = tmp_path / "server-plan.json"
+
+    result = _cli(
+        "shard-plan",
+        "--config",
+        "server_full.yaml",
+        "--shard-count",
+        "8",
+        "--output",
+        str(plan_path),
+        "--device",
+        "cuda",
+    )
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stderr == b""
+    assert len(result.stdout.decode("utf-8").splitlines()) == 1
+    plan = json.loads(result.stdout)
+    assert plan == json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan["git_commit"] == _git_head()
+    assert plan["device"] == "cuda"
+    assert plan["shard_count"] == 8
+    assert plan["total_groups"] == 175
+    assert plan["total_cells"] == 4095
+    assert len(plan["plan_sha256"]) == 64
+
+
+def test_shard_plan_rerun_is_idempotent_but_different_plan_does_not_clobber(
+    tmp_path: Path,
+):
+    plan_path = tmp_path / "server-plan.json"
+    arguments = (
+        "shard-plan",
+        "--config",
+        "server_full.yaml",
+        "--shard-count",
+        "8",
+        "--output",
+        str(plan_path),
+        "--device",
+        "cpu",
+    )
+
+    first = _cli(*arguments)
+    assert first.returncode == 0, first.stderr.decode()
+    before = plan_path.read_bytes()
+    second = _cli(*arguments)
+    different = _cli(*arguments[:-5], "7", *arguments[-4:])
+
+    assert second.returncode == 0
+    assert first.stdout == second.stdout
+    assert second.stderr == b""
+    assert different.returncode == 2
+    assert different.stdout == b""
+    assert different.stderr.startswith(b"validation-v2: ")
+    assert b"different" in different.stderr or b"shard_count" in different.stderr
+    assert plan_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("shard_index", ["-1", "8"])
+def test_shard_rejects_negative_and_out_of_range_index(
+    tmp_path: Path, shard_index: str,
+):
+    plan_path = tmp_path / "server-plan.json"
+    planned = _cli(
+        "shard-plan", "--config", "server_full.yaml", "--shard-count", "8",
+        "--output", str(plan_path), "--device", "cpu",
+    )
+    assert planned.returncode == 0, planned.stderr.decode()
+
+    result = _cli(
+        "shard", "--config", "server_full.yaml", "--plan", str(plan_path),
+        "--shard-index", shard_index, "--output-root", str(tmp_path / "shard"),
+        "--device", "cpu",
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert result.stderr.startswith(b"validation-v2: ")
+    assert b"shard_index" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("shard-plan", "--config", "server_full.yaml", "--shard-count", "0",
+         "--output", "plan.json", "--device", "cpu"),
+        ("shard-plan", "--config", "server_full.yaml", "--shard-count", "8",
+         "--output", "plan.json", "--device", "auto"),
+        ("shard", "--config", "server_full.yaml", "--plan", "missing.json",
+         "--shard-index", "-1", "--output-root", "shards/000", "--device", "cpu"),
+    ],
+)
+def test_shard_commands_reject_invalid_arguments(arguments: tuple[str, ...]):
+    result = _cli(*arguments)
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+
+
+def test_two_cli_shards_execute_and_merge_through_strict_validator(tmp_path: Path):
+    if not (REPO_ROOT / "Oxford Dataset" / "handbag-1" / "imu1.csv").is_file():
+        pytest.skip("real OxIOD files are not available")
+    config = yaml.safe_load(
+        (REPO_ROOT / "configs" / "validation_v2" / "smoke.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    config["models"] = ["linear", "locf"]
+    config_path = tmp_path / "two-shards.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    plan_path = tmp_path / "plan.json"
+    shards_root = tmp_path / "shards"
+    merged_root = tmp_path / "merged"
+
+    planned = _cli(
+        "shard-plan", "--config", str(config_path), "--shard-count", "2",
+        "--output", str(plan_path), "--device", "cpu",
+    )
+    assert planned.returncode == 0, planned.stderr.decode()
+    assert json.loads(planned.stdout)["total_groups"] == 2
+
+    for shard_index in range(2):
+        executed = _cli(
+            "shard", "--config", str(config_path), "--plan", str(plan_path),
+            "--shard-index", str(shard_index), "--output-root",
+            str(shards_root / f"{shard_index:03d}"), "--device", "cpu",
+        )
+        assert executed.returncode == 0, executed.stderr.decode()
+        assert executed.stderr == b""
+        assert len(executed.stdout.decode("utf-8").splitlines()) == 1
+        report = json.loads(executed.stdout)
+        assert report["status"] == "completed"
+        assert report["shard_index"] == shard_index
+
+    merged = _cli(
+        "merge-shards", "--config", str(config_path), "--plan", str(plan_path),
+        "--shards-root", str(shards_root), "--output-root", str(merged_root),
+    )
+
+    assert merged.returncode == 0, merged.stderr.decode()
+    assert merged.stderr == b""
+    assert len(merged.stdout.decode("utf-8").splitlines()) == 1
+    assert json.loads(merged.stdout)["status"] == "complete"
+    validation_report = json.loads(
+        (merged_root / "validation_report.json").read_text(encoding="utf-8")
+    )
+    assert validation_report["status"] == "complete"
+    assert not (merged_root / "shard_execution.json").exists()
+
+
+def test_merge_shards_error_is_one_prefixed_stderr_line(tmp_path: Path):
+    result = _cli(
+        "merge-shards", "--config", "smoke.yaml", "--plan",
+        str(tmp_path / "missing-plan.json"), "--shards-root",
+        str(tmp_path / "missing-shards"), "--output-root",
+        str(tmp_path / "merged"),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert result.stderr.startswith(b"validation-v2: ")
+    assert len(result.stderr.decode("utf-8").splitlines()) == 1
+
+
 def test_server_matrix_dry_run_is_byte_stable_and_complete():
     arguments = ("matrix", "--config", "server_full.yaml", "--dry-run")
 
