@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,108 @@ def _runbook_bash_function(runbook: str, name: str) -> str:
     )
     assert match is not None, name
     return match.group(1)
+
+
+def _run_bash(tmp_path: Path, source: str, *, timeout: float = 10) -> subprocess.CompletedProcess:
+    git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+    bash = str(git_bash) if git_bash.is_file() else shutil.which("bash")
+    assert bash is not None
+    script = tmp_path / "runbook-contract.sh"
+    script.write_bytes(source.encode("utf-8"))
+    environment = os.environ.copy()
+    environment["MSYS2_ARG_CONV_EXCL"] = "*"
+    return subprocess.run(
+        [
+            bash, "-c", 'timeout "$1" bash "$2"', "runbook-contract",
+            str(timeout), script.as_posix(),
+        ],
+        cwd=tmp_path, env=environment, capture_output=True, text=True,
+        timeout=timeout + 5, check=False,
+    )
+
+
+def test_server_runbook_launch_preconditions_never_reach_nohup(tmp_path: Path):
+    launch = _runbook_bash_function(_server_runbook(), "launch_shard")
+    root = tmp_path.as_posix()
+    result = _run_bash(tmp_path, f'''set -Eeuo pipefail
+launch_shard() {{
+{launch}
+}}
+nohup() {{ printf 'called\\n' >> "$NOHUP_LOG"; return 0; }}
+pgrep() {{ return 1; }}
+export CONFIG="{root}/config.yaml"
+export PLAN="{root}/plan.json"
+export SHARDS_ROOT="{root}/shards"
+export AUDIT_DIR="{root}/audit"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export NOHUP_LOG="{root}/nohup.log"
+mkdir -p "$SHARDS_ROOT" "$AUDIT_DIR"
+printf 'config\\n' > "$CONFIG"
+printf '{{}}\\n' > "$PLAN"
+if launch_shard 008; then exit 90; fi
+mkdir -p "$SHARDS_ROOT/000"
+if launch_shard 000; then exit 91; fi
+test ! -e "$NOHUP_LOG"
+''')
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_server_runbook_queue_returns_timeout_instead_of_looping(tmp_path: Path):
+    queue = _runbook_bash_function(_server_runbook(), "run_queue")
+    root = tmp_path.as_posix()
+    result = _run_bash(tmp_path, f'''set -Eeuo pipefail
+run_queue() {{
+{queue}
+}}
+launch_shard() {{
+  local shard="$1"
+  mkdir -p "$SHARDS_ROOT/$shard"
+  printf '{{"status":"started","group_runs":[]}}\\n' > "$SHARDS_ROOT/$shard/shard_execution.json"
+  printf '%s\\n' "$$" > "$AUDIT_DIR/shard-$shard.pid"
+}}
+audit_active() {{ return 0; }}
+python() {{ printf 'started 0\\n'; }}
+export SHARDS_ROOT="{root}/shards"
+export AUDIT_DIR="{root}/audit"
+export QUEUE_MAX_SECONDS=1
+export QUEUE_MAX_IDLE_SECONDS=1
+export QUEUE_POLL_SECONDS=0.1
+mkdir -p "$SHARDS_ROOT" "$AUDIT_DIR"
+if run_queue 1 000; then rc=0; else rc=$?; fi
+test "$rc" -eq 4
+''', timeout=3)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_server_runbook_sampler_never_kills_a_mismatched_process(tmp_path: Path):
+    stop = _runbook_bash_function(_server_runbook(), "stop_gpu_sampler")
+    root = tmp_path.as_posix()
+    stat_wrong = " ".join(["123", "(bash)", "S", *("0" for _ in range(18)), "778"])
+    stat_right = " ".join(["123", "(bash)", "S", *("0" for _ in range(18)), "777"])
+    result = _run_bash(tmp_path, f'''set -Eeuo pipefail
+stop_gpu_sampler() {{
+{stop}
+}}
+kill() {{ printf '%s\\n' "$1" >> "$KILL_LOG"; return 0; }}
+wait() {{ return 0; }}
+export AUDIT_DIR="{root}/audit"
+export PROC_ROOT="{root}/proc"
+export KILL_LOG="{root}/kill.log"
+mkdir -p "$AUDIT_DIR" "$PROC_ROOT/123"
+printf '123 777\\n' > "$AUDIT_DIR/gpu-test.pid"
+printf '%s\\n' '{stat_wrong}' > "$PROC_ROOT/123/stat"
+printf 'validation-v2-gpu-sampler-test\\0nvidia-smi\\0' > "$PROC_ROOT/123/cmdline"
+declare -Ag GPU_SAMPLER_JOBS=([test]=123)
+if stop_gpu_sampler test; then exit 90; fi
+test ! -e "$KILL_LOG"
+printf '%s\\n' '{stat_right}' > "$PROC_ROOT/123/stat"
+stop_gpu_sampler test
+grep -Fx '123' "$KILL_LOG"
+''')
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_server_runbook_strict_shell_explicitly_propagates_wait_failures():
@@ -173,7 +276,13 @@ def test_server_runbook_legacy_stop_handles_zero_one_or_many_matches_safely():
     assert "1)" in legacy and "kill -INT" in legacy
     assert "*)" in legacy and "exit 2" in legacy
     assert '[[ "$OLD_PID" =~ ^[0-9]+$ ]]' in legacy
-    assert "ps -ww" in legacy and "while kill -0" in legacy
+    assert 'grep -F -- "$OLD_ROOT"' in legacy
+    assert '"$PROC_ROOT/$OLD_PID/cmdline"' in legacy
+    assert 'OLD_STARTTIME="$(awk' in legacy
+    assert '"python -m validation_v2.cli matrix"' in legacy
+    assert '"$OLD_CMDLINE" == *"$OLD_ROOT"*' in legacy
+    assert "ps -ww" in legacy and 'while test -r "$PROC_ROOT/$OLD_PID/stat"' in legacy
+    assert 'CURRENT_STARTTIME' in legacy and '!= "$OLD_STARTTIME"' in legacy
     assert legacy.index("1)") < legacy.index("kill -INT") < legacy.index("*)")
     assert "rm " not in legacy and "rm -" not in legacy
 

@@ -21,11 +21,13 @@ choosing a PID.
 ```bash
 set -Eeuo pipefail
 export OLD_ROOT="/root/autodl-tmp/2025.12.28LNN_Imputation/results/validation_v2/server_full-fcf81f8"
+export PROC_ROOT=/proc
 test -d "$OLD_ROOT"
 # Legacy command signature: python -m validation_v2.cli matrix
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 mapfile -t OLD_MATCHES < <(
-  pgrep -af '[p]ython -m validation_v2\.cli matrix' | grep 'fcf81f8' || true
+  pgrep -af '[p]ython -m validation_v2\.cli matrix' \
+    | grep -F -- "$OLD_ROOT" || true
 )
 printf '%s\n' "${OLD_MATCHES[@]}"
 case "${#OLD_MATCHES[@]}" in
@@ -38,10 +40,28 @@ case "${#OLD_MATCHES[@]}" in
       echo "non-numeric legacy PID: $OLD_PID" >&2
       exit 2
     }
+    if test ! -r "$PROC_ROOT/$OLD_PID/stat" \
+        -o ! -r "$PROC_ROOT/$OLD_PID/cmdline"; then
+      echo "cannot verify legacy process identity in /proc: $OLD_PID" >&2
+      exit 2
+    fi
+    OLD_STARTTIME="$(awk '{print $22}' "$PROC_ROOT/$OLD_PID/stat")"
+    OLD_CMDLINE="$(tr '\0' ' ' < "$PROC_ROOT/$OLD_PID/cmdline")"
+    if ! [[ "$OLD_STARTTIME" =~ ^[0-9]+$ \
+        && "$OLD_CMDLINE" == *"python -m validation_v2.cli matrix"* \
+        && "$OLD_CMDLINE" == *"$OLD_ROOT"* ]]; then
+      echo "legacy process identity re-check failed: pid=$OLD_PID cmd=$OLD_CMDLINE" >&2
+      exit 2
+    fi
     ps -ww -p "$OLD_PID" -o pid=,lstart=,args=
     kill -INT "$OLD_PID"
     OLD_STOP_DEADLINE=$((SECONDS + 300))
-    while kill -0 "$OLD_PID" 2>/dev/null; do
+    while test -r "$PROC_ROOT/$OLD_PID/stat"; do
+      CURRENT_STARTTIME="$(awk '{print $22}' "$PROC_ROOT/$OLD_PID/stat")"
+      if test "$CURRENT_STARTTIME" != "$OLD_STARTTIME"; then
+        echo "legacy process exited and PID was reused; not signalling replacement: $OLD_PID"
+        break
+      fi
       if test "$SECONDS" -ge "$OLD_STOP_DEADLINE"; then
         echo "legacy PID did not stop after SIGINT: $OLD_PID" >&2
         exit 3
@@ -296,10 +316,47 @@ audit_active() {
 }
 
 launch_shard() {
-  local shard="$1"
+  local shard="${1-}"
+  if ! [[ "$shard" =~ ^[0-7]{3}$ ]]; then
+    echo "invalid zero-padded shard index: $shard" >&2
+    return 2
+  fi
   local index=$((10#$shard))
-  test "$shard" = "$(printf '%03d' "$index")"
-  test ! -e "$SHARDS_ROOT/$shard"
+  if test "$index" -lt 0 -o "$index" -ge 8; then
+    echo "shard index outside formal plan: $shard" >&2
+    return 2
+  fi
+  if test -z "${CONFIG-}" -o ! -r "${CONFIG-}"; then
+    echo "CONFIG is missing or unreadable: ${CONFIG-}" >&2
+    return 2
+  fi
+  if test -z "${PLAN-}" -o ! -r "${PLAN-}"; then
+    echo "PLAN is missing or unreadable: ${PLAN-}" >&2
+    return 2
+  fi
+  if test -z "${SHARDS_ROOT-}" -o ! -d "${SHARDS_ROOT-}" \
+      -o -z "${AUDIT_DIR-}" -o ! -d "${AUDIT_DIR-}"; then
+    echo 'SHARDS_ROOT and AUDIT_DIR must already be directories' >&2
+    return 2
+  fi
+  local output_root="$SHARDS_ROOT/$shard"
+  local pid_file="$AUDIT_DIR/shard-$shard.pid"
+  if [[ -e "$output_root" || -L "$output_root" ]]; then
+    echo "shard root already exists or is linked: $output_root" >&2
+    return 2
+  fi
+  if [[ -e "$pid_file" || -L "$pid_file" ]]; then
+    local old_pid=""
+    if test -r "$pid_file"; then
+      read -r old_pid < "$pid_file" || true
+    fi
+    if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+      echo "recorded shard PID is alive: $shard pid=$old_pid" >&2
+    else
+      echo "stale/invalid shard PID file must be diagnosed, not overwritten: $pid_file" >&2
+    fi
+    return 2
+  fi
   if pgrep -af "validation_v2\.cli shard.*--shard-index $index" \
       | grep -F -- "$PLAN"; then
     echo "duplicate shard process: $shard" >&2
@@ -308,9 +365,17 @@ launch_shard() {
   nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
     /root/miniconda3/envs/pinn_imu/bin/python -m validation_v2.cli shard \
     --config "$CONFIG" --plan "$PLAN" --shard-index "$index" \
-    --output-root "$SHARDS_ROOT/$shard" --device cuda \
+    --output-root "$output_root" --device cuda \
     > "$AUDIT_DIR/shard-$shard.log" 2>&1 &
-  echo "$!" > "$AUDIT_DIR/shard-$shard.pid"
+  local pid="$!"
+  if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+    echo "nohup did not return a numeric PID: $pid" >&2
+    return 3
+  fi
+  if ! printf '%s\n' "$pid" > "$pid_file"; then
+    kill "$pid" 2>/dev/null || true
+    return 3
+  fi
 }
 
 wait_shard() {
@@ -451,9 +516,30 @@ wait_all_shards() {
 }
 
 run_queue() {
-  local max_parallel="$1"
-  shift
+  if test "$#" -lt 2; then
+    echo 'run_queue requires MAX_PARALLEL and at least one shard index' >&2
+    return 2
+  fi
+  local max_parallel="${1-}"
+  shift || return 2
+  if ! [[ "$max_parallel" =~ ^[1-9][0-9]*$ ]]; then
+    echo "invalid queue parallelism: $max_parallel" >&2
+    return 2
+  fi
+  local queue_max_seconds="${QUEUE_MAX_SECONDS:-1209600}"
+  local queue_max_idle_seconds="${QUEUE_MAX_IDLE_SECONDS:-21600}"
+  local queue_poll_seconds="${QUEUE_POLL_SECONDS:-10}"
+  if ! [[ "$queue_max_seconds" =~ ^[1-9][0-9]*$ \
+      && "$queue_max_idle_seconds" =~ ^[1-9][0-9]*$ \
+      && "$queue_poll_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo 'invalid queue timeout/idle/poll settings' >&2
+    return 2
+  fi
+  local deadline=$((SECONDS + queue_max_seconds))
+  local last_progress="$SECONDS"
+  local last_completed_groups=-1
   local -a pending=("$@")
+  local -a all_shards=("$@")
   local -a active=()
   while test "${#pending[@]}" -gt 0 -o "${#active[@]}" -gt 0; do
     while test "${#pending[@]}" -gt 0 -a "${#active[@]}" -lt "$max_parallel"; do
@@ -466,11 +552,18 @@ run_queue() {
     for shard in "${active[@]}"; do
       local marker="$SHARDS_ROOT/$shard/shard_execution.json"
       if test -f "$marker"; then
-        local state
-        state="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$marker")"
+        local state groups
+        read -r state groups < <(python -c \
+          'import json,sys; marker=json.load(open(sys.argv[1])); print(marker["status"], len(marker["group_runs"]))' \
+          "$marker")
         if test "$state" = failed; then
           cat "$marker" >&2
+          tail -n 50 "$AUDIT_DIR/shard-$shard.log" >&2 || true
           return 2
+        fi
+        if test "$state" != started -a "$state" != completed; then
+          echo "invalid queue marker status: $shard status=$state" >&2
+          return 3
         fi
         if test "$state" != completed; then
           local pid
@@ -492,41 +585,150 @@ run_queue() {
       fi
     done
     active=("${next[@]}")
-    if test "${#active[@]}" -gt 0; then
-      audit_active "${active[@]}" || return $?
+    audit_active "${all_shards[@]}" || return $?
+    local completed_groups=0
+    for shard in "${all_shards[@]}"; do
+      local marker="$SHARDS_ROOT/$shard/shard_execution.json"
+      if test -f "$marker"; then
+        local state groups
+        read -r state groups < <(python -c \
+          'import json,sys; marker=json.load(open(sys.argv[1])); print(marker["status"], len(marker["group_runs"]))' \
+          "$marker")
+        if test "$state" = failed; then
+          cat "$marker" >&2
+          return 2
+        fi
+        completed_groups=$((completed_groups + groups))
+      fi
+    done
+    if test "$completed_groups" -ne "$last_completed_groups"; then
+      last_completed_groups="$completed_groups"
+      last_progress="$SECONDS"
     fi
     printf '%s max=%s pending=%s active=%s\n' \
       "$(date -Is)" "$max_parallel" "${pending[*]}" "${active[*]}" \
       | tee -a "$AUDIT_DIR/queue.log"
-    test "${#pending[@]}" -eq 0 -a "${#active[@]}" -eq 0 || sleep 10
+    if test "${#pending[@]}" -eq 0 -a "${#active[@]}" -eq 0; then
+      return 0
+    fi
+    if test "$SECONDS" -ge "$deadline"; then
+      echo "queue deadline exceeded: QUEUE_MAX_SECONDS=$queue_max_seconds" \
+        | tee -a "$AUDIT_DIR/queue.log" >&2
+      return 4
+    fi
+    if test "$((SECONDS - last_progress))" -ge "$queue_max_idle_seconds"; then
+      echo "queue idle timeout: QUEUE_MAX_IDLE_SECONDS=$queue_max_idle_seconds" \
+        | tee -a "$AUDIT_DIR/queue.log" >&2
+      return 4
+    fi
+    test "${#pending[@]}" -eq 0 -a "${#active[@]}" -eq 0 || \
+      sleep "$queue_poll_seconds"
   done
 }
 
+declare -Ag GPU_SAMPLER_JOBS=()
+
 start_gpu_sampler() {
-  local label="$1"
+  local label="${1-}"
+  if ! [[ "$label" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "invalid GPU sampler label: $label" >&2
+    return 2
+  fi
   local csv="$AUDIT_DIR/gpu-$label.csv"
-  printf 'timestamp_utc,memory_used_mib,memory_total_mib,utilization_percent\n' > "$csv"
-  (
-    while :; do
-      local timestamp
-      timestamp="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
-      nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
-        --format=csv,noheader,nounits \
-        | awk -F, -v timestamp="$timestamp" \
-          '{gsub(/ /, ""); print timestamp "," $1 "," $2 "," $3}' \
-        | tee -a "$csv"
-      sleep 10
-    done
-  ) &
-  echo "$!" > "$AUDIT_DIR/gpu-$label.pid"
+  local pid_file="$AUDIT_DIR/gpu-$label.pid"
+  local identity="validation-v2-gpu-sampler-$label"
+  local proc_root="${PROC_ROOT:-/proc}"
+  if [[ -e "$pid_file" || -L "$pid_file" ]]; then
+    echo "GPU sampler PID file already exists: $pid_file" >&2
+    return 2
+  fi
+  printf 'timestamp_utc,memory_used_mib,memory_total_mib,utilization_percent\n' > "$csv" \
+    || return 3
+  bash -c '
+set -Eeuo pipefail
+csv="$1"
+while :; do
+  timestamp="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+  nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+    --format=csv,noheader,nounits \
+    | awk -F, -v timestamp="$timestamp" \
+      '\''{gsub(/ /, ""); print timestamp "," $1 "," $2 "," $3}'\'' \
+    | tee -a "$csv"
+  sleep 10
+done
+' "$identity" "$csv" &
+  local pid="$!"
+  GPU_SAMPLER_JOBS["$label"]="$pid"
+  local attempt
+  for attempt in $(seq 1 50); do
+    test -r "$proc_root/$pid/stat" -a -r "$proc_root/$pid/cmdline" && break
+    sleep 0.1
+  done
+  if ! [[ "$pid" =~ ^[0-9]+$ ]] \
+      || test ! -r "$proc_root/$pid/stat" \
+      || test ! -r "$proc_root/$pid/cmdline"; then
+    echo "unable to establish GPU sampler process identity: $pid" >&2
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 3
+  fi
+  local starttime cmdline
+  starttime="$(awk '{print $22}' "$proc_root/$pid/stat")"
+  cmdline="$(tr '\0' ' ' < "$proc_root/$pid/cmdline")"
+  if ! [[ "$starttime" =~ ^[0-9]+$ \
+      && "$cmdline" == *"$identity"* \
+      && "$cmdline" == *"nvidia-smi"* ]]; then
+    echo "GPU sampler identity verification failed immediately: $pid" >&2
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 3
+  fi
+  printf '%s %s\n' "$pid" "$starttime" > "$pid_file" || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 3
+  }
 }
 
 stop_gpu_sampler() {
-  local label="$1"
-  local pid
-  pid="$(cat "$AUDIT_DIR/gpu-$label.pid")"
-  kill "$pid" 2>/dev/null || true
+  local label="${1-}"
+  local pid_file="$AUDIT_DIR/gpu-$label.pid"
+  local proc_root="${PROC_ROOT:-/proc}"
+  local identity="validation-v2-gpu-sampler-$label"
+  if ! [[ -f "$pid_file" && -r "$pid_file" ]]; then
+    echo "missing/unreadable GPU sampler PID file: $pid_file" >&2
+    return 3
+  fi
+  local pid expected_start extra=""
+  read -r pid expected_start extra < "$pid_file" || {
+    echo "invalid GPU sampler PID record: $pid_file" >&2
+    return 3
+  }
+  if ! [[ "$pid" =~ ^[0-9]+$ && "$expected_start" =~ ^[0-9]+$ \
+      && -z "$extra" ]]; then
+    echo "GPU sampler PID record must contain exactly two numeric fields" >&2
+    return 3
+  fi
+  if test "${GPU_SAMPLER_JOBS[$label]-}" != "$pid"; then
+    echo "GPU sampler is not the current shell job: label=$label pid=$pid" >&2
+    return 3
+  fi
+  if test ! -r "$proc_root/$pid/stat" -o ! -r "$proc_root/$pid/cmdline"; then
+    echo "GPU sampler process identity is unavailable; refusing kill: $pid" >&2
+    return 3
+  fi
+  local actual_start cmdline
+  actual_start="$(awk '{print $22}' "$proc_root/$pid/stat")"
+  cmdline="$(tr '\0' ' ' < "$proc_root/$pid/cmdline")"
+  if test "$actual_start" != "$expected_start" \
+      || [[ "$cmdline" != *"$identity"* ]] \
+      || [[ "$cmdline" != *"nvidia-smi"* ]]; then
+    echo "GPU sampler identity mismatch; refusing kill: label=$label pid=$pid" >&2
+    return 3
+  fi
+  kill "$pid" || return 3
   wait "$pid" 2>/dev/null || true
+  unset 'GPU_SAMPLER_JOBS[$label]'
 }
 
 wait_until_groups() {
