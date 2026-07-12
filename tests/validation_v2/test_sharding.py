@@ -540,28 +540,31 @@ def test_merge_rejects_run_artifact_changed_after_preflight_without_publishing(
     assert not output_root.exists()
 
 
-def test_merge_rejects_cross_file_mutation_during_preflight_snapshot(
+def test_merge_rejects_cross_file_mutation_in_post_validation_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
     output_root = tmp_path / "merged"
     real_hash = sharding._file_sha256
     changed = False
+    best_hashes = 0
 
-    def mutate_sibling_on_first_best(path: Path) -> str:
-        nonlocal changed
+    def mutate_sibling_on_after_snapshot(path: Path) -> str:
+        nonlocal best_hashes, changed
         path = Path(path)
-        if path.name == "best.pt" and not changed:
-            changed = True
-            manifest_path = path.parent / "run.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["python"] = "changed-during-snapshot"
-            _write_raw(manifest_path, manifest)
+        if path.name == "best.pt":
+            best_hashes += 1
+            if best_hashes == 2:
+                changed = True
+                manifest_path = path.parent / "run.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["python"] = "changed-after-validation"
+                _write_raw(manifest_path, manifest)
         return real_hash(path)
 
-    monkeypatch.setattr(sharding, "_file_sha256", mutate_sibling_on_first_best)
+    monkeypatch.setattr(sharding, "_file_sha256", mutate_sibling_on_after_snapshot)
 
-    with pytest.raises(ValueError, match="snapshot|changed|runtime"):
+    with pytest.raises(ValueError, match="changed during semantic validation"):
         merge_shards(
             config_path=config_path,
             plan_path=plan_path,
@@ -570,28 +573,34 @@ def test_merge_rejects_cross_file_mutation_during_preflight_snapshot(
         )
 
     assert changed
+    assert best_hashes == 2
     assert not output_root.exists()
 
 
-def test_merge_rejects_run_file_set_change_during_preflight_snapshot(
+def test_merge_rejects_run_file_set_change_in_post_validation_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
     output_root = tmp_path / "merged"
     real_hash = sharding._file_sha256
     changed = False
+    best_hashes = 0
 
-    def add_sibling_on_first_best(path: Path) -> str:
-        nonlocal changed
+    def add_sibling_on_after_snapshot(path: Path) -> str:
+        nonlocal best_hashes, changed
         path = Path(path)
-        if path.name == "best.pt" and not changed:
-            changed = True
-            (path.parent / "appeared.tmp").write_text("late file", encoding="utf-8")
+        if path.name == "best.pt":
+            best_hashes += 1
+            if best_hashes == 2:
+                changed = True
+                (path.parent / "appeared.tmp").write_text(
+                    "late file", encoding="utf-8"
+                )
         return real_hash(path)
 
-    monkeypatch.setattr(sharding, "_file_sha256", add_sibling_on_first_best)
+    monkeypatch.setattr(sharding, "_file_sha256", add_sibling_on_after_snapshot)
 
-    with pytest.raises(ValueError, match="snapshot|file set|exactly six|content"):
+    with pytest.raises(ValueError, match="snapshot file set changed"):
         merge_shards(
             config_path=config_path,
             plan_path=plan_path,
@@ -600,6 +609,7 @@ def test_merge_rejects_run_file_set_change_during_preflight_snapshot(
         )
 
     assert changed
+    assert best_hashes == 2
     assert not output_root.exists()
 
 
