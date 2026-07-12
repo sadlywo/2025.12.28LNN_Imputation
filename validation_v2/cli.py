@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -177,7 +178,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = _mapping_config(arguments.config)
             git_commit = _current_git_commit()
             output = _repository_path(arguments.output)
-            if output.exists():
+            if os.path.lexists(output):
                 plan = load_shard_plan(
                     output,
                     config=config,

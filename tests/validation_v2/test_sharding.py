@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -1094,6 +1095,85 @@ def test_write_never_clobbers_different_existing_content(tmp_path: Path):
     assert _temporary_files(path) == []
 
 
+def test_write_rejects_linked_plan_without_mutating_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target = tmp_path / "external-plan.json"
+    plan = _plan(shard_count=2)
+    target.write_text(canonical_json(plan) + "\n", encoding="utf-8")
+    link = tmp_path / "plan.json"
+    _symlink_or_simulate(
+        link, target, directory=False, monkeypatch=monkeypatch
+    )
+    protected = target if target.exists() else link
+    before = protected.read_bytes()
+
+    with pytest.raises(ValueError, match="linked|symlink|regular"):
+        write_shard_plan(link, plan)
+
+    assert protected.read_bytes() == before
+
+
+def test_load_rejects_linked_plan_without_reading_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target = tmp_path / "external-plan.json"
+    plan = _plan(shard_count=2)
+    target.write_text(canonical_json(plan) + "\n", encoding="utf-8")
+    link = tmp_path / "plan.json"
+    _symlink_or_simulate(
+        link, target, directory=False, monkeypatch=monkeypatch
+    )
+    protected = target if target.exists() else link
+    before = protected.read_bytes()
+
+    with pytest.raises(ValueError, match="linked|symlink|regular"):
+        load_shard_plan(
+            link, config=_server_config(), git_commit=GIT_COMMIT, device="cuda"
+        )
+
+    assert protected.read_bytes() == before
+
+
+def test_load_rejects_plan_beneath_linked_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_parent = tmp_path / "external-parent"
+    real_parent.mkdir()
+    plan = _plan(shard_count=2)
+    (real_parent / "plan.json").write_text(
+        canonical_json(plan) + "\n", encoding="utf-8"
+    )
+    linked_parent = tmp_path / "linked-parent"
+    _symlink_or_simulate(
+        linked_parent, real_parent, directory=True, monkeypatch=monkeypatch
+    )
+
+    with pytest.raises(ValueError, match="linked|symlink|parent"):
+        load_shard_plan(
+            linked_parent / "plan.json",
+            config=_server_config(), git_commit=GIT_COMMIT, device="cuda",
+        )
+
+
+def test_write_rejects_plan_beneath_linked_parent_without_creating_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_parent = tmp_path / "external-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    _symlink_or_simulate(
+        linked_parent, real_parent, directory=True, monkeypatch=monkeypatch
+    )
+    protected = real_parent if real_parent.exists() else linked_parent
+    before = _tree_snapshot(protected)
+
+    with pytest.raises(ValueError, match="linked|symlink|parent"):
+        write_shard_plan(linked_parent / "plan.json", _plan(shard_count=2))
+
+    assert _tree_snapshot(protected) == before
+
+
 def test_write_survives_destination_deleted_after_exists_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1129,13 +1209,12 @@ def test_write_survives_destination_deleted_after_exists_check(
     assert _temporary_files(path) == []
 
 
-def test_write_retries_when_destination_is_deleted_before_conflict_read(
+def test_write_fails_closed_when_destination_disappears_before_conflict_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     path = tmp_path / "plan.json"
     path.write_bytes(b"transient writer\n")
     plan = _plan(shard_count=2)
-    expected = (canonical_json(plan) + "\n").encode("utf-8")
     real_link = os.link
     real_read_bytes = Path.read_bytes
     link_attempts = 0
@@ -1157,9 +1236,11 @@ def test_write_retries_when_destination_is_deleted_before_conflict_read(
     monkeypatch.setattr(os, "link", counting_link)
     monkeypatch.setattr(Path, "read_bytes", deleting_read_bytes)
 
-    assert write_shard_plan(path, plan) == path
-    assert link_attempts == 2
-    assert path.read_bytes() == expected
+    with pytest.raises(ValueError, match="changed|linked|regular|inspect"):
+        write_shard_plan(path, plan)
+
+    assert link_attempts == 1
+    assert not os.path.lexists(path)
     assert _temporary_files(path) == []
 
 
@@ -1208,6 +1289,37 @@ def test_write_accepts_same_content_created_at_commit(
 
     assert write_shard_plan(path, plan) == path
     assert path.read_bytes() == content
+    assert _temporary_files(path) == []
+
+
+def test_write_rejects_link_created_at_commit_without_mutating_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "plan.json"
+    target = tmp_path / "external-plan.json"
+    plan = _plan(shard_count=2)
+    content = (canonical_json(plan) + "\n").encode("utf-8")
+    target.write_bytes(content)
+    real_link = os.link
+    raced = False
+
+    def racing_link(source: Any, destination: Any) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            _symlink_or_simulate(
+                path, target, directory=False, monkeypatch=monkeypatch
+            )
+        real_link(source, destination)
+
+    monkeypatch.setattr(os, "link", racing_link)
+    before = target.read_bytes()
+
+    with pytest.raises(ValueError, match="linked|symlink|regular"):
+        write_shard_plan(path, plan)
+
+    protected_after = target if target.exists() else path
+    assert protected_after.read_bytes() == before
     assert _temporary_files(path) == []
 
 
@@ -1659,6 +1771,115 @@ def test_active_shard_lock_rejects_second_holder_and_releases(
     )
     assert report["status"] == "completed"
     assert (root / ".shard_execution.lock").is_file()
+
+
+def test_execute_rejects_linked_output_root_without_mutating_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _mini_config()
+    plan = _execution_plan(config)
+    external = tmp_path / "external-shard"
+    external.mkdir()
+    root = tmp_path / "shard"
+    _symlink_or_simulate(
+        root, external, directory=True, monkeypatch=monkeypatch
+    )
+    protected = external if external.exists() else root
+    before = _tree_snapshot(protected)
+    monkeypatch.setattr(
+        "validation_v2.experiments.sharding._run_group", _fake_group_runner([])
+    )
+
+    with pytest.raises(ValueError, match="linked|symlink|output root"):
+        execute_shard(
+            config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+            output_root=root, requested_device="cpu",
+        )
+
+    assert _tree_snapshot(protected) == before
+
+
+def test_execute_rejects_output_beneath_linked_parent_without_mutating_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _mini_config()
+    plan = _execution_plan(config)
+    external = tmp_path / "external-parent"
+    external.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    _symlink_or_simulate(
+        linked_parent, external, directory=True, monkeypatch=monkeypatch
+    )
+    protected = external if external.exists() else linked_parent
+    before = _tree_snapshot(protected)
+    monkeypatch.setattr(
+        "validation_v2.experiments.sharding._run_group", _fake_group_runner([])
+    )
+
+    with pytest.raises(ValueError, match="linked|symlink|parent"):
+        execute_shard(
+            config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+            output_root=linked_parent / "shard", requested_device="cpu",
+        )
+
+    assert _tree_snapshot(protected) == before
+
+
+def test_execute_rejects_broken_link_output_without_recreating_target(
+    tmp_path: Path,
+):
+    config = _mini_config()
+    plan = _execution_plan(config)
+    root = tmp_path / "shard"
+    target = tmp_path / "missing-target"
+    _make_broken_directory_link(root, target)
+    before = os.lstat(root)
+
+    with pytest.raises(ValueError, match="linked|symlink|output root"):
+        execute_shard(
+            config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+            output_root=root, requested_device="cpu",
+        )
+
+    after = os.lstat(root)
+    assert (after.st_mode, getattr(after, "st_file_attributes", 0)) == (
+        before.st_mode, getattr(before, "st_file_attributes", 0)
+    )
+    assert not target.exists()
+
+
+def test_execute_rechecks_output_identity_when_link_appears_before_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _mini_config()
+    plan = _execution_plan(config)
+    root = tmp_path / "shard"
+    external = tmp_path / "external-shard"
+    external.mkdir()
+    before = _tree_snapshot(external)
+    real_lock = sharding._shard_execution_lock
+
+    @contextmanager
+    def racing_lock(output_root: Path):
+        _symlink_or_simulate(
+            root, external, directory=True, monkeypatch=monkeypatch
+        )
+        with real_lock(output_root):
+            yield
+
+    monkeypatch.setattr(sharding, "_shard_execution_lock", racing_lock)
+    monkeypatch.setattr(
+        "validation_v2.experiments.sharding._run_group", _fake_group_runner([])
+    )
+
+    with pytest.raises(ValueError, match="linked|symlink|output root"):
+        execute_shard(
+            config, plan=plan, shard_index=0, repository_root=REPO_ROOT,
+            output_root=root, requested_device="cpu",
+        )
+
+    protected = external if external.exists() else root
+    assert _tree_snapshot(protected) == before
 
 
 @pytest.mark.parametrize(

@@ -188,15 +188,22 @@ def write_shard_plan(
     """Atomically create a canonical plan without replacing different content."""
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path = _absolute_unresolved(path)
+    _reject_linked_components(raw_path.parent, label="shard plan parent")
+    if os.path.lexists(raw_path):
+        _require_regular_plan_file(raw_path)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_linked_components(raw_path.parent, label="shard plan parent")
+    if os.path.lexists(raw_path):
+        _require_regular_plan_file(raw_path)
     content = (canonical_json(plan) + "\n").encode("utf-8")
 
     temporary: Union[Path, None] = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb",
-            dir=path.parent,
-            prefix=f".{path.name}-",
+            dir=raw_path.parent,
+            prefix=f".{raw_path.name}-",
             suffix=".tmp",
             delete=False,
         ) as handle:
@@ -207,13 +214,25 @@ def write_shard_plan(
 
         while True:
             try:
-                os.link(temporary, path)
+                _reject_linked_components(
+                    raw_path.parent, label="shard plan parent"
+                )
+                os.link(temporary, raw_path)
                 return path
             except FileExistsError:
-                try:
-                    existing = path.read_bytes()
-                except FileNotFoundError:
+                if not os.path.lexists(raw_path):
                     continue
+                identity = _require_regular_plan_file(raw_path)
+                try:
+                    existing = raw_path.read_bytes()
+                except FileNotFoundError as error:
+                    raise ValueError(
+                        "shard plan path changed during conflict read"
+                    ) from error
+                except OSError as error:
+                    raise ValueError("unable to read existing shard plan") from error
+                if _require_regular_plan_file(raw_path) != identity:
+                    raise ValueError("shard plan path changed during conflict read")
                 if existing == content:
                     return path
                 raise ValueError(
@@ -298,10 +317,15 @@ def load_shard_plan(
     device = _validate_device(device)
     if not isinstance(config, Mapping):
         raise ValueError("config must be a mapping")
+    raw_path = _absolute_unresolved(path)
+    _reject_linked_components(raw_path.parent, label="shard plan parent")
+    identity = _require_regular_plan_file(raw_path)
     try:
-        loaded = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        loaded = yaml.safe_load(raw_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
         raise ValueError("unable to load shard plan") from error
+    if _require_regular_plan_file(raw_path) != identity:
+        raise ValueError("shard plan path changed while loading")
     if not isinstance(loaded, Mapping):
         raise ValueError("shard plan must be a mapping")
 
@@ -424,8 +448,17 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
 def _shard_execution_lock(output_root: Path):
     """Hold a non-blocking process lock for one shard output root."""
 
-    output_root.mkdir(parents=True, exist_ok=True)
+    root_identity = _prepare_shard_output_root(output_root)
     lock_path = output_root / _LOCK_FILE
+    if os.path.lexists(lock_path):
+        if _is_linked_source(lock_path):
+            raise ValueError("linked shard execution lock is not allowed")
+        try:
+            lock_status = os.lstat(lock_path)
+        except OSError as error:
+            raise ValueError("unable to inspect shard execution lock") from error
+        if not stat.S_ISREG(lock_status.st_mode):
+            raise ValueError("shard execution lock must be a regular file")
     handle = lock_path.open("a+b")
     locked = False
     try:
@@ -445,6 +478,10 @@ def _shard_execution_lock(output_root: Path):
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             locked = True
+            if _inspect_shard_output_root(
+                output_root, allow_missing=False
+            ) != root_identity:
+                raise ValueError("shard output root changed while acquiring lock")
         except OSError as error:
             raise ValueError("shard output root is active or locked") from error
         yield
@@ -802,12 +839,14 @@ def execute_shard(
 ) -> Mapping[str, Any]:
     """Execute one shard while holding its process-wide output-root lock."""
 
-    repository_path = Path(repository_root)
-    output_path = Path(output_root)
-    if not output_path.is_absolute():
-        output_path = repository_path / output_path
-    if output_path.exists() and not output_path.is_dir():
-        raise ValueError("shard output root must be a directory")
+    repository_path = _absolute_unresolved(repository_root)
+    supplied_output = Path(output_root)
+    output_path = _absolute_unresolved(
+        supplied_output
+        if supplied_output.is_absolute()
+        else repository_path / supplied_output
+    )
+    _inspect_shard_output_root(output_path, allow_missing=True)
     with _shard_execution_lock(output_path):
         return _execute_shard_locked(
             config,
@@ -840,6 +879,64 @@ def _is_linked_source(path: Path) -> bool:
         raise ValueError(f"unable to inspect source path: {path}") from error
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _path_identity(path_status: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        path_status.st_dev,
+        path_status.st_ino,
+        path_status.st_mode,
+        getattr(path_status, "st_file_attributes", 0),
+    )
+
+
+def _require_regular_plan_file(path: Path) -> tuple[int, int, int, int]:
+    _reject_linked_components(path.parent, label="shard plan parent")
+    if not os.path.lexists(path):
+        raise ValueError("shard plan file does not exist")
+    if _is_linked_source(path):
+        raise ValueError("linked or symlink shard plan file is not allowed")
+    try:
+        path_status = os.lstat(path)
+    except OSError as error:
+        raise ValueError("unable to inspect shard plan file") from error
+    if not stat.S_ISREG(path_status.st_mode):
+        raise ValueError("shard plan path must be a regular file")
+    return _path_identity(path_status)
+
+
+def _inspect_shard_output_root(
+    path: Path, *, allow_missing: bool
+) -> Union[tuple[int, int, int, int], None]:
+    _reject_linked_components(path.parent, label="shard output parent")
+    if not os.path.lexists(path):
+        if allow_missing:
+            return None
+        raise ValueError("shard output root does not exist")
+    if _is_linked_source(path):
+        raise ValueError("linked or symlink shard output root is not allowed")
+    try:
+        path_status = os.lstat(path)
+    except OSError as error:
+        raise ValueError("unable to inspect shard output root") from error
+    if not stat.S_ISDIR(path_status.st_mode):
+        raise ValueError("shard output root must be a directory")
+    return _path_identity(path_status)
+
+
+def _prepare_shard_output_root(path: Path) -> tuple[int, int, int, int]:
+    identity = _inspect_shard_output_root(path, allow_missing=True)
+    if identity is None:
+        try:
+            path.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise ValueError("unable to create shard output root") from error
+    inspected = _inspect_shard_output_root(path, allow_missing=False)
+    if inspected is None:
+        raise AssertionError("existing shard output root has no identity")
+    return inspected
 
 
 def _resolve_contained_source(

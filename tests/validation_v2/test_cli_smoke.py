@@ -33,7 +33,11 @@ def external_repo_tmp_path() -> Iterator[Path]:
         yield Path(directory)
 
 
-def _cli(*arguments: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[bytes]:
+def _cli(
+    *arguments: str,
+    cwd: Path = REPO_ROOT,
+    timeout=None,
+) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(REPO_ROOT)
     return subprocess.run(
@@ -42,6 +46,7 @@ def _cli(*arguments: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[
         env=environment,
         capture_output=True,
         check=False,
+        timeout=timeout,
     )
 
 
@@ -115,6 +120,43 @@ def test_shard_plan_rerun_is_idempotent_but_different_plan_does_not_clobber(
     assert different.stderr.startswith(b"validation-v2: ")
     assert b"different" in different.stderr or b"shard_count" in different.stderr
     assert plan_path.read_bytes() == before
+
+
+def test_shard_plan_rejects_broken_link_output_without_hanging_or_recreating_target(
+    tmp_path: Path,
+):
+    output = tmp_path / "plan.json"
+    target = tmp_path / "missing-target"
+    target.mkdir()
+    try:
+        output.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"symlink creation is unavailable: {error}")
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(output), str(target)],
+            capture_output=True, text=True, check=False,
+        )
+        if completed.returncode != 0:
+            pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+    target.rmdir()
+    assert os.path.lexists(output)
+    before = os.lstat(output)
+
+    result = _cli(
+        "shard-plan", "--config", "server_full.yaml", "--shard-count", "8",
+        "--output", str(output), "--device", "cpu", timeout=5,
+    )
+
+    after = os.lstat(output)
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert len(result.stderr.decode("utf-8").splitlines()) == 1
+    assert b"linked" in result.stderr or b"regular" in result.stderr
+    assert (after.st_mode, getattr(after, "st_file_attributes", 0)) == (
+        before.st_mode, getattr(before, "st_file_attributes", 0)
+    )
+    assert not target.exists()
 
 
 @pytest.mark.parametrize("shard_index", ["-1", "8"])
