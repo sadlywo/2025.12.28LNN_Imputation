@@ -574,6 +574,109 @@ def test_merge_rejects_output_inside_shards_without_mutating_sources(tmp_path: P
     assert {path.name for path in shards_root.iterdir()} == {"000", "001"}
 
 
+def _symlink_or_simulate(
+    link: Path,
+    target: Path,
+    *,
+    directory: bool,
+    monkeypatch: pytest.MonkeyPatch | None = None,
+) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as error:
+        if directory and os.name == "nt":
+            completed = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode == 0:
+                return
+        if monkeypatch is None:
+            pytest.skip(f"symlink creation is unavailable: {error}")
+        target.replace(link)
+        real_is_linked = sharding._is_linked_source
+        linked_path = link.absolute()
+        monkeypatch.setattr(
+            sharding,
+            "_is_linked_source",
+            lambda path: Path(path).absolute() == linked_path
+            or real_is_linked(Path(path)),
+        )
+
+
+def test_linked_shard_cannot_hide_output_overlap_with_real_source(
+    tmp_path: Path,
+):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    linked = shards_root / "000"
+    external = tmp_path / "external-shard"
+    linked.replace(external)
+    _symlink_or_simulate(linked, external, directory=True)
+    before = _tree_snapshot(external)
+
+    with pytest.raises(ValueError, match="symlink|linked|shard"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=external / "merged",
+        )
+
+    assert _tree_snapshot(external) == before
+    assert {path.name for path in external.iterdir()} == set(
+        path.split("/", 1)[0] for path in before
+    )
+
+
+@pytest.mark.parametrize("linked_kind", ["run", "asset", "run-file", "marker"])
+def test_preflight_rejects_linked_shard_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    linked_kind: str,
+):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    shard_root = shards_root / "000"
+    marker = json.loads(
+        (shard_root / "shard_execution.json").read_text(encoding="utf-8")
+    )
+    if linked_kind == "run":
+        linked = shard_root / marker["run_ids"][0]
+        external = tmp_path / "external-run"
+        linked.replace(external)
+        _symlink_or_simulate(
+            linked, external, directory=True, monkeypatch=monkeypatch
+        )
+    elif linked_kind == "asset":
+        linked = next(shard_root.glob("scaler-*.json"))
+        external = tmp_path / linked.name
+        linked.replace(external)
+        _symlink_or_simulate(
+            linked, external, directory=False, monkeypatch=monkeypatch
+        )
+    elif linked_kind == "run-file":
+        linked = shard_root / marker["run_ids"][0] / "best.pt"
+        external = tmp_path / "external-best.pt"
+        linked.replace(external)
+        _symlink_or_simulate(
+            linked, external, directory=False, monkeypatch=monkeypatch
+        )
+    else:
+        linked = shard_root / "shard_execution.json"
+        external = tmp_path / "external-shard_execution.json"
+        linked.replace(external)
+        _symlink_or_simulate(
+            linked, external, directory=False, monkeypatch=monkeypatch
+        )
+
+    with pytest.raises(ValueError, match="symlink|linked|contain"):
+        preflight_shards(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            plan=plan,
+            shards_root=shards_root,
+        )
+
+
 def test_server_plan_has_expected_counts_and_round_robin_assignment():
     config = _server_config()
     groups = enumerate_training_groups(config)

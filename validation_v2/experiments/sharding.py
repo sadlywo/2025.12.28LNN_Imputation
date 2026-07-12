@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from typing import Any, Union
@@ -827,6 +828,31 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_linked_source(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+    except OSError as error:
+        raise ValueError(f"unable to inspect source path: {path}") from error
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _resolve_contained_source(
+    path: Path, *, container: Path, label: str
+) -> Path:
+    if _is_linked_source(path):
+        raise ValueError(f"linked or symlink {label} is not allowed: {path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"unable to resolve {label}: {path}") from error
+    if resolved != container and container not in resolved.parents:
+        raise ValueError(f"{label} escapes its resolved shard containment: {path}")
+    return resolved
+
+
 def _load_json_mapping(path: Path, label: str) -> dict[str, Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -838,7 +864,9 @@ def _load_json_mapping(path: Path, label: str) -> dict[str, Any]:
 
 
 def _validate_shard_assets(
-    shard_root: Path, run_ids: list[str]
+    shard_root: Path,
+    run_ids: list[str],
+    resolved_entries: Mapping[str, Path],
 ) -> list[dict[str, Any]]:
     assets: dict[str, dict[str, Any]] = {}
     for child in shard_root.iterdir():
@@ -849,12 +877,13 @@ def _validate_shard_assets(
         if not child.is_file():
             raise ValueError(f"asset is not a file: {child.name}")
         expected = (split_match or scaler_match).group(1)  # type: ignore[union-attr]
-        actual = _file_sha256(child)
+        source = resolved_entries[child.name]
+        actual = _file_sha256(source)
         if actual != expected:
             raise ValueError(f"asset filename digest does not match SHA-256: {child.name}")
         assets[child.name] = {
             "name": child.name,
-            "source": child,
+            "source": source,
             "sha256": actual,
         }
 
@@ -898,6 +927,10 @@ def preflight_shards(
     root = Path(shards_root)
     if not root.is_dir():
         raise ValueError("shards_root must be a directory")
+    try:
+        resolved_root = root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("unable to resolve shards_root") from error
     expected_names = {
         f"{index:03d}" for index in range(validated_plan["shard_count"])
     }
@@ -918,16 +951,46 @@ def preflight_shards(
     group_ids: list[str] = []
     combination_ids: list[str] = []
     assets_by_name: dict[str, tuple[str, bytes]] = {}
+    source_paths: list[Path] = []
 
     for shard_index, shard in enumerate(validated_plan["shards"]):
         shard_root = root / f"{shard_index:03d}"
+        resolved_shard_root = _resolve_contained_source(
+            shard_root,
+            container=resolved_root,
+            label=f"shard directory {shard_root.name}",
+        )
+        if not resolved_shard_root.is_dir():
+            raise ValueError(f"shard source is not a directory: {shard_root.name}")
+        source_paths.append(resolved_shard_root)
+        resolved_entries: dict[str, Path] = {}
+        resolved_run_entries: dict[str, dict[str, Path]] = {}
+        for child in shard_root.iterdir():
+            resolved_child = _resolve_contained_source(
+                child,
+                container=resolved_shard_root,
+                label=f"shard source {child.name}",
+            )
+            resolved_entries[child.name] = resolved_child
+            source_paths.append(resolved_child)
+            if _RUN_ID.fullmatch(child.name) and resolved_child.is_dir():
+                run_items: dict[str, Path] = {}
+                for item in child.iterdir():
+                    resolved_item = _resolve_contained_source(
+                        item,
+                        container=resolved_child,
+                        label=f"run artifact {child.name}/{item.name}",
+                    )
+                    run_items[item.name] = resolved_item
+                    source_paths.append(resolved_item)
+                resolved_run_entries[child.name] = run_items
         assigned_groups = [groups[index] for index in shard["group_indices"]]
         marker_path = shard_root / "shard_execution.json"
         if not marker_path.is_file():
             raise ValueError(f"missing completed shard_execution.json in {shard_root.name}")
         immutable = _immutable_marker_fields(validated_plan, shard, shard_index)
         marker = _load_execution_marker(
-            marker_path, immutable, shard_root, assigned_groups
+            resolved_entries[marker_path.name], immutable, shard_root, assigned_groups
         )
         if marker["status"] != "completed":
             raise ValueError(
@@ -935,7 +998,9 @@ def preflight_shards(
             )
         marker_run_ids = list(marker["run_ids"])
         allowed = {"shard_execution.json", _LOCK_FILE, *marker_run_ids}
-        shard_assets = _validate_shard_assets(shard_root, marker_run_ids)
+        shard_assets = _validate_shard_assets(
+            shard_root, marker_run_ids, resolved_entries
+        )
         allowed.update(asset["name"] for asset in shard_assets)
         actual = {child.name for child in shard_root.iterdir()}
         if actual - allowed or allowed - actual - {_LOCK_FILE}:
@@ -945,12 +1010,19 @@ def preflight_shards(
             )
         for run_id in marker_run_ids:
             run_dir = shard_root / run_id
-            if not run_dir.is_dir() or {item.name for item in run_dir.iterdir()} != _RUN_FILES:
+            resolved_run_dir = resolved_entries[run_id]
+            run_entries = list(run_dir.iterdir()) if run_dir.is_dir() else []
+            if not run_dir.is_dir() or {item.name for item in run_entries} != _RUN_FILES:
                 raise ValueError(f"run {run_id} must contain exactly six artifacts")
+            for item_name, resolved_item in resolved_run_entries[run_id].items():
+                if not resolved_item.is_file():
+                    raise ValueError(
+                        f"run artifact is not a regular file: {run_id}/{item_name}"
+                    )
             if run_id in run_ids:
                 raise ValueError(f"duplicate run_id across shards: {run_id}")
             run_ids.append(run_id)
-            run_sources.append({"run_id": run_id, "source": run_dir})
+            run_sources.append({"run_id": run_id, "source": resolved_run_dir})
         for asset in shard_assets:
             source = asset["source"]
             content = source.read_bytes()
@@ -1003,6 +1075,7 @@ def preflight_shards(
         "asset_digests": {
             name: digest for name, (digest, _) in sorted(assets_by_name.items())
         },
+        "source_paths": source_paths,
     }
 
 
@@ -1060,6 +1133,14 @@ def _preserve_failed_merge(temporary: Path, parent: Path) -> None:
     os.replace(temporary, failed)
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return (
+        first == second
+        or first in second.parents
+        or second in first.parents
+    )
+
+
 def merge_shards(
     *,
     config_path: Union[Path, str],
@@ -1087,6 +1168,12 @@ def merge_shards(
     source_root = Path(shards_root).absolute().resolve(strict=False)
     if output == source_root or source_root in output.parents:
         raise ValueError("output_root must not overlap shards_root")
+    for source in promotion["source_paths"]:
+        resolved_source = Path(source)
+        if _paths_overlap(output, resolved_source) or _paths_overlap(
+            output, resolved_source.parent
+        ):
+            raise ValueError("output_root must not overlap resolved shard sources")
     parent = output.parent
     parent.mkdir(parents=True, exist_ok=True)
 
