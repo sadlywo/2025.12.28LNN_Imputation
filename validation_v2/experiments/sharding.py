@@ -1044,6 +1044,82 @@ def _resolve_contained_source(
     return resolved
 
 
+def _snapshot_run_artifacts(
+    shard_root: Path,
+    run_directories: Mapping[str, Path],
+) -> dict[str, dict[str, Any]]:
+    """Capture one stable, exact snapshot of every discovered run directory."""
+
+    expected_run_ids = set(run_directories)
+
+    def live_run_ids() -> set[str]:
+        return {
+            child.name
+            for child in shard_root.iterdir()
+            if _RUN_ID.fullmatch(child.name) and child.is_dir()
+        }
+
+    if live_run_ids() != expected_run_ids:
+        raise ValueError("run directory snapshot set changed")
+    snapshot: dict[str, dict[str, Any]] = {}
+    for run_id in sorted(expected_run_ids):
+        run_dir = run_directories[run_id]
+        try:
+            directory_identity = _path_identity(os.lstat(run_dir))
+        except OSError as error:
+            raise ValueError(f"unable to inspect run directory snapshot: {run_id}") from error
+        entries = {item.name: item for item in run_dir.iterdir()}
+        if set(entries) != _RUN_FILES:
+            raise ValueError(f"run {run_id} snapshot must contain exactly six artifacts")
+        artifacts: dict[str, dict[str, Any]] = {}
+        for name in sorted(_RUN_FILES):
+            raw_source = entries[name]
+            source = _resolve_contained_source(
+                raw_source,
+                container=run_dir,
+                label=f"run artifact snapshot {run_id}/{name}",
+            )
+            try:
+                identity = _path_identity(os.lstat(raw_source))
+            except OSError as error:
+                raise ValueError(
+                    f"unable to inspect run artifact snapshot: {run_id}/{name}"
+                ) from error
+            if not stat.S_ISREG(os.lstat(raw_source).st_mode):
+                raise ValueError(f"run artifact is not a regular file: {run_id}/{name}")
+            digest = _file_sha256(source)
+            try:
+                stable_identity = _path_identity(os.lstat(raw_source))
+            except OSError as error:
+                raise ValueError(
+                    f"run artifact changed during snapshot: {run_id}/{name}"
+                ) from error
+            if stable_identity != identity:
+                raise ValueError(
+                    f"run artifact changed during snapshot: {run_id}/{name}"
+                )
+            artifacts[name] = {
+                "source": source,
+                "sha256": digest,
+                "identity": identity,
+            }
+        if {item.name for item in run_dir.iterdir()} != _RUN_FILES:
+            raise ValueError(f"run {run_id} snapshot file set changed")
+        try:
+            stable_directory_identity = _path_identity(os.lstat(run_dir))
+        except OSError as error:
+            raise ValueError(f"run directory changed during snapshot: {run_id}") from error
+        if stable_directory_identity != directory_identity:
+            raise ValueError(f"run directory changed during snapshot: {run_id}")
+        snapshot[run_id] = {
+            "directory_identity": directory_identity,
+            "artifacts": artifacts,
+        }
+    if live_run_ids() != expected_run_ids:
+        raise ValueError("run directory snapshot set changed")
+    return snapshot
+
+
 def _load_json_mapping(path: Path, label: str) -> dict[str, Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -1183,6 +1259,12 @@ def preflight_shards(
                     run_items[item.name] = resolved_item
                     source_paths.append(resolved_item)
                 resolved_run_entries[child.name] = run_items
+        run_directories = {
+            run_id: resolved_entries[run_id] for run_id in resolved_run_entries
+        }
+        before_run_snapshot = _snapshot_run_artifacts(
+            shard_root, run_directories
+        )
         assigned_groups = [groups[index] for index in shard["group_indices"]]
         marker_path = shard_root / "shard_execution.json"
         if not marker_path.is_file():
@@ -1207,17 +1289,16 @@ def preflight_shards(
                 f"foreign or missing content in shard {shard_root.name}: "
                 f"foreign={sorted(actual - allowed)}, missing={sorted(allowed - actual - {_LOCK_FILE})}"
             )
+        after_run_snapshot = _snapshot_run_artifacts(
+            shard_root, run_directories
+        )
+        if after_run_snapshot != before_run_snapshot:
+            raise ValueError(
+                f"run artifact snapshot changed during semantic validation in {shard_root.name}"
+            )
         for run_id in marker_run_ids:
             run_dir = shard_root / run_id
             resolved_run_dir = resolved_entries[run_id]
-            run_entries = list(run_dir.iterdir()) if run_dir.is_dir() else []
-            if not run_dir.is_dir() or {item.name for item in run_entries} != _RUN_FILES:
-                raise ValueError(f"run {run_id} must contain exactly six artifacts")
-            for item_name, resolved_item in resolved_run_entries[run_id].items():
-                if not resolved_item.is_file():
-                    raise ValueError(
-                        f"run artifact is not a regular file: {run_id}/{item_name}"
-                    )
             if run_id in run_ids:
                 raise ValueError(f"duplicate run_id across shards: {run_id}")
             run_ids.append(run_id)
@@ -1228,10 +1309,12 @@ def preflight_shards(
                     "artifacts": [
                         {
                             "relative_path": name,
-                            "source": resolved_run_entries[run_id][name],
-                            "sha256": _file_sha256(
-                                resolved_run_entries[run_id][name]
-                            ),
+                            "source": before_run_snapshot[run_id]["artifacts"][name][
+                                "source"
+                            ],
+                            "sha256": before_run_snapshot[run_id]["artifacts"][name][
+                                "sha256"
+                            ],
                         }
                         for name in sorted(_RUN_FILES)
                     ],

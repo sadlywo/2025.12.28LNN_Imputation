@@ -540,6 +540,69 @@ def test_merge_rejects_run_artifact_changed_after_preflight_without_publishing(
     assert not output_root.exists()
 
 
+def test_merge_rejects_cross_file_mutation_during_preflight_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    output_root = tmp_path / "merged"
+    real_hash = sharding._file_sha256
+    changed = False
+
+    def mutate_sibling_on_first_best(path: Path) -> str:
+        nonlocal changed
+        path = Path(path)
+        if path.name == "best.pt" and not changed:
+            changed = True
+            manifest_path = path.parent / "run.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["python"] = "changed-during-snapshot"
+            _write_raw(manifest_path, manifest)
+        return real_hash(path)
+
+    monkeypatch.setattr(sharding, "_file_sha256", mutate_sibling_on_first_best)
+
+    with pytest.raises(ValueError, match="snapshot|changed|runtime"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=output_root,
+        )
+
+    assert changed
+    assert not output_root.exists()
+
+
+def test_merge_rejects_run_file_set_change_during_preflight_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    output_root = tmp_path / "merged"
+    real_hash = sharding._file_sha256
+    changed = False
+
+    def add_sibling_on_first_best(path: Path) -> str:
+        nonlocal changed
+        path = Path(path)
+        if path.name == "best.pt" and not changed:
+            changed = True
+            (path.parent / "appeared.tmp").write_text("late file", encoding="utf-8")
+        return real_hash(path)
+
+    monkeypatch.setattr(sharding, "_file_sha256", add_sibling_on_first_best)
+
+    with pytest.raises(ValueError, match="snapshot|file set|exactly six|content"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=output_root,
+        )
+
+    assert changed
+    assert not output_root.exists()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
