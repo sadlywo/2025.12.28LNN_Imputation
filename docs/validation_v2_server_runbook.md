@@ -112,8 +112,8 @@ cd "$REPO"
 (
   source /etc/network_turbo
   git fetch --all --tags --prune
-  git checkout validation-v2-server
-  git pull --ff-only origin validation-v2-server
+  git checkout codex/validation-v2
+  git pull --ff-only origin codex/validation-v2
 )
 ```
 

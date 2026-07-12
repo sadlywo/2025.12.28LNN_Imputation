@@ -27,6 +27,16 @@ from validation_v2.types import Recording
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_server_runbook_uses_the_delivered_validation_branch() -> None:
+    runbook = (REPO_ROOT / "docs" / "validation_v2_server_runbook.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "git checkout codex/validation-v2" in runbook
+    assert "git pull --ff-only origin codex/validation-v2" in runbook
+    assert "validation-v2-server" not in runbook
+
+
 @pytest.fixture
 def external_repo_tmp_path() -> Iterator[Path]:
     with tempfile.TemporaryDirectory(
