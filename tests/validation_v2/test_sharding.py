@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -190,6 +191,58 @@ def test_write_never_clobbers_different_existing_content(tmp_path: Path):
         write_shard_plan(path, _plan(shard_count=2))
 
     assert path.read_bytes() == b"existing bytes\n"
+
+
+def _race_at_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+    racing_content: bytes,
+) -> None:
+    real_link = os.link
+    real_replace = os.replace
+    raced = False
+
+    def create_racing_destination() -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            path.write_bytes(racing_content)
+
+    def racing_link(source: Any, destination: Any) -> None:
+        create_racing_destination()
+        real_link(source, destination)
+
+    def racing_replace(source: Any, destination: Any) -> None:
+        create_racing_destination()
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "link", racing_link)
+    monkeypatch.setattr(os, "replace", racing_replace)
+
+
+def test_write_does_not_clobber_different_content_created_at_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "plan.json"
+    racing_content = b"racing writer's different plan\n"
+    _race_at_commit(monkeypatch, path, racing_content)
+
+    with pytest.raises(ValueError, match="different content"):
+        write_shard_plan(path, _plan(shard_count=2))
+
+    assert path.read_bytes() == racing_content
+
+
+def test_write_accepts_same_content_created_at_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "plan.json"
+    plan = _plan(shard_count=2)
+    content = (canonical_json(plan) + "\n").encode("utf-8")
+    _race_at_commit(monkeypatch, path, content)
+
+    assert write_shard_plan(path, plan) == path
+    assert path.read_bytes() == content
 
 
 def test_load_round_trip_accepts_json_and_yaml(tmp_path: Path):

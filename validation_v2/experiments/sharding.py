@@ -178,13 +178,20 @@ def write_shard_plan(
             handle.flush()
             os.fsync(handle.fileno())
 
-        if path.exists():
-            if path.read_bytes() == content:
+        while True:
+            try:
+                os.link(temporary, path)
                 return path
-            raise ValueError("shard plan already exists with different content")
-        os.replace(temporary, path)
-        temporary = None
-        return path
+            except FileExistsError:
+                try:
+                    existing = path.read_bytes()
+                except FileNotFoundError:
+                    continue
+                if existing == content:
+                    return path
+                raise ValueError(
+                    "shard plan already exists with different content"
+                )
     finally:
         if temporary is not None:
             try:
