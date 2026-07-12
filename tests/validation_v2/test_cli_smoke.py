@@ -67,6 +67,77 @@ def _runbook_python_blocks(runbook: str) -> list[str]:
     return re.findall(r"<<'PY'\n(.*?)\nPY", runbook, flags=re.DOTALL)
 
 
+def _runbook_bash_function(runbook: str, name: str) -> str:
+    match = re.search(
+        rf"^{name}\(\) \{{\n(.*?)^\}}$",
+        runbook,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    assert match is not None, name
+    return match.group(1)
+
+
+def test_server_runbook_strict_shell_explicitly_propagates_wait_failures():
+    runbook = _server_runbook()
+
+    assert "set -Eeuo pipefail" in runbook
+    wait_calls = [
+        line.strip()
+        for line in runbook.splitlines()
+        if re.match(r"wait_shard (?!\(\))", line.strip())
+    ]
+    queue_calls = [
+        line.strip()
+        for line in runbook.splitlines()
+        if re.match(r"run_queue [12] ", line.strip())
+    ]
+    assert wait_calls and all("|| exit $?" in line for line in wait_calls)
+    assert queue_calls and all("|| exit $?" in line for line in queue_calls)
+    assert 'wait_shard "$SHARD" || exit $?' in runbook
+    assert not re.search(r"^\s+wait_shard\s+\S+\s*$", runbook, flags=re.MULTILINE)
+
+
+def test_server_runbook_waits_check_markers_pids_completion_and_timeouts():
+    runbook = _server_runbook()
+    wait_groups = _runbook_bash_function(runbook, "wait_until_groups")
+    wait_stage = _runbook_bash_function(runbook, "wait_stage_metrics")
+
+    for block in (wait_groups, wait_stage):
+        assert "kill -0" in block
+        assert "failed" in block
+        assert "group_runs" in block
+        assert "tail -n" in block
+        assert "deadline" in block
+        assert "return 2" in block
+        assert "return 3" in block
+        assert "return 4" in block
+    assert "completed before required group count" in wait_groups
+    assert "14400" in wait_stage
+    assert 'SystemExit(10)' in runbook
+    for stage in ("STAGE2_RC", "STAGE4_RC"):
+        case_block = re.search(
+            rf'case "\${stage}" in(.*?)esac', runbook, flags=re.DOTALL
+        )
+        assert case_block is not None
+        assert "10)" in case_block.group(1)
+        assert "2|3|4)" in case_block.group(1)
+
+
+def test_server_runbook_audits_active_marker_pid_process_and_gpu_each_minute():
+    runbook = _server_runbook()
+    audit = _runbook_bash_function(runbook, "audit_active")
+
+    assert "60" in audit
+    assert "shard_execution.json" in audit
+    assert "group_runs" in audit
+    assert "kill -0" in audit
+    assert "pgrep -af" in audit
+    assert "nvidia-smi" in audit
+    assert "tee -a" in audit
+    for function in ("wait_shard", "wait_until_groups", "wait_stage_metrics"):
+        assert "audit_active" in _runbook_bash_function(runbook, function)
+
+
 def test_server_runbook_rebuilds_commit_scoped_paths_in_the_offline_shell():
     runbook = _server_runbook()
     offline = runbook.index("Open a new offline shell")
