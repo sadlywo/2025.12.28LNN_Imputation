@@ -5,15 +5,19 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import tempfile
 from typing import Any, Union
 
 import yaml
 
-from .groups import TrainingGroup, enumerate_training_groups
+from .groups import TrainingGroup, enumerate_training_groups, group_execution_config
 from .provenance import canonical_json
+from .runner import run_smoke
 
 
 SHARD_SCHEMA_VERSION = 1
@@ -43,6 +47,20 @@ _SHARD_FIELDS = frozenset(
 )
 _GROUP_KEY_FIELDS = frozenset(
     {"training_family", "seed", "protocol", "objective"}
+)
+_RUN_ID = re.compile(r"[0-9a-f]{16}")
+_RUN_FILES = frozenset(
+    {
+        "run.json",
+        "history.json",
+        "best.pt",
+        "checkpoint.json",
+        "test_evaluation.json",
+        "per_record_metrics.csv",
+    }
+)
+_FORBIDDEN_ROOT_FILES = frozenset(
+    {"matrix_execution.json", "smoke_summary.json", "validation_report.json"}
 )
 
 
@@ -274,6 +292,26 @@ def load_shard_plan(
     if not isinstance(loaded, Mapping):
         raise ValueError("shard plan must be a mapping")
 
+    return _validate_plan_mapping(
+        loaded, config=config, git_commit=git_commit, device=device
+    )
+
+
+def _validate_plan_mapping(
+    loaded: Mapping[str, Any],
+    *,
+    config: Mapping[str, Any],
+    git_commit: str,
+    device: str,
+) -> dict[str, Any]:
+    """Validate an in-memory plan with the same strictness as file loading."""
+
+    git_commit = _validate_git_commit(git_commit)
+    device = _validate_device(device)
+    if not isinstance(config, Mapping):
+        raise ValueError("config must be a mapping")
+    if not isinstance(loaded, Mapping):
+        raise ValueError("shard plan must be a mapping")
     plan = dict(loaded)
     _validate_plan_structure(plan)
     try:
@@ -322,9 +360,284 @@ def load_shard_plan(
     return plan
 
 
+def _current_git_commit(repository_root: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("unable to determine current git_commit") from error
+    commit = completed.stdout.strip()
+    if not commit:
+        raise ValueError("unable to determine current git_commit")
+    return commit
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
+    content = (canonical_json(value) + "\n").encode("utf-8")
+    temporary: Union[Path, None] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _run_group(
+    config: Mapping[str, Any],
+    group: TrainingGroup,
+    repository_root: Path,
+    output_root: Path,
+    requested_device: str,
+) -> Mapping[str, Any]:
+    """Execute exactly one pre-enumerated training group."""
+
+    return run_smoke(
+        group_execution_config(config, group),
+        repository_root=repository_root,
+        output_root=output_root,
+        requested_device=requested_device,
+    )
+
+
+def _immutable_marker_fields(
+    plan: Mapping[str, Any], shard: Mapping[str, Any], shard_index: int
+) -> dict[str, Any]:
+    return {
+        "schema_version": SHARD_SCHEMA_VERSION,
+        "plan_sha256": plan["plan_sha256"],
+        "source_config_sha256": plan["source_config_sha256"],
+        "git_commit": plan["git_commit"],
+        "device": plan["device"],
+        "shard_index": shard_index,
+        "shard_count": plan["shard_count"],
+        "group_ids": list(shard["group_ids"]),
+        "combination_ids": list(shard["combination_ids"]),
+    }
+
+
+def _validate_run_directory(run_dir: Path) -> None:
+    missing = sorted(name for name in _RUN_FILES if not (run_dir / name).is_file())
+    if missing:
+        raise ValueError(f"incomplete run artifacts in {run_dir.name}: {missing}")
+    try:
+        ledger = json.loads(
+            (run_dir / "test_evaluation.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid test_evaluation ledger in {run_dir.name}") from error
+    if not isinstance(ledger, Mapping) or ledger.get("status") != "completed":
+        raise ValueError(f"test_evaluation ledger is not completed in {run_dir.name}")
+
+
+def _root_run_ids(output_root: Path) -> list[str]:
+    run_ids: list[str] = []
+    for child in output_root.iterdir():
+        if child.name == "shard_execution.json":
+            continue
+        if child.name in _FORBIDDEN_ROOT_FILES:
+            raise ValueError(f"forbidden marker in shard output root: {child.name}")
+        if child.is_file() and (
+            child.match("split_manifest-*.csv") or child.match("scaler-*.json")
+        ):
+            continue
+        if child.is_dir() and _RUN_ID.fullmatch(child.name):
+            run_ids.append(child.name)
+            continue
+        raise ValueError(f"foreign content in exclusive shard output root: {child.name}")
+    return sorted(run_ids)
+
+
+def _validate_marker(
+    marker: Any,
+    immutable: Mapping[str, Any],
+    output_root: Path,
+) -> dict[str, Any]:
+    if not isinstance(marker, Mapping):
+        raise ValueError("shard execution marker must be a mapping")
+    value = dict(marker)
+    status = value.get("status")
+    common = set(immutable) | {
+        "status",
+        "started_at",
+        "completed_group_ids",
+        "run_ids",
+    }
+    expected_fields = {
+        "started": common,
+        "completed": common | {"completed_at"},
+        "failed": common | {"error_type"},
+    }.get(status)
+    if expected_fields is None or set(value) != expected_fields:
+        raise ValueError("invalid shard execution marker fields or status")
+    for field, expected in immutable.items():
+        if value.get(field) != expected:
+            raise ValueError(f"immutable shard marker mismatch: {field}")
+    _validate_created_at(value["started_at"])
+    if status == "completed":
+        _validate_created_at(value["completed_at"])
+    if status == "failed" and (
+        not isinstance(value["error_type"], str) or not value["error_type"]
+    ):
+        raise ValueError("invalid shard execution error_type")
+    assigned = list(immutable["group_ids"])
+    completed = value["completed_group_ids"]
+    run_ids = value["run_ids"]
+    if not isinstance(completed, list) or completed != assigned[: len(completed)]:
+        raise ValueError("completed_group_ids must be an assigned prefix")
+    if status == "completed" and completed != assigned:
+        raise ValueError("completed_group_ids do not cover the completed shard")
+    if not isinstance(run_ids, list) or any(
+        not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id)
+        for run_id in run_ids
+    ):
+        raise ValueError("invalid run_ids in shard execution marker")
+    if len(set(run_ids)) != len(run_ids):
+        raise ValueError("duplicate run_ids in shard execution marker")
+    if completed and not run_ids:
+        raise ValueError("completed groups require non-empty run_ids")
+    if not assigned and run_ids:
+        raise ValueError("empty shard must have empty run_ids")
+    actual_run_ids = _root_run_ids(output_root)
+    if sorted(run_ids) != actual_run_ids:
+        raise ValueError("run_ids do not match shard run directories")
+    for run_id in run_ids:
+        _validate_run_directory(output_root / run_id)
+    return value
+
+
+def _load_execution_marker(
+    marker_path: Path,
+    immutable: Mapping[str, Any],
+    output_root: Path,
+) -> dict[str, Any]:
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("unable to load shard execution marker") from error
+    return _validate_marker(marker, immutable, output_root)
+
+
+def execute_shard(
+    config: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    shard_index: int,
+    repository_root: Union[Path, str],
+    output_root: Union[Path, str],
+    requested_device: str,
+) -> Mapping[str, Any]:
+    """Execute one isolated shard, with atomic resumable state transitions."""
+
+    if type(shard_index) is not int:
+        raise ValueError("shard_index must be an integer")
+    repository_root = Path(repository_root)
+    output_root = Path(output_root)
+    if not output_root.is_absolute():
+        output_root = repository_root / output_root
+    git_commit = _current_git_commit(repository_root)
+    validated_plan = _validate_plan_mapping(
+        plan,
+        config=config,
+        git_commit=git_commit,
+        device=requested_device,
+    )
+    if shard_index < 0 or shard_index >= validated_plan["shard_count"]:
+        raise ValueError("shard_index is outside the shard plan")
+    shard = validated_plan["shards"][shard_index]
+    immutable = _immutable_marker_fields(validated_plan, shard, shard_index)
+    marker_path = output_root / "shard_execution.json"
+
+    if marker_path.exists():
+        marker = _load_execution_marker(marker_path, immutable, output_root)
+        if marker["status"] == "failed":
+            raise ValueError("failed shard execution cannot be resumed")
+        if marker["status"] == "completed":
+            return marker
+    else:
+        if output_root.exists() and any(output_root.iterdir()):
+            names = {child.name for child in output_root.iterdir()}
+            forbidden = sorted(names & _FORBIDDEN_ROOT_FILES)
+            if forbidden:
+                raise ValueError(f"forbidden marker in shard output root: {forbidden[0]}")
+            raise ValueError("foreign content in exclusive shard output root")
+        output_root.mkdir(parents=True, exist_ok=True)
+        marker = {
+            **immutable,
+            "status": "started",
+            "started_at": _timestamp(),
+            "completed_group_ids": [],
+            "run_ids": [],
+        }
+        _atomic_write_json(marker_path, marker)
+
+    groups = enumerate_training_groups(config)
+    assigned_groups = [groups[index] for index in shard["group_indices"]]
+    completed_count = len(marker["completed_group_ids"])
+    try:
+        for group in assigned_groups[completed_count:]:
+            report = _run_group(
+                config, group, repository_root, output_root, requested_device
+            )
+            if not isinstance(report, Mapping):
+                raise ValueError("group execution report must be a mapping")
+            new_run_ids = report.get("run_ids")
+            if not isinstance(new_run_ids, list) or not new_run_ids:
+                raise ValueError("group execution must return non-empty run_ids")
+            if any(
+                not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id)
+                for run_id in new_run_ids
+            ):
+                raise ValueError("group execution returned invalid run_ids")
+            if set(new_run_ids) & set(marker["run_ids"]):
+                raise ValueError("group execution returned duplicate run_ids")
+            for run_id in new_run_ids:
+                _validate_run_directory(output_root / run_id)
+            marker["completed_group_ids"].append(group.group_id)
+            marker["run_ids"].extend(new_run_ids)
+            if sorted(marker["run_ids"]) != _root_run_ids(output_root):
+                raise ValueError("run_ids do not match shard run directories")
+            _atomic_write_json(marker_path, marker)
+    except BaseException as error:
+        marker["status"] = "failed"
+        marker["error_type"] = type(error).__name__
+        _atomic_write_json(marker_path, marker)
+        raise
+
+    marker["status"] = "completed"
+    marker["completed_at"] = _timestamp()
+    _atomic_write_json(marker_path, marker)
+    return marker
+
+
 __all__ = [
     "SHARD_SCHEMA_VERSION",
     "build_shard_plan",
+    "execute_shard",
     "load_shard_plan",
     "write_shard_plan",
 ]
