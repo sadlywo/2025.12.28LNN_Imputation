@@ -1141,6 +1141,27 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     )
 
 
+def _absolute_unresolved(path: Union[Path, str]) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _reject_linked_components(path: Path, *, label: str) -> None:
+    components: list[Path] = []
+    current = path
+    while True:
+        components.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+    for component in reversed(components):
+        if os.path.lexists(component) and _is_linked_source(component):
+            raise ValueError(f"linked {label} component is not allowed: {component}")
+
+
+def _destination_exists(raw_output: Path, resolved_output: Path) -> bool:
+    return os.path.lexists(raw_output) or os.path.lexists(resolved_output)
+
+
 def merge_shards(
     *,
     config_path: Union[Path, str],
@@ -1149,6 +1170,12 @@ def merge_shards(
     output_root: Union[Path, str],
 ) -> Mapping[str, Any]:
     """Validate, copy, seal, and atomically publish completed shards."""
+
+    raw_output = _absolute_unresolved(output_root)
+    if os.path.lexists(raw_output):
+        raise ValueError("raw output_root already exists or is linked")
+    raw_parent = raw_output.parent
+    _reject_linked_components(raw_parent, label="output parent")
 
     try:
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
@@ -1164,7 +1191,9 @@ def merge_shards(
         raise ValueError("shard plan must be a mapping")
 
     promotion = preflight_shards(config, plan=plan, shards_root=shards_root)
-    output = Path(output_root).absolute().resolve(strict=False)
+    _reject_linked_components(raw_parent, label="output parent")
+    resolved_parent_candidate = raw_parent.resolve(strict=False)
+    output = resolved_parent_candidate / raw_output.name
     source_root = Path(shards_root).absolute().resolve(strict=False)
     if output == source_root or source_root in output.parents:
         raise ValueError("output_root must not overlap shards_root")
@@ -1174,11 +1203,21 @@ def merge_shards(
             output, resolved_source.parent
         ):
             raise ValueError("output_root must not overlap resolved shard sources")
-    parent = output.parent
-    parent.mkdir(parents=True, exist_ok=True)
+    raw_parent.mkdir(parents=True, exist_ok=True)
+    _reject_linked_components(raw_parent, label="output parent")
+    try:
+        parent = raw_parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("unable to resolve output parent") from error
+    if parent != resolved_parent_candidate:
+        raise ValueError("output parent changed while preparing merge")
+    output = parent / raw_output.name
 
     with _merge_publish_lock(parent):
-        if os.path.lexists(output):
+        _reject_linked_components(raw_parent, label="output parent")
+        if raw_parent.resolve(strict=True) != parent:
+            raise ValueError("output parent changed while acquiring merge lock")
+        if _destination_exists(raw_output, output):
             raise ValueError("output_root already exists")
         temporary = Path(
             tempfile.mkdtemp(prefix=f".{output.name}-merge-", dir=parent)
@@ -1223,9 +1262,12 @@ def merge_shards(
                 or not (temporary / "validation_report.json").is_file()
             ):
                 raise ValueError("artifact validator did not complete and seal report")
-            if os.path.lexists(output):
+            _reject_linked_components(raw_parent, label="output parent")
+            if raw_parent.resolve(strict=True) != parent:
+                raise ValueError("output parent changed during merge")
+            if _destination_exists(raw_output, output):
                 raise ValueError("output_root appeared during merge")
-            os.rename(temporary, output)
+            os.rename(temporary, raw_output)
             return dict(report)
         except BaseException:
             try:

@@ -677,6 +677,99 @@ def test_preflight_rejects_linked_shard_artifacts(
         )
 
 
+def _link_snapshot(path: Path) -> tuple[int, int, str]:
+    status = os.lstat(path)
+    return (
+        status.st_mode,
+        getattr(status, "st_file_attributes", 0),
+        os.readlink(path),
+    )
+
+
+def _make_broken_directory_link(link: Path, target: Path) -> None:
+    target.mkdir()
+    _symlink_or_simulate(link, target, directory=True)
+    target.rmdir()
+    if not os.path.lexists(link):
+        pytest.skip("platform does not preserve a lexists-visible broken directory link")
+
+
+def test_merge_rejects_raw_broken_destination_before_preflight_or_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    output_root = tmp_path / "merged"
+    target = tmp_path / "missing-target"
+    _make_broken_directory_link(output_root, target)
+    before = _link_snapshot(output_root)
+
+    def forbidden_preflight(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        raise AssertionError("preflight must not run for an existing raw destination")
+
+    monkeypatch.setattr(sharding, "preflight_shards", forbidden_preflight)
+    with pytest.raises(ValueError, match="exist|linked|destination"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=output_root,
+        )
+
+    assert _link_snapshot(output_root) == before
+    assert not target.exists()
+    assert not list(tmp_path.glob(".merged-merge-*"))
+    assert not list(tmp_path.glob(".failed-merge-*"))
+
+
+def test_merge_rejects_linked_destination_parent_without_writes(tmp_path: Path):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    _symlink_or_simulate(linked_parent, real_parent, directory=True)
+    before = _link_snapshot(linked_parent)
+
+    with pytest.raises(ValueError, match="linked|parent|destination"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=linked_parent / "merged",
+        )
+
+    assert _link_snapshot(linked_parent) == before
+    assert list(real_parent.iterdir()) == []
+
+
+def test_merge_rejects_raw_link_created_during_publish_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    output_root = tmp_path / "merged"
+    target = tmp_path / "racing-missing-target"
+    real_validator = sharding.validate_artifacts
+    link_before_publish: dict[str, tuple[int, int, str]] = {}
+
+    def race_validator(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        report = real_validator(*args, **kwargs)
+        _make_broken_directory_link(output_root, target)
+        link_before_publish["snapshot"] = _link_snapshot(output_root)
+        return report
+
+    monkeypatch.setattr(sharding, "validate_artifacts", race_validator)
+    with pytest.raises(ValueError, match="appeared|exist|destination"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=output_root,
+        )
+
+    assert _link_snapshot(output_root) == link_before_publish["snapshot"]
+    assert not target.exists()
+    assert len(list(tmp_path.glob(".failed-merge-*"))) == 1
+
+
 def test_server_plan_has_expected_counts_and_round_robin_assignment():
     config = _server_config()
     groups = enumerate_training_groups(config)
