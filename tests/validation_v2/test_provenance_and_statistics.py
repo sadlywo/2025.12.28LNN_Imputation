@@ -1,7 +1,9 @@
 import csv
+import hashlib
 import importlib
 import json
 from pathlib import Path
+import subprocess
 
 import pandas as pd
 import pytest
@@ -112,6 +114,57 @@ def test_collect_provenance_resolves_config_and_marks_missing_packages(monkeypat
         "package_versions",
         "python",
         "platform",
+    }
+
+
+def test_runtime_fingerprint_is_public_and_collect_provenance_reuses_it(monkeypatch):
+    monkeypatch.setattr(provenance.metadata, "version", lambda name: f"v-{name}")
+    monkeypatch.setattr(provenance.sys, "version", "3.9.19 custom")
+    monkeypatch.setattr(provenance.platform_module, "platform", lambda: "test-platform")
+
+    runtime = provenance.runtime_fingerprint()
+    manifest = provenance.collect_provenance({"seq_len": 30}, seed=7)
+
+    assert runtime == {
+        "package_versions": {
+            name: f"v-{name}" for name in provenance.PACKAGE_DISTRIBUTIONS
+        },
+        "python": "3.9.19",
+        "platform": "test-platform",
+    }
+    assert {field: manifest[field] for field in runtime} == runtime
+    assert manifest["run_id"] == provenance.run_id({"seq_len": 30}, 7)
+
+
+def test_git_worktree_identity_uses_repository_root_from_external_cwd(
+    tmp_path: Path, monkeypatch
+):
+    repository_root = Path(__file__).resolve().parents[2]
+    expected_commit = subprocess.check_output(
+        ["git", "-C", str(repository_root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    dirty_text = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(repository_root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ],
+        text=True,
+    ).strip()
+    monkeypatch.chdir(tmp_path)
+
+    identity = provenance.git_worktree_identity(repository_root)
+
+    assert identity == {
+        "git_commit": expected_commit,
+        "dirty_state_digest": (
+            hashlib.sha256(dirty_text.encode("utf-8")).hexdigest()
+            if dirty_text
+            else ""
+        ),
     }
 
 

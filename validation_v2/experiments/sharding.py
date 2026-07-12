@@ -14,7 +14,6 @@ from pathlib import Path
 import re
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 from typing import Any, Union
@@ -24,12 +23,16 @@ import yaml
 
 from .groups import TrainingGroup, enumerate_training_groups, group_execution_config
 from .matrix import enumerate_matrix
-from .provenance import canonical_json
+from .provenance import (
+    canonical_json,
+    git_worktree_identity,
+    runtime_fingerprint as current_runtime_fingerprint,
+)
 from .runner import run_smoke
 from .validate_artifacts import validate_artifacts
 
 
-SHARD_SCHEMA_VERSION = 1
+SHARD_SCHEMA_VERSION = 2
 
 _PLAN_FIELDS = frozenset(
     {
@@ -37,6 +40,8 @@ _PLAN_FIELDS = frozenset(
         "created_at",
         "source_config_sha256",
         "git_commit",
+        "dirty_state_digest",
+        "runtime_fingerprint",
         "device",
         "shard_count",
         "total_groups",
@@ -89,6 +94,34 @@ def _validate_git_commit(git_commit: Any) -> str:
     if not isinstance(git_commit, str) or not git_commit.strip():
         raise ValueError("git_commit must be a non-empty string")
     return git_commit
+
+
+def _validate_dirty_state_digest(value: Any) -> str:
+    if not isinstance(value, str) or (
+        value and re.fullmatch(r"[0-9a-f]{64}", value) is None
+    ):
+        raise ValueError("dirty_state_digest must be empty or 64 lowercase hex")
+    return value
+
+
+def _validate_runtime_fingerprint(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "package_versions",
+        "python",
+        "platform",
+    }:
+        raise ValueError("invalid runtime_fingerprint fields")
+    versions = value["package_versions"]
+    if not isinstance(versions, Mapping) or any(
+        not isinstance(name, str) or not isinstance(version, str)
+        for name, version in versions.items()
+    ):
+        raise ValueError("runtime_fingerprint package_versions must map strings to strings")
+    if not isinstance(value["python"], str) or not value["python"]:
+        raise ValueError("runtime_fingerprint python must be a non-empty string")
+    if not isinstance(value["platform"], str) or not value["platform"]:
+        raise ValueError("runtime_fingerprint platform must be a non-empty string")
+    return json.loads(canonical_json(value))
 
 
 def _validate_device(device: Any) -> str:
@@ -154,12 +187,20 @@ def build_shard_plan(
     *,
     shard_count: int,
     git_commit: str,
+    dirty_state_digest: str = "",
+    runtime_fingerprint: Mapping[str, Any] | None = None,
     device: str = "cuda",
 ) -> dict[str, Any]:
     """Build a deterministic round-robin plan for all validation training groups."""
 
     shard_count = _validate_shard_count(shard_count)
     git_commit = _validate_git_commit(git_commit)
+    dirty_state_digest = _validate_dirty_state_digest(dirty_state_digest)
+    runtime = _validate_runtime_fingerprint(
+        current_runtime_fingerprint()
+        if runtime_fingerprint is None
+        else runtime_fingerprint
+    )
     device = _validate_device(device)
     if not isinstance(config, Mapping):
         raise ValueError("config must be a mapping")
@@ -172,6 +213,8 @@ def build_shard_plan(
         ),
         "source_config_sha256": _sha256(_source_config(config)),
         "git_commit": git_commit,
+        "dirty_state_digest": dirty_state_digest,
+        "runtime_fingerprint": runtime,
         "device": device,
         "shard_count": shard_count,
         "total_groups": len(groups),
@@ -280,6 +323,8 @@ def _validate_plan_structure(plan: Mapping[str, Any]) -> None:
         ):
             raise ValueError(f"{field} must be 64 lowercase hex")
     _validate_git_commit(plan["git_commit"])
+    _validate_dirty_state_digest(plan["dirty_state_digest"])
+    _validate_runtime_fingerprint(plan["runtime_fingerprint"])
     _validate_device(plan["device"])
     _validate_shard_count(plan["shard_count"])
     for field in ("total_groups", "total_cells"):
@@ -309,11 +354,19 @@ def load_shard_plan(
     *,
     config: Mapping[str, Any],
     git_commit: str,
+    dirty_state_digest: str = "",
+    runtime_fingerprint: Mapping[str, Any] | None = None,
     device: str,
 ) -> dict[str, Any]:
     """Strictly load and validate a plan against its current execution inputs."""
 
     git_commit = _validate_git_commit(git_commit)
+    dirty_state_digest = _validate_dirty_state_digest(dirty_state_digest)
+    runtime = _validate_runtime_fingerprint(
+        current_runtime_fingerprint()
+        if runtime_fingerprint is None
+        else runtime_fingerprint
+    )
     device = _validate_device(device)
     if not isinstance(config, Mapping):
         raise ValueError("config must be a mapping")
@@ -330,7 +383,12 @@ def load_shard_plan(
         raise ValueError("shard plan must be a mapping")
 
     return _validate_plan_mapping(
-        loaded, config=config, git_commit=git_commit, device=device
+        loaded,
+        config=config,
+        git_commit=git_commit,
+        dirty_state_digest=dirty_state_digest,
+        runtime_fingerprint=runtime,
+        device=device,
     )
 
 
@@ -339,11 +397,15 @@ def _validate_plan_mapping(
     *,
     config: Mapping[str, Any],
     git_commit: str,
+    dirty_state_digest: str,
+    runtime_fingerprint: Mapping[str, Any],
     device: str,
 ) -> dict[str, Any]:
     """Validate an in-memory plan with the same strictness as file loading."""
 
     git_commit = _validate_git_commit(git_commit)
+    dirty_state_digest = _validate_dirty_state_digest(dirty_state_digest)
+    runtime = _validate_runtime_fingerprint(runtime_fingerprint)
     device = _validate_device(device)
     if not isinstance(config, Mapping):
         raise ValueError("config must be a mapping")
@@ -361,6 +423,10 @@ def _validate_plan_mapping(
         raise ValueError("source_config_sha256 does not match current config")
     if plan["git_commit"] != git_commit:
         raise ValueError("git_commit does not match requested commit")
+    if plan["dirty_state_digest"] != dirty_state_digest:
+        raise ValueError("dirty_state_digest does not match current worktree")
+    if canonical_json(plan["runtime_fingerprint"]) != canonical_json(runtime):
+        raise ValueError("runtime_fingerprint does not match current runtime")
     if plan["device"] != device:
         raise ValueError("device does not match requested device")
 
@@ -395,22 +461,6 @@ def _validate_plan_mapping(
             if not matches:
                 raise ValueError(f"{field} do not match current training groups")
     return plan
-
-
-def _current_git_commit(repository_root: Path) -> str:
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError("unable to determine current git_commit") from error
-    commit = completed.stdout.strip()
-    if not commit:
-        raise ValueError("unable to determine current git_commit")
-    return commit
 
 
 def _timestamp() -> str:
@@ -528,6 +578,8 @@ def _immutable_marker_fields(
         "plan_sha256": plan["plan_sha256"],
         "source_config_sha256": plan["source_config_sha256"],
         "git_commit": plan["git_commit"],
+        "dirty_state_digest": plan["dirty_state_digest"],
+        "runtime_fingerprint": plan["runtime_fingerprint"],
         "device": plan["device"],
         "shard_index": shard_index,
         "shard_count": plan["shard_count"],
@@ -541,6 +593,8 @@ def _validate_run_directory(
     group: TrainingGroup,
     *,
     git_commit: str,
+    dirty_state_digest: str,
+    runtime_fingerprint: Mapping[str, Any],
     device: str,
 ) -> None:
     missing = sorted(name for name in _RUN_FILES if not (run_dir / name).is_file())
@@ -564,6 +618,20 @@ def _validate_run_directory(
         raise ValueError("run manifest run_id does not match its directory")
     if manifest.get("git_commit") != git_commit:
         raise ValueError("run manifest git_commit does not match shard")
+    if manifest.get("dirty_state_digest") != dirty_state_digest:
+        raise ValueError("run manifest dirty_state_digest does not match shard plan")
+    manifest_runtime = {
+        field: manifest.get(field)
+        for field in ("package_versions", "python", "platform")
+    }
+    try:
+        runtime_matches = canonical_json(manifest_runtime) == canonical_json(
+            runtime_fingerprint
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid run manifest runtime fingerprint") from error
+    if not runtime_matches:
+        raise ValueError("run manifest runtime fingerprint does not match shard plan")
     if type(manifest.get("seed")) is not int or manifest.get("seed") != group.seed:
         raise ValueError("run manifest seed does not match assigned group")
     resolved = manifest.get("config")
@@ -694,6 +762,8 @@ def _validate_marker(
             output_root / run_id,
             assigned_groups[index],
             git_commit=str(immutable["git_commit"]),
+            dirty_state_digest=str(immutable["dirty_state_digest"]),
+            runtime_fingerprint=immutable["runtime_fingerprint"],
             device=str(immutable["device"]),
         )
     unregistered = sorted(set(actual_run_ids) - set(run_ids))
@@ -707,6 +777,8 @@ def _validate_marker(
             output_root / unregistered[0],
             assigned_groups[next_index],
             git_commit=str(immutable["git_commit"]),
+            dirty_state_digest=str(immutable["dirty_state_digest"]),
+            runtime_fingerprint=immutable["runtime_fingerprint"],
             device=str(immutable["device"]),
         )
     return value
@@ -742,15 +814,22 @@ def _execute_shard_locked(
     output_root = Path(output_root)
     if not output_root.is_absolute():
         output_root = repository_root / output_root
-    git_commit = _current_git_commit(repository_root)
+    worktree_identity = git_worktree_identity(repository_root)
+    runtime = current_runtime_fingerprint()
     validated_plan = _validate_plan_mapping(
         plan,
         config=config,
-        git_commit=git_commit,
+        git_commit=worktree_identity["git_commit"],
+        dirty_state_digest=worktree_identity["dirty_state_digest"],
+        runtime_fingerprint=runtime,
         device=requested_device,
     )
     if shard_index < 0 or shard_index >= validated_plan["shard_count"]:
         raise ValueError("shard_index is outside the shard plan")
+    if config.get("require_clean_git") is True and validated_plan[
+        "dirty_state_digest"
+    ]:
+        raise ValueError("require_clean_git requires a clean shard plan and worktree")
     shard = validated_plan["shards"][shard_index]
     immutable = _immutable_marker_fields(validated_plan, shard, shard_index)
     marker_path = output_root / "shard_execution.json"
@@ -787,6 +866,16 @@ def _execute_shard_locked(
     completed_count = len(marker["group_runs"])
     try:
         for group in assigned_groups[completed_count:]:
+            current_identity = git_worktree_identity(repository_root)
+            current_runtime = current_runtime_fingerprint()
+            if canonical_json(current_identity) != canonical_json(worktree_identity):
+                raise ValueError("git worktree identity changed during shard execution")
+            if canonical_json(current_runtime) != canonical_json(runtime):
+                raise ValueError("runtime fingerprint changed during shard execution")
+            if config.get("require_clean_git") is True and current_identity[
+                "dirty_state_digest"
+            ]:
+                raise ValueError("require_clean_git requires a clean worktree")
             report = _run_group(
                 config, group, repository_root, output_root, requested_device
             )
@@ -805,7 +894,9 @@ def _execute_shard_locked(
             _validate_run_directory(
                 output_root / new_run_ids[0],
                 group,
-                git_commit=git_commit,
+                git_commit=worktree_identity["git_commit"],
+                dirty_state_digest=worktree_identity["dirty_state_digest"],
+                runtime_fingerprint=runtime,
                 device=requested_device,
             )
             marker["group_runs"].append(
@@ -1022,8 +1113,14 @@ def preflight_shards(
         plan,
         config=config,
         git_commit=plan.get("git_commit"),
+        dirty_state_digest=plan.get("dirty_state_digest"),
+        runtime_fingerprint=plan.get("runtime_fingerprint"),
         device=plan.get("device"),
     )
+    if config.get("require_clean_git") is True and validated_plan[
+        "dirty_state_digest"
+    ]:
+        raise ValueError("require_clean_git requires clean shard provenance")
     root = Path(shards_root)
     if os.path.lexists(root) and _is_linked_source(root):
         raise ValueError("linked or symlink shards_root is not allowed")
@@ -1167,6 +1264,8 @@ def preflight_shards(
         "plan_sha256": validated_plan["plan_sha256"],
         "source_config_sha256": validated_plan["source_config_sha256"],
         "git_commit": validated_plan["git_commit"],
+        "dirty_state_digest": validated_plan["dirty_state_digest"],
+        "runtime_fingerprint": validated_plan["runtime_fingerprint"],
         "device": validated_plan["device"],
         "total_groups": validated_plan["total_groups"],
         "total_cells": validated_plan["total_cells"],
@@ -1436,6 +1535,9 @@ def merge_shards(
                         "selected_combination_ids"
                     ],
                     "run_ids": promotion["run_ids"],
+                    "git_commit": promotion["git_commit"],
+                    "dirty_state_digest": promotion["dirty_state_digest"],
+                    "runtime_fingerprint": promotion["runtime_fingerprint"],
                 },
             )
             report = validate_artifacts(temporary, config=config_path)

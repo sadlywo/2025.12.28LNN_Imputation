@@ -69,6 +69,7 @@ def _complete_root(
     condition_label: str = "cell-1",
     condition_id: str | None = None,
     scaler_training_ids: list[str] | None = None,
+    dirty_digest: str = "",
 ) -> tuple[Path, Path, dict]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     root = tmp_path / "results"
@@ -174,6 +175,7 @@ def _complete_root(
         split_hash=split_hash,
         scaler_hash=scaler_hash,
         git_commit="a" * 40,
+        dirty_digest=dirty_digest,
     )
     run_dir = root / manifest["run_id"]
     run_dir.mkdir()

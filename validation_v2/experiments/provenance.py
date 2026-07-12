@@ -11,6 +11,7 @@ import os
 import platform as platform_module
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 from typing import Any, Mapping
@@ -95,6 +96,53 @@ def run_id(
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:16]
 
 
+def runtime_fingerprint() -> dict[str, Any]:
+    """Return the canonical package, Python, and platform runtime identity."""
+
+    versions: dict[str, str] = {}
+    for distribution in PACKAGE_DISTRIBUTIONS:
+        try:
+            versions[distribution] = metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            versions[distribution] = "not-installed"
+    return {
+        "package_versions": versions,
+        "python": sys.version.split()[0],
+        "platform": platform_module.platform(),
+    }
+
+
+def git_worktree_identity(repository_root: Path | str) -> dict[str, str]:
+    """Return HEAD and the tracked-worktree digest used by experiment manifests."""
+
+    root = Path(repository_root)
+
+    def git(*arguments: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(root), *arguments],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ValueError("unable to determine git worktree identity") from error
+        return completed.stdout.strip()
+
+    commit = git("rev-parse", "HEAD")
+    if not commit:
+        raise ValueError("unable to determine git worktree identity")
+    dirty_text = git("status", "--porcelain=v1", "--untracked-files=no")
+    return {
+        "git_commit": commit,
+        "dirty_state_digest": (
+            hashlib.sha256(dirty_text.encode("utf-8")).hexdigest()
+            if dirty_text
+            else ""
+        ),
+    }
+
+
 def collect_provenance(
     config: Any,
     seed: int,
@@ -107,12 +155,7 @@ def collect_provenance(
 
     resolved_config = _json_value(config)
     config_json = canonical_json(resolved_config)
-    versions: dict[str, str] = {}
-    for distribution in PACKAGE_DISTRIBUTIONS:
-        try:
-            versions[distribution] = metadata.version(distribution)
-        except metadata.PackageNotFoundError:
-            versions[distribution] = "not-installed"
+    runtime = runtime_fingerprint()
     return {
         "run_id": run_id(
             resolved_config,
@@ -129,9 +172,7 @@ def collect_provenance(
         "scaler_hash": scaler_hash,
         "git_commit": git_commit,
         "dirty_state_digest": dirty_digest,
-        "package_versions": versions,
-        "python": sys.version.split()[0],
-        "platform": platform_module.platform(),
+        **runtime,
     }
 
 

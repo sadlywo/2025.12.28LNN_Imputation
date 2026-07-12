@@ -517,7 +517,14 @@ def test_shard_plan_writes_formal_server_plan_as_one_canonical_json_line(
     assert len(result.stdout.decode("utf-8").splitlines()) == 1
     plan = json.loads(result.stdout)
     assert plan == json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan["schema_version"] == 2
     assert plan["git_commit"] == _git_head()
+    assert isinstance(plan["dirty_state_digest"], str)
+    assert set(plan["runtime_fingerprint"]) == {
+        "package_versions",
+        "python",
+        "platform",
+    }
     assert plan["device"] == "cuda"
     assert plan["shard_count"] == 8
     assert plan["total_groups"] == 175

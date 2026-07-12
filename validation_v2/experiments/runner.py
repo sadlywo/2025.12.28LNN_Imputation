@@ -18,7 +18,6 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-import subprocess
 from typing import Any
 
 import numpy as np
@@ -44,7 +43,11 @@ from validation_v2.experiments.groups import (
     group_execution_config,
 )
 from validation_v2.experiments.matrix import enumerate_matrix
-from validation_v2.experiments.provenance import canonical_json, collect_provenance
+from validation_v2.experiments.provenance import (
+    canonical_json,
+    collect_provenance,
+    git_worktree_identity,
+)
 from validation_v2.experiments.train import resume_run, train_one_run
 from validation_v2.models.baselines import (
     equal_average,
@@ -440,25 +443,6 @@ def _set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(True)
-
-
-def _git_value(
-    arguments: Sequence[str],
-    default: str = "",
-    *,
-    repository_root: Path | None = None,
-) -> str:
-    command = ["git"]
-    if repository_root is not None:
-        command.extend(("-C", str(repository_root)))
-    command.extend(arguments)
-    try:
-        result = subprocess.run(
-            command, capture_output=True, check=True, text=True
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return default
-    return result.stdout.strip()
 
 
 def _record_seed(seed: int, recording_id: str) -> int:
@@ -1020,14 +1004,9 @@ def run_smoke(
         ),
         batch_size,
     )
-    commit = _git_value(
-        ("rev-parse", "HEAD"), repository_root=repository_root
-    )
-    dirty_text = _git_value(
-        ("status", "--porcelain=v1", "--untracked-files=no"),
-        repository_root=repository_root,
-    )
-    dirty_digest = _sha256_bytes(dirty_text.encode("utf-8")) if dirty_text else ""
+    worktree_identity = git_worktree_identity(repository_root)
+    commit = worktree_identity["git_commit"]
+    dirty_digest = worktree_identity["dirty_state_digest"]
     run_dirs: list[Path] = []
     scenarios = {row["recording_id"]: row["scenario"] for row in manifest_rows}
     for model_name in models:

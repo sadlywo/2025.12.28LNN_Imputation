@@ -18,7 +18,11 @@ import yaml
 from validation_v2.experiments import sharding
 from validation_v2.experiments.groups import enumerate_training_groups
 from validation_v2.experiments.matrix import enumerate_matrix
-from validation_v2.experiments.provenance import canonical_json
+from validation_v2.experiments.provenance import (
+    canonical_json,
+    git_worktree_identity,
+    runtime_fingerprint,
+)
 from validation_v2.experiments.sharding import (
     SHARD_SCHEMA_VERSION,
     build_shard_plan,
@@ -35,6 +39,12 @@ preflight_shards = getattr(sharding, "preflight_shards", None)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GIT_COMMIT = "c34d4cb7d766393bd31f210cc33ad7ae8d30e59b"
+DIRTY_DIGEST = "d" * 64
+RUNTIME_FINGERPRINT = {
+    "package_versions": {"validation-v2-test": "1.0"},
+    "python": "3.9.19",
+    "platform": "test-platform",
+}
 
 
 def _server_config() -> dict[str, Any]:
@@ -94,6 +104,7 @@ def _mini_config() -> dict[str, Any]:
         topologies=["point"],
         rates=[0.3],
         irregular_cases=[],
+        require_clean_git=False,
     )
     return config
 
@@ -105,8 +116,14 @@ def _head() -> str:
 
 
 def _execution_plan(config: Mapping[str, Any], shard_count: int = 2) -> dict[str, Any]:
+    identity = git_worktree_identity(REPO_ROOT)
     return build_shard_plan(
-        config, shard_count=shard_count, git_commit=_head(), device="cpu"
+        config,
+        shard_count=shard_count,
+        git_commit=identity["git_commit"],
+        dirty_state_digest=identity["dirty_state_digest"],
+        runtime_fingerprint=runtime_fingerprint(),
+        device="cpu",
     )
 
 
@@ -116,6 +133,8 @@ def _write_complete_run(
     group: Any,
     *,
     git_commit: str | None = None,
+    dirty_state_digest: str | None = None,
+    runtime: Mapping[str, Any] | None = None,
     device: str = "cpu",
 ) -> None:
     run_dir = output_root / run_id
@@ -125,6 +144,12 @@ def _write_complete_run(
     manifest = {
         "run_id": run_id,
         "git_commit": git_commit or _head(),
+        "dirty_state_digest": (
+            git_worktree_identity(REPO_ROOT)["dirty_state_digest"]
+            if dirty_state_digest is None
+            else dirty_state_digest
+        ),
+        **dict(runtime or runtime_fingerprint()),
         "seed": group.seed,
         "config": {
             "model": group.training_model,
@@ -178,11 +203,21 @@ def _merge_config() -> dict[str, Any]:
     return config
 
 
-def _write_merge_fixture(tmp_path: Path) -> tuple[dict[str, Any], Path, Path, Path]:
+def _write_merge_fixture(
+    tmp_path: Path,
+    *,
+    require_clean_git: bool = True,
+    dirty_state_digest: str = "",
+) -> tuple[dict[str, Any], Path, Path, Path]:
     config = _merge_config()
+    config["require_clean_git"] = require_clean_git
     commit = "a" * 40
     plan = build_shard_plan(
-        config, shard_count=2, git_commit=commit, device="cpu"
+        config,
+        shard_count=2,
+        git_commit=commit,
+        dirty_state_digest=dirty_state_digest,
+        device="cpu",
     )
     shards_root = tmp_path / "shards"
     shards_root.mkdir(parents=True)
@@ -194,6 +229,7 @@ def _write_merge_fixture(tmp_path: Path) -> tuple[dict[str, Any], Path, Path, Pa
             tmp_path / f"generated-{shard_index}",
             protocol=group.protocol,
             condition_id=group.combination_ids[0],
+            dirty_digest=dirty_state_digest,
         )
         shard_root = shards_root / f"{shard_index:03d}"
         generated.replace(shard_root)
@@ -205,6 +241,8 @@ def _write_merge_fixture(tmp_path: Path) -> tuple[dict[str, Any], Path, Path, Pa
                 "plan_sha256": plan["plan_sha256"],
                 "source_config_sha256": plan["source_config_sha256"],
                 "git_commit": commit,
+                "dirty_state_digest": plan["dirty_state_digest"],
+                "runtime_fingerprint": plan["runtime_fingerprint"],
                 "device": "cpu",
                 "shard_index": shard_index,
                 "shard_count": 2,
@@ -250,6 +288,8 @@ def test_preflight_is_read_only_and_returns_complete_promotion_manifest(
     assert promotion["plan_sha256"] == plan["plan_sha256"]
     assert promotion["source_config_sha256"] == plan["source_config_sha256"]
     assert promotion["git_commit"] == plan["git_commit"]
+    assert promotion["dirty_state_digest"] == plan["dirty_state_digest"]
+    assert promotion["runtime_fingerprint"] == plan["runtime_fingerprint"]
     assert promotion["device"] == "cpu"
     assert promotion["total_groups"] == 2
     assert promotion["total_cells"] == 2
@@ -293,9 +333,12 @@ def test_merge_two_formal_shards_validates_and_preserves_sources(tmp_path: Path)
             for cell in enumerate_matrix(
                 yaml.safe_load(config_path.read_text(encoding="utf-8"))
             )
-        ],
-        "run_ids": sorted(report["run_ids"]),
-    }
+            ],
+            "run_ids": sorted(report["run_ids"]),
+            "git_commit": plan["git_commit"],
+            "dirty_state_digest": plan["dirty_state_digest"],
+            "runtime_fingerprint": plan["runtime_fingerprint"],
+        }
     assert not list(tmp_path.glob(".merged-merge-*"))
     assert not list(tmp_path.glob(".failed-merge-*"))
 
@@ -455,6 +498,8 @@ def test_merge_failure_keeps_no_final_and_preserves_failed_diagnostics(
         ("plan_sha256", "0" * 64),
         ("source_config_sha256", "0" * 64),
         ("git_commit", "wrong"),
+        ("dirty_state_digest", "f" * 64),
+        ("runtime_fingerprint", {**RUNTIME_FINGERPRINT, "python": "3.10.14"}),
         ("device", "cuda"),
         ("shard_index", 1),
         ("shard_count", 3),
@@ -503,6 +548,62 @@ def test_preflight_rejects_foreign_shard_and_run_content(
             plan=plan,
             shards_root=shards_root,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dirty_state_digest", "f" * 64, "dirty_state_digest"),
+        ("package_versions", {"different": "9"}, "runtime"),
+        ("python", "3.10.14", "runtime"),
+        ("platform", "different-platform", "runtime"),
+    ],
+)
+def test_preflight_rejects_run_manifest_dirty_or_runtime_mismatch(
+    tmp_path: Path, field: str, value: Any, message: str
+):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    marker = json.loads(
+        (shards_root / "000" / "shard_execution.json").read_text(encoding="utf-8")
+    )
+    manifest_path = shards_root / "000" / marker["run_ids"][0] / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = value
+    _write_raw(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match=message):
+        preflight_shards(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            plan=plan,
+            shards_root=shards_root,
+        )
+
+
+def test_formal_preflight_rejects_consistently_dirty_shards(tmp_path: Path):
+    plan, shards_root, config_path, _ = _write_merge_fixture(
+        tmp_path, require_clean_git=True, dirty_state_digest=DIRTY_DIGEST
+    )
+
+    with pytest.raises(ValueError, match="require_clean_git|clean"):
+        preflight_shards(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            plan=plan,
+            shards_root=shards_root,
+        )
+
+
+def test_smoke_preflight_accepts_consistently_dirty_shards(tmp_path: Path):
+    plan, shards_root, config_path, _ = _write_merge_fixture(
+        tmp_path, require_clean_git=False, dirty_state_digest=DIRTY_DIGEST
+    )
+
+    promotion = preflight_shards(
+        yaml.safe_load(config_path.read_text(encoding="utf-8")),
+        plan=plan,
+        shards_root=shards_root,
+    )
+
+    assert promotion["dirty_state_digest"] == DIRTY_DIGEST
 
 
 @pytest.mark.parametrize("mutation", ["missing-marker", "missing-run", "extra-asset"])
@@ -963,8 +1064,14 @@ def test_server_plan_has_expected_counts_and_round_robin_assignment():
 
     plan = _plan()
 
-    assert SHARD_SCHEMA_VERSION == 1
-    assert plan["schema_version"] == 1
+    assert SHARD_SCHEMA_VERSION == 2
+    assert plan["schema_version"] == 2
+    assert plan["dirty_state_digest"] == ""
+    assert set(plan["runtime_fingerprint"]) == {
+        "package_versions",
+        "python",
+        "platform",
+    }
     assert plan["shard_count"] == 8
     assert plan["total_groups"] == 175
     assert plan["total_cells"] == 4095
@@ -988,6 +1095,38 @@ def test_server_plan_has_expected_counts_and_round_robin_assignment():
             for index in expected
             for combination_id in groups[index].combination_ids
         ]
+
+
+def test_plan_hash_binds_dirty_state_and_runtime_fingerprint():
+    plan = build_shard_plan(
+        _server_config(),
+        shard_count=2,
+        git_commit=GIT_COMMIT,
+        dirty_state_digest=DIRTY_DIGEST,
+        runtime_fingerprint=RUNTIME_FINGERPRINT,
+        device="cuda",
+    )
+
+    assert plan["dirty_state_digest"] == DIRTY_DIGEST
+    assert plan["runtime_fingerprint"] == RUNTIME_FINGERPRINT
+    for field, value in (
+        ("dirty_state_digest", "e" * 64),
+        (
+            "runtime_fingerprint",
+            {**RUNTIME_FINGERPRINT, "python": "3.10.14"},
+        ),
+    ):
+        changed = copy.deepcopy(plan)
+        changed[field] = value
+        assert changed["plan_sha256"] != hashlib.sha256(
+            canonical_json(
+                {
+                    key: item
+                    for key, item in changed.items()
+                    if key not in {"created_at", "plan_sha256"}
+                }
+            ).encode("utf-8")
+        ).hexdigest()
 
 
 def test_group_ids_are_stable_across_shard_counts():
@@ -1355,6 +1494,41 @@ def test_load_round_trip_accepts_json_and_yaml(tmp_path: Path):
     ) == plan
 
 
+@pytest.mark.parametrize(
+    ("dirty_state_digest", "runtime", "message"),
+    [
+        ("e" * 64, RUNTIME_FINGERPRINT, "dirty_state_digest"),
+        (DIRTY_DIGEST, {**RUNTIME_FINGERPRINT, "python": "3.10.14"}, "runtime"),
+    ],
+)
+def test_load_rejects_current_dirty_or_runtime_mismatch(
+    tmp_path: Path,
+    dirty_state_digest: str,
+    runtime: Mapping[str, Any],
+    message: str,
+):
+    config = _server_config()
+    plan = build_shard_plan(
+        config,
+        shard_count=2,
+        git_commit=GIT_COMMIT,
+        dirty_state_digest=DIRTY_DIGEST,
+        runtime_fingerprint=RUNTIME_FINGERPRINT,
+        device="cuda",
+    )
+    path = write_shard_plan(tmp_path / "plan.json", plan)
+
+    with pytest.raises(ValueError, match=message):
+        load_shard_plan(
+            path,
+            config=config,
+            git_commit=GIT_COMMIT,
+            dirty_state_digest=dirty_state_digest,
+            runtime_fingerprint=runtime,
+            device="cuda",
+        )
+
+
 def test_load_rejects_non_mapping_and_invalid_yaml(tmp_path: Path):
     path = tmp_path / "plan.yaml"
     path.write_text("- not\n- a\n- mapping\n", encoding="utf-8")
@@ -1403,7 +1577,7 @@ def test_load_rejects_yaml_implicit_date_as_invalid_plan_value(tmp_path: Path):
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("schema_version", 2, "schema_version"),
+        ("schema_version", 3, "schema_version"),
         ("source_config_sha256", "0" * 64, "source_config_sha256"),
         ("git_commit", "different", "git_commit"),
         ("device", "cpu", "device"),
@@ -1578,6 +1752,8 @@ def test_two_shards_execute_only_disjoint_exhaustive_assigned_groups(
             for group_id in report["group_ids"]
         ]
         assert report["completed_at"].endswith("Z")
+        assert report["dirty_state_digest"] == plan["dirty_state_digest"]
+        assert report["runtime_fingerprint"] == plan["runtime_fingerprint"]
         assert json.loads(
             (tmp_path / f"shard-{index}" / "shard_execution.json").read_text(
                 encoding="utf-8"
@@ -1586,6 +1762,90 @@ def test_two_shards_execute_only_disjoint_exhaustive_assigned_groups(
         assert not (tmp_path / f"shard-{index}" / "matrix_execution.json").exists()
         assert not (tmp_path / f"shard-{index}" / "smoke_summary.json").exists()
         assert not (tmp_path / f"shard-{index}" / "summary.json").exists()
+
+
+@pytest.mark.parametrize("changed_component", ["identity", "runtime"])
+def test_execute_stops_before_next_group_when_provenance_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_component: str,
+):
+    config = _mini_config()
+    plan = _execution_plan(config, shard_count=1)
+    root = tmp_path / "shard"
+    calls: list[str] = []
+    monkeypatch.setattr(sharding, "_run_group", _fake_group_runner(calls))
+    identity = {
+        "git_commit": plan["git_commit"],
+        "dirty_state_digest": plan["dirty_state_digest"],
+    }
+    runtime = plan["runtime_fingerprint"]
+    identity_calls = 0
+    runtime_calls = 0
+
+    def changing_identity(_root: Path) -> Mapping[str, str]:
+        nonlocal identity_calls
+        identity_calls += 1
+        if changed_component == "identity" and identity_calls >= 3:
+            return {**identity, "dirty_state_digest": "f" * 64}
+        return identity
+
+    def changing_runtime() -> Mapping[str, Any]:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        if changed_component == "runtime" and runtime_calls >= 3:
+            return {**runtime, "python": "3.10.14"}
+        return runtime
+
+    monkeypatch.setattr(sharding, "git_worktree_identity", changing_identity)
+    monkeypatch.setattr(sharding, "current_runtime_fingerprint", changing_runtime)
+
+    with pytest.raises(ValueError, match="changed"):
+        execute_shard(
+            config,
+            plan=plan,
+            shard_index=0,
+            repository_root=REPO_ROOT,
+            output_root=root,
+            requested_device="cpu",
+        )
+
+    marker = json.loads((root / "shard_execution.json").read_text(encoding="utf-8"))
+    assert marker["status"] == "failed"
+    assert len(calls) == 1
+
+
+def test_formal_execute_rejects_dirty_plan_before_running_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _mini_config()
+    config["require_clean_git"] = True
+    identity = {"git_commit": _head(), "dirty_state_digest": DIRTY_DIGEST}
+    runtime = runtime_fingerprint()
+    plan = build_shard_plan(
+        config,
+        shard_count=1,
+        git_commit=identity["git_commit"],
+        dirty_state_digest=DIRTY_DIGEST,
+        runtime_fingerprint=runtime,
+        device="cpu",
+    )
+    monkeypatch.setattr(sharding, "git_worktree_identity", lambda _root: identity)
+    monkeypatch.setattr(sharding, "current_runtime_fingerprint", lambda: runtime)
+    calls: list[str] = []
+    monkeypatch.setattr(sharding, "_run_group", _fake_group_runner(calls))
+
+    with pytest.raises(ValueError, match="require_clean_git|clean"):
+        execute_shard(
+            config,
+            plan=plan,
+            shard_index=0,
+            repository_root=REPO_ROOT,
+            output_root=tmp_path / "shard",
+            requested_device="cpu",
+        )
+
+    assert calls == []
 
 
 def test_completed_shard_rerun_is_idempotent_without_group_calls(

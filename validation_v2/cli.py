@@ -6,13 +6,16 @@ import argparse
 from collections.abc import Mapping, Sequence
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 import yaml
 
 from validation_v2.experiments.matrix import enumerate_matrix
-from validation_v2.experiments.provenance import canonical_json
+from validation_v2.experiments.provenance import (
+    canonical_json,
+    git_worktree_identity,
+    runtime_fingerprint,
+)
 from validation_v2.experiments.runner import run_matrix, run_smoke
 from validation_v2.experiments.sharding import (
     build_shard_plan,
@@ -51,22 +54,6 @@ def _mapping_config(value: str) -> Mapping[str, object]:
 
 def _repository_path(value: Path) -> Path:
     return value if value.is_absolute() else _REPOSITORY_ROOT / value
-
-
-def _current_git_commit() -> str:
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(_REPOSITORY_ROOT), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError("unable to determine current git_commit") from error
-    commit = completed.stdout.strip()
-    if not commit:
-        raise ValueError("unable to determine current git_commit")
-    return commit
 
 
 def _write_matrix(config_path: str, *, dry_run: bool) -> None:
@@ -176,13 +163,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "shard-plan":
             config = _mapping_config(arguments.config)
-            git_commit = _current_git_commit()
+            identity = git_worktree_identity(_REPOSITORY_ROOT)
+            runtime = runtime_fingerprint()
             output = _repository_path(arguments.output)
             if os.path.lexists(output):
                 plan = load_shard_plan(
                     output,
                     config=config,
-                    git_commit=git_commit,
+                    git_commit=identity["git_commit"],
+                    dirty_state_digest=identity["dirty_state_digest"],
+                    runtime_fingerprint=runtime,
                     device=arguments.device,
                 )
                 if plan["shard_count"] != arguments.shard_count:
@@ -193,7 +183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plan = build_shard_plan(
                     config,
                     shard_count=arguments.shard_count,
-                    git_commit=git_commit,
+                    git_commit=identity["git_commit"],
+                    dirty_state_digest=identity["dirty_state_digest"],
+                    runtime_fingerprint=runtime,
                     device=arguments.device,
                 )
                 write_shard_plan(output, plan)
@@ -201,10 +193,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "shard":
             config = _mapping_config(arguments.config)
+            identity = git_worktree_identity(_REPOSITORY_ROOT)
+            runtime = runtime_fingerprint()
             plan = load_shard_plan(
                 _repository_path(arguments.plan),
                 config=config,
-                git_commit=_current_git_commit(),
+                git_commit=identity["git_commit"],
+                dirty_state_digest=identity["dirty_state_digest"],
+                runtime_fingerprint=runtime,
                 device=arguments.device,
             )
             report = execute_shard(
