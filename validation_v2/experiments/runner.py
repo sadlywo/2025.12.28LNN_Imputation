@@ -39,6 +39,10 @@ from validation_v2.data.windows import make_windows
 from validation_v2.evaluation.reconstruction import reconstruction_metrics
 from validation_v2.evaluation.trajectory import measured_attitude_full_record_diagnostic
 from validation_v2.experiments.evaluate import evaluate_test_once
+from validation_v2.experiments.groups import (
+    enumerate_training_groups,
+    group_execution_config,
+)
 from validation_v2.experiments.matrix import enumerate_matrix
 from validation_v2.experiments.provenance import canonical_json, collect_provenance
 from validation_v2.experiments.train import resume_run, train_one_run
@@ -1137,27 +1141,13 @@ def run_matrix(
     if not destination.is_absolute():
         destination = repository_root / destination
     destination.mkdir(parents=True, exist_ok=True)
-    objective = str(config.get("objective", "reconstruction_only"))
-    gate_models = {
-        "hybrid", "equal_average", "fixed_gate_0", "fixed_gate_0.5", "fixed_gate_1"
-    }
-    grouped: dict[tuple[str, int, str, str], list[dict[str, Any]]] = {}
-    for cell in selected:
-        model_name = str(cell["model"])
-        training_family = "hybrid_shared" if model_name in gate_models else model_name
-        key = (
-            training_family,
-            int(cell["seed"]),
-            str(cell["protocol"]),
-            objective,
-        )
-        grouped.setdefault(key, []).append(cell)
+    groups = enumerate_training_groups(config, combinations=selected)
     marker_path = destination / "matrix_execution.json"
     marker: dict[str, Any] = {
         "partial": partial,
         "selected_cells": len(selected),
         "total_cells": len(combinations),
-        "training_groups": len(grouped),
+        "training_groups": len(groups),
         "grouping_key": ["training_family", "seed", "protocol", "objective"],
         "selected_combination_ids": [cell["combination_id"] for cell in selected],
         "status": "started",
@@ -1165,21 +1155,8 @@ def run_matrix(
     marker_path.write_text(canonical_json(marker) + "\n", encoding="utf-8")
     reports: list[Mapping[str, Any]] = []
     try:
-        for (training_family, seed, protocol, _), cells in sorted(grouped.items()):
-            training_model = (
-                "hybrid" if training_family == "hybrid_shared" else training_family
-            )
-            reported_models = sorted({str(cell["model"]) for cell in cells})
-            group_config = dict(config)
-            group_config.update(
-                models=[training_model],
-                seeds=[seed],
-                protocols=[protocol],
-                _execution_conditions=cells,
-                _skip_descriptive_summary=True,
-                _training_family=training_family,
-                _reported_models=reported_models,
-            )
+        for group in groups:
+            group_config = group_execution_config(config, group)
             reports.append(
                 run_smoke(
                     group_config,
