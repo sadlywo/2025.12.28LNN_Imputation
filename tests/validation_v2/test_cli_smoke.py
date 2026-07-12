@@ -3,6 +3,7 @@ import hashlib
 import os
 from collections.abc import Iterator
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,96 @@ def _git_head() -> str:
     return subprocess.check_output(
         ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], text=True
     ).strip()
+
+
+def _server_runbook() -> str:
+    return (REPO_ROOT / "docs" / "validation_v2_server_runbook.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_server_runbook_pins_the_offline_linux_shard_plan_contract():
+    runbook = _server_runbook()
+    bash_blocks = re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)
+    turbo_blocks = [block for block in bash_blocks if "source /etc/network_turbo" in block]
+
+    for variable in (
+        "REPO", "CONFIG", "AUDIT_DIR", "PLAN", "SHARDS_ROOT", "FINAL_ROOT",
+    ):
+        assert f"export {variable}=" in runbook
+    assert 'export CONFIG="/root/' in runbook
+    assert "CUBLAS_WORKSPACE_CONFIG=:4096:8" in runbook
+    assert "conda activate /root/miniconda3/envs/pinn_imu" in runbook
+    assert "shard-plan" in runbook
+    assert "--shard-count 8" in runbook
+    assert "total_groups" in runbook and "175" in runbook
+    assert "total_cells" in runbook and "4095" in runbook
+    assert "shard_count" in runbook and "8" in runbook
+    assert "test_linux_rename_noreplace_survives_real_directory_race" in runbook
+    assert "1 passed" in runbook and "skipped" in runbook
+    assert "python -m pytest" in runbook
+    assert turbo_blocks
+    assert all(
+        any(token in block for token in ("git clone", "git fetch", "pip install"))
+        and "validation_v2.cli shard" not in block
+        for block in turbo_blocks
+    )
+    assert "training requires no network" in runbook.lower()
+
+
+def test_server_runbook_stages_independent_shards_two_four_eight_and_resumes_safely():
+    runbook = _server_runbook()
+
+    assert "2 -> 4 -> 8" in runbook
+    assert "shard 000" in runbook and "shard 001" in runbook
+    assert "002 003" in runbook and "004 005 006 007" in runbook
+    assert '"$SHARDS_ROOT/$SHARD"' in runbook
+    assert '"$AUDIT_DIR/shard-$SHARD.log"' in runbook
+    assert "nohup" in runbook and "--device cuda" in runbook
+    assert "python -m validation_v2.cli shard" in runbook
+    assert "completed groups/hour" in runbook
+    assert ">= 50%" in runbook and "< 80%" in runbook
+    assert "GPU memory" in runbook and "failed" in runbook
+    assert "shard_execution.json" in runbook
+    assert '"completed"' in runbook and '"started"' in runbook and '"failed"' in runbook
+    assert "60" in runbook and "nvidia-smi" in runbook and "pgrep" in runbook
+    assert ".shard_execution.lock" in runbook
+    assert "full assigned group list" in runbook
+    assert "stdout" in runbook and "final JSON" in runbook
+    assert "same commit, config, plan, device, shard index, and shard root" in runbook
+    assert "new formal campaign" in runbook
+
+
+def test_server_runbook_never_mixes_legacy_or_replacement_roots_and_strictly_publishes():
+    runbook = _server_runbook()
+
+    assert "fcf81f8" in runbook
+    assert "kill -INT" in runbook and "pgrep" in runbook
+    assert "Never delete the old root" in runbook
+    assert "must not be mixed" in runbook
+    assert "test ! -e \"$SHARDS_ROOT\"" in runbook
+    assert "test ! -e \"$FINAL_ROOT\"" in runbook
+    assert "python -m validation_v2.cli merge-shards" in runbook
+    assert "python -m validation_v2.experiments.validate_artifacts" in runbook
+    assert 'report["status"] == "complete"' in runbook
+    assert "python -m validation_v2.cli summarize" in runbook
+    assert "--required-seeds 2026 2027 2028 2029 2030" in runbook
+    for artifact in (
+        "matrix_execution.json", "validation_report.json", "summary.csv",
+        "summary.json", "run.json", "history.json", "best.pt",
+        "checkpoint.json", "test_evaluation.json", "per_record_metrics.csv",
+    ):
+        assert artifact in runbook
+
+
+def test_server_runbook_contains_no_ssh_secret_and_checks_secret_leakage():
+    runbook = _server_runbook()
+
+    assert "<enter interactively" not in runbook
+    assert "connect.westb.seetacloud.com" not in runbook
+    assert not re.search(r"(?i)(password|passwd)\s*[:=]\s*\S+", runbook)
+    assert "git grep" in runbook
+    assert "AUDIT_DIR" in runbook and "grep -R" in runbook
 
 
 def test_shard_plan_writes_formal_server_plan_as_one_canonical_json_line(
