@@ -13,29 +13,57 @@ must not be mixed, copied together, used as merge inputs, or summarized as one
 campaign. Never delete the old root: it is immutable diagnostic evidence. Give
 the new campaign a different, commit-qualified root.
 
-Stopping the old process is optional. If it is still consuming the GPU, first
-confirm that exactly one PID is both the legacy matrix command and the
-`fcf81f8` root, then send `SIGINT` and wait for that PID to disappear. Do not run
-this block when the match is absent or ambiguous.
+Stopping the old process is optional. The block below discovers every process
+that is both the legacy matrix command and the `fcf81f8` root. Zero matches is a
+no-op, exactly one is eligible for `SIGINT`, and multiple matches abort without
+choosing a PID.
 
 ```bash
+set -Eeuo pipefail
 export OLD_ROOT="/root/autodl-tmp/2025.12.28LNN_Imputation/results/validation_v2/server_full-fcf81f8"
 test -d "$OLD_ROOT"
 # Legacy command signature: python -m validation_v2.cli matrix
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
-mapfile -t OLD_MATCHES < <(pgrep -af '[p]ython -m validation_v2\.cli matrix' | grep 'fcf81f8')
+mapfile -t OLD_MATCHES < <(
+  pgrep -af '[p]ython -m validation_v2\.cli matrix' | grep 'fcf81f8' || true
+)
 printf '%s\n' "${OLD_MATCHES[@]}"
-test "${#OLD_MATCHES[@]}" -eq 1
-export OLD_PID="${OLD_MATCHES[0]%% *}"
-ps -p "$OLD_PID" -o pid=,lstart=,cmd=
-kill -INT "$OLD_PID"
-timeout 300 tail --pid="$OLD_PID" -f /dev/null
-! kill -0 "$OLD_PID" 2>/dev/null
+case "${#OLD_MATCHES[@]}" in
+  0)
+    echo 'no legacy process; not sending a signal'
+    ;;
+  1)
+    export OLD_PID="${OLD_MATCHES[0]%% *}"
+    [[ "$OLD_PID" =~ ^[0-9]+$ ]] || {
+      echo "non-numeric legacy PID: $OLD_PID" >&2
+      exit 2
+    }
+    ps -ww -p "$OLD_PID" -o pid=,lstart=,args=
+    kill -INT "$OLD_PID"
+    OLD_STOP_DEADLINE=$((SECONDS + 300))
+    while kill -0 "$OLD_PID" 2>/dev/null; do
+      if test "$SECONDS" -ge "$OLD_STOP_DEADLINE"; then
+        echo "legacy PID did not stop after SIGINT: $OLD_PID" >&2
+        exit 3
+      fi
+      ps -ww -p "$OLD_PID" -o pid=,etime=,args=
+      sleep 5
+    done
+    echo "legacy PID stopped: $OLD_PID"
+    ;;
+  *)
+    printf 'ambiguous legacy matches; refusing to choose a PID:\n%s\n' \
+      "${OLD_MATCHES[*]}" >&2
+    exit 2
+    ;;
+esac
 test -d "$OLD_ROOT"
 ```
 
-`timeout` makes failure to stop explicit. Escalate manually after inspection;
-do not use `kill -9`, remove the old root, or point a shard at it.
+Zero matches is a safe no-op. One strictly numeric PID is shown with its full
+command before `SIGINT`; multiple matches abort without choosing one. The
+bounded conditional wait makes failure to stop explicit. Do not use `kill -9`,
+remove the old root, or point a shard at it.
 
 ## 2. Freeze the validated source without leaking network state
 
@@ -346,6 +374,79 @@ PY
       return 4
     fi
     sleep 10
+  done
+}
+
+wait_all_shards() {
+  local -a shards=("$@")
+  local deadline=$((SECONDS + 86400))
+  while :; do
+    local completed=0 outcome=0
+    local shard marker pid_file pid alive status groups
+    for shard in "${shards[@]}"; do
+      marker="$SHARDS_ROOT/$shard/shard_execution.json"
+      pid_file="$AUDIT_DIR/shard-$shard.pid"
+      pid=missing
+      alive=no
+      status=missing
+      groups=0
+      if [[ -f "$pid_file" && -r "$pid_file" ]]; then
+        read -r pid < "$pid_file"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+          alive=yes
+        fi
+      fi
+      if test -f "$marker"; then
+        read -r status groups < <(python -c \
+          'import json,sys; marker=json.load(open(sys.argv[1])); print(marker["status"], len(marker["group_runs"]))' \
+          "$marker")
+      fi
+      printf '%s shard=%s status=%s group_runs=%s pid=%s alive=%s\n' \
+        "$(date -Is)" "$shard" "$status" "$groups" "$pid" "$alive" \
+        | tee -a "$AUDIT_DIR/wait-all-shards.log"
+      case "$status" in
+        completed)
+          completed=$((completed + 1))
+          ;;
+        failed)
+          cat "$marker" | tee -a "$AUDIT_DIR/wait-all-shards.log" >&2
+          tail -n 50 "$AUDIT_DIR/shard-$shard.log" >&2 || true
+          outcome=2
+          ;;
+        missing|started)
+          if test "$alive" != yes -a "$outcome" -ne 2; then
+            echo "nonterminal shard has no live PID: $shard status=$status pid=$pid" \
+              | tee -a "$AUDIT_DIR/wait-all-shards.log" >&2
+            tail -n 50 "$AUDIT_DIR/shard-$shard.log" >&2 || true
+            outcome=3
+          fi
+          ;;
+        *)
+          echo "invalid shard status: $shard status=$status" \
+            | tee -a "$AUDIT_DIR/wait-all-shards.log" >&2
+          test "$outcome" -eq 2 || outcome=3
+          ;;
+      esac
+    done
+    pgrep -af 'validation_v2\.cli shard' \
+      | tee -a "$AUDIT_DIR/wait-all-shards.log" || true
+    if ! nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+        --format=csv,noheader,nounits \
+        | tee -a "$AUDIT_DIR/wait-all-shards.log"; then
+      echo 'GPU audit command failed' >&2
+      return 3
+    fi
+    case "$outcome" in
+      2) return 2 ;;
+      3) return 3 ;;
+    esac
+    test "$completed" -ne "${#shards[@]}" || return 0
+    if test "$SECONDS" -ge "$deadline"; then
+      echo "all-shard wait timeout: completed=$completed/${#shards[@]}" \
+        | tee -a "$AUDIT_DIR/wait-all-shards.log" >&2
+      return 4
+    fi
+    sleep 60
   done
 }
 
@@ -795,28 +896,11 @@ the same executable 1.5x/1.8x/0.8 assertions. The eight-worker measurement is
 not a pre-launch gate: shards 004..007 already own formal plan directories and
 must reach a terminal marker. On an eight-worker anomaly, do not start another
 campaign or kill a group mid-write; retain diagnostics and wait for safe formal
-completion. Whichever branch was taken, the following condition-based waits
-must finish, then the explicit all-eight assertion must pass before merge.
+completion. Whichever branch was taken, one condition loop must audit all eight
+workers together and return only after every marker is completed.
 
 ```bash
-for SHARD in 000 001 002 003 004 005 006 007; do
-  wait_shard "$SHARD" || exit $?
-done
-python - "$SHARDS_ROOT" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1])
-completed = 0
-for index in range(8):
-    marker_path = root / f"{index:03d}" / "shard_execution.json"
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker["status"] == "completed", (marker_path, marker)
-    completed += 1
-assert completed == 8, completed
-print("all eight shard markers completed")
-PY
+wait_all_shards 000 001 002 003 004 005 006 007 || exit $?
 ```
 
 ## 8. Resume and failure policy
@@ -827,8 +911,27 @@ boundaries, so resume starts after the last completely recorded group. A
 The lock still applies; first prove the old PID is gone.
 
 ```bash
+set -Eeuo pipefail
 export SHARD=003
-! kill -0 "$(cat "$AUDIT_DIR/shard-$SHARD.pid")" 2>/dev/null
+export PID_FILE="$AUDIT_DIR/shard-$SHARD.pid"
+if ! [[ -f "$PID_FILE" && -r "$PID_FILE" ]]; then
+  echo "missing or unreadable shard PID file: $PID_FILE" >&2
+  exit 2
+fi
+read -r OLD_SHARD_PID < "$PID_FILE"
+if ! [[ "$OLD_SHARD_PID" =~ ^[0-9]+$ ]]; then
+  echo "non-numeric shard PID: $OLD_SHARD_PID" >&2
+  exit 2
+fi
+if kill -0 "$OLD_SHARD_PID" 2>/dev/null; then
+  echo "recorded shard PID is still alive; refusing resume: $OLD_SHARD_PID" >&2
+  exit 2
+fi
+if ps -p "$OLD_SHARD_PID" >/dev/null 2>&1; then
+  echo "recorded PID still exists but cannot be signalled: $OLD_SHARD_PID" >&2
+  exit 2
+fi
+echo "recorded shard PID is explicitly absent: $OLD_SHARD_PID"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 /root/miniconda3/envs/pinn_imu/bin/python -m validation_v2.cli shard \
   --config "$CONFIG" --plan "$PLAN" \

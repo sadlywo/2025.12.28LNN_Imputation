@@ -93,7 +93,7 @@ def test_server_runbook_strict_shell_explicitly_propagates_wait_failures():
     ]
     assert wait_calls and all("|| exit $?" in line for line in wait_calls)
     assert queue_calls and all("|| exit $?" in line for line in queue_calls)
-    assert 'wait_shard "$SHARD" || exit $?' in runbook
+    assert "wait_all_shards 000 001 002 003 004 005 006 007 || exit $?" in runbook
     assert not re.search(r"^\s+wait_shard\s+\S+\s*$", runbook, flags=re.MULTILINE)
 
 
@@ -136,6 +136,65 @@ def test_server_runbook_audits_active_marker_pid_process_and_gpu_each_minute():
     assert "tee -a" in audit
     for function in ("wait_shard", "wait_until_groups", "wait_stage_metrics"):
         assert "audit_active" in _runbook_bash_function(runbook, function)
+
+
+def test_server_runbook_waits_for_all_eight_shards_in_one_audited_scan():
+    runbook = _server_runbook()
+    wait_all = _runbook_bash_function(runbook, "wait_all_shards")
+
+    assert 'local -a shards=("$@")' in wait_all
+    assert 'for shard in "${shards[@]}"' in wait_all
+    assert "shard_execution.json" in wait_all
+    assert "group_runs" in wait_all
+    assert "kill -0" in wait_all
+    assert "failed" in wait_all and "return 2" in wait_all
+    assert "missing" in wait_all and "started" in wait_all and "return 3" in wait_all
+    assert "deadline" in wait_all and "return 4" in wait_all
+    assert "sleep 60" in wait_all
+    assert "pgrep -af" in wait_all and "nvidia-smi" in wait_all
+    assert "tee -a" in wait_all
+    assert "wait_all_shards 000 001 002 003 004 005 006 007 || exit $?" in runbook
+    assert not re.search(
+        r"for SHARD in 000 001 002 003 004 005 006 007; do\n\s+wait_shard",
+        runbook,
+    )
+
+
+def test_server_runbook_legacy_stop_handles_zero_one_or_many_matches_safely():
+    runbook = _server_runbook()
+    legacy = next(
+        block for block in re.findall(r"```bash\n(.*?)\n```", runbook, re.DOTALL)
+        if "OLD_ROOT=" in block
+    )
+
+    assert legacy.startswith("set -Eeuo pipefail\n")
+    assert 'case "${#OLD_MATCHES[@]}" in' in legacy
+    assert "0)" in legacy and "no legacy process; not sending a signal" in legacy
+    assert "1)" in legacy and "kill -INT" in legacy
+    assert "*)" in legacy and "exit 2" in legacy
+    assert '[[ "$OLD_PID" =~ ^[0-9]+$ ]]' in legacy
+    assert "ps -ww" in legacy and "while kill -0" in legacy
+    assert legacy.index("1)") < legacy.index("kill -INT") < legacy.index("*)")
+    assert "rm " not in legacy and "rm -" not in legacy
+
+
+def test_server_runbook_resume_proves_the_recorded_pid_is_absent_first():
+    runbook = _server_runbook()
+    resume = next(
+        block for block in re.findall(r"```bash\n(.*?)\n```", runbook, re.DOTALL)
+        if "OLD_SHARD_PID" in block
+    )
+
+    assert '[[ -f "$PID_FILE" && -r "$PID_FILE" ]]' in resume
+    assert 'read -r OLD_SHARD_PID < "$PID_FILE"' in resume
+    assert '[[ "$OLD_SHARD_PID" =~ ^[0-9]+$ ]]' in resume
+    assert 'if kill -0 "$OLD_SHARD_PID"' in resume
+    assert 'ps -p "$OLD_SHARD_PID"' in resume
+    assert "exit 2" in resume
+    assert '! kill -0 "$(cat' not in resume
+    proof_end = resume.index("explicitly absent")
+    rerun = resume.index("python -m validation_v2.cli shard")
+    assert proof_end < rerun
 
 
 def test_server_runbook_rebuilds_commit_scoped_paths_in_the_offline_shell():
@@ -221,7 +280,7 @@ def test_server_runbook_has_executable_staged_gates_and_bounded_fallback_queues(
 
     for function in (
         "launch_shard", "wait_shard", "run_queue", "start_gpu_sampler",
-        "stop_gpu_sampler", "wait_stage_metrics",
+        "stop_gpu_sampler", "wait_stage_metrics", "wait_all_shards",
     ):
         assert re.search(rf"^{function}\(\) \{{", runbook, flags=re.MULTILINE)
     assert runbook.index("launch_shard 000") < runbook.index("launch_shard 001")
@@ -236,9 +295,7 @@ def test_server_runbook_has_executable_staged_gates_and_bounded_fallback_queues(
     assert "run_queue 1 002 003 004 005 006 007" in runbook
     assert "run_queue 2 004 005 006 007" in runbook
     assert "nvidia-smi" in runbook and "tee -a" in runbook and "sleep 10" in runbook
-    assert "for SHARD in 000 001 002 003 004 005 006 007" in runbook
-    assert 'assert marker["status"] == "completed"' in runbook
-    assert 'assert completed == 8' in runbook
+    assert "wait_all_shards 000 001 002 003 004 005 006 007" in runbook
 
 
 def test_server_runbook_pins_the_offline_linux_shard_plan_contract():
