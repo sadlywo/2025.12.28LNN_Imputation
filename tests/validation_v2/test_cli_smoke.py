@@ -63,6 +63,113 @@ def _server_runbook() -> str:
     )
 
 
+def _runbook_python_blocks(runbook: str) -> list[str]:
+    return re.findall(r"<<'PY'\n(.*?)\nPY", runbook, flags=re.DOTALL)
+
+
+def test_server_runbook_rebuilds_commit_scoped_paths_in_the_offline_shell():
+    runbook = _server_runbook()
+    offline = runbook.index("Open a new offline shell")
+    expected_order = (
+        'cd "$REPO"',
+        'export COMMIT="$(git rev-parse HEAD)"',
+        'export PREFLIGHT_DIR=',
+        'export AUDIT_DIR=',
+        'export PLAN=',
+        'export SHARDS_ROOT=',
+        'export FINAL_ROOT=',
+    )
+    positions = []
+    for token in expected_order:
+        match = re.search(re.escape(token), runbook[offline:])
+        assert match is not None, token
+        positions.append(offline + match.start())
+
+    assert positions == sorted(positions)
+    assert all("${COMMIT}" in runbook[position : position + 180] for position in positions[2:])
+
+
+def test_server_runbook_asserts_every_pinned_runtime_version_exactly():
+    runbook = _server_runbook()
+    env_block = next(
+        block for block in _runbook_python_blocks(runbook)
+        if "torch.cuda.is_available" in block
+    )
+
+    assert "import importlib.metadata as md" in env_block
+    assert 'platform.python_version().startswith("3.9.")' in env_block
+    for package, version in {
+        "numpy": "1.26.4",
+        "pandas": "2.3.3",
+        "scipy": "1.13.1",
+        "PyYAML": "6.0.3",
+        "pytest": "8.4.2",
+        "ncps": "1.0.1",
+    }.items():
+        assert f'"{package}": "{version}"' in env_block
+    assert '"torch": "2.3.1+cu121"' in env_block
+    assert "actual == expected" in env_block
+    assert 'torch.__version__ == "2.3.1+cu121"' in env_block
+    assert 'torch.version.cuda == "12.1"' in env_block
+    assert '"4090 D" in torch.cuda.get_device_name(0)' in env_block
+
+
+def test_server_runbook_metrics_code_compiles_and_uses_real_group_durations():
+    runbook = _server_runbook()
+    python_blocks = _runbook_python_blocks(runbook)
+    assert python_blocks
+    for index, block in enumerate(python_blocks):
+        compile(block, f"validation_v2_server_runbook.py:{index}", "exec")
+    metrics_block = next(
+        (block for block in python_blocks if "median_group_seconds" in block), None
+    )
+
+    assert metrics_block is not None
+    assert 'marker["started_at"]' in metrics_block
+    assert 'marker["group_runs"]' in metrics_block
+    assert 'binding["run_ids"][0]' in metrics_block
+    assert '"test_evaluation.json"' in metrics_block
+    assert 'ledger["completed_at"]' in metrics_block
+    assert "completed - previous" in metrics_block
+    assert "previous = completed" in metrics_block
+    assert "statistics.median(durations)" in metrics_block
+    assert "max(" in metrics_block and "peak_gpu_memory_ratio" in metrics_block
+    assert re.search(
+        r"assert\s+.*groups_per_hour.*>=.*groups_per_hour.*\*\s*1\.5",
+        metrics_block,
+    )
+    assert re.search(
+        r"assert\s+.*median_group_seconds.*<.*median_group_seconds.*\*\s*1\.8",
+        metrics_block,
+    )
+    assert re.search(r"assert\s+.*peak_gpu_memory_ratio.*<\s*0\.8", metrics_block)
+
+
+def test_server_runbook_has_executable_staged_gates_and_bounded_fallback_queues():
+    runbook = _server_runbook()
+
+    for function in (
+        "launch_shard", "wait_shard", "run_queue", "start_gpu_sampler",
+        "stop_gpu_sampler", "wait_stage_metrics",
+    ):
+        assert re.search(rf"^{function}\(\) \{{", runbook, flags=re.MULTILINE)
+    assert runbook.index("launch_shard 000") < runbook.index("launch_shard 001")
+    assert "baseline-1worker.json" in runbook
+    assert "stage-2worker-start.txt" in runbook
+    assert "stage-2worker-metrics.json" in runbook
+    assert "stage-4worker-start.txt" in runbook
+    assert "stage-4worker-metrics.json" in runbook
+    assert "stage-8worker-metrics.json" in runbook
+    assert "launch_shard 002" in runbook and "launch_shard 003" in runbook
+    assert all(f"launch_shard {index:03d}" in runbook for index in range(4, 8))
+    assert "run_queue 1 002 003 004 005 006 007" in runbook
+    assert "run_queue 2 004 005 006 007" in runbook
+    assert "nvidia-smi" in runbook and "tee -a" in runbook and "sleep 10" in runbook
+    assert "for SHARD in 000 001 002 003 004 005 006 007" in runbook
+    assert 'assert marker["status"] == "completed"' in runbook
+    assert 'assert completed == 8' in runbook
+
+
 def test_server_runbook_pins_the_offline_linux_shard_plan_contract():
     runbook = _server_runbook()
     bash_blocks = re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)

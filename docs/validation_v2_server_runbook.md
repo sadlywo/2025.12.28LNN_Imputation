@@ -94,7 +94,7 @@ test "$(printf '%s' "$COMMIT" | wc -c)" -eq 40
 git show -s --format='%H %cI %s' "$COMMIT"
 ```
 
-## 3. Activate and verify the pinned Linux/GPU environment
+## 3. Re-enter offline, pin the commit, and verify the runtime
 
 Dependency installation is the final permitted network operation. Skip it when
 the pinned environment is already complete.
@@ -107,28 +107,67 @@ the pinned environment is already complete.
 )
 ```
 
-Open a new offline shell, activate the exact environment, and pin deterministic
-CUDA workspace behavior. Stop on a Python, Torch, CUDA, GPU, or disk failure.
+Open a new offline shell. Re-activate the environment, re-enter the repository,
+and only then derive `COMMIT`. Construct every commit-qualified path after that
+assignment; do not rely on variables inherited from the network shell.
 
 ```bash
 source /root/miniconda3/etc/profile.d/conda.sh
 conda activate /root/miniconda3/envs/pinn_imu
 export REPO="/root/autodl-tmp/2025.12.28LNN_Imputation"
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
 cd "$REPO"
+export COMMIT="$(git rev-parse HEAD)"
+export PREFLIGHT_DIR="/root/autodl-tmp/validation-v2-preflight-${COMMIT}-sharded-v2"
+export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${COMMIT}-sharded-v2"
+export PLAN="$AUDIT_DIR/server-full-8-shards-${COMMIT}.json"
+export SHARDS_ROOT="$REPO/results/validation_v2/server-full-shards-${COMMIT}-sharded-v2"
+export FINAL_ROOT="$REPO/results/validation_v2/server-full-final-${COMMIT}-sharded-v2"
+export CONFIG="/root/autodl-tmp/2025.12.28LNN_Imputation/configs/validation_v2/server_full.yaml"
+export SHARD_LOG_PATTERN="$AUDIT_DIR/shard-NNN.log"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+test "$(printf '%s' "$COMMIT" | wc -c)" -eq 40
+test -z "$(git status --porcelain)"
+test -f "$CONFIG"
+test ! -e "$PREFLIGHT_DIR"
+test ! -e "$AUDIT_DIR"
+test ! -e "$SHARDS_ROOT"
+test ! -e "$FINAL_ROOT"
+mkdir -p "$PREFLIGHT_DIR" "$AUDIT_DIR" "$SHARDS_ROOT"
+printf '%s\n' "$COMMIT" > "$AUDIT_DIR/COMMIT"
+git status --porcelain > "$AUDIT_DIR/git-status-porcelain.txt"
+test ! -s "$AUDIT_DIR/git-status-porcelain.txt"
+```
+
+The following check is intentionally exact. Stop if Python, any dependency,
+Torch's local CUDA build, CUDA availability, or the 4090 D model differs.
+
+```bash
 python - <<'PY'
+import importlib.metadata as md
 import os
 import platform
 import torch
 
+expected = {
+    "numpy": "1.26.4",
+    "pandas": "2.3.3",
+    "scipy": "1.13.1",
+    "PyYAML": "6.0.3",
+    "pytest": "8.4.2",
+    "torch": "2.3.1+cu121",
+    "ncps": "1.0.1",
+}
+actual = {name: md.version(name) for name in expected}
 assert platform.system() == "Linux", platform.system()
+assert platform.python_version().startswith("3.9."), platform.python_version()
 assert os.environ["CONDA_PREFIX"] == "/root/miniconda3/envs/pinn_imu"
 assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+assert actual == expected, (actual, expected)
+assert torch.__version__ == "2.3.1+cu121", torch.__version__
 assert torch.cuda.is_available()
-assert torch.version.cuda is not None
-name = torch.cuda.get_device_name(0)
-assert "4090 D" in name, name
-print(platform.python_version(), torch.__version__, torch.version.cuda, name)
+assert torch.version.cuda == "12.1", torch.version.cuda
+assert "4090 D" in torch.cuda.get_device_name(0), torch.cuda.get_device_name(0)
+print(platform.python_version(), actual, torch.cuda.get_device_name(0))
 PY
 nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used --format=csv
 df -h "$REPO" /root/autodl-tmp
@@ -136,13 +175,9 @@ df -Pk /root/autodl-tmp | awk 'NR==2 { if ($4 < 104857600) exit 1 }'
 ```
 
 Run the real Linux no-replace race separately and require `1 passed`; a
-`skipped` result is a hard stop. Then run the complete suite. `PIPESTATUS`
-preserves pytest's status through `tee`.
+`skipped` result is a hard stop. Then run the complete suite.
 
 ```bash
-export PREFLIGHT_DIR="/root/autodl-tmp/validation-v2-preflight-${COMMIT}"
-test ! -e "$PREFLIGHT_DIR"
-mkdir -p "$PREFLIGHT_DIR"
 test "$(uname -s)" = Linux
 set -o pipefail
 python -m pytest -q \
@@ -153,41 +188,13 @@ grep -F '1 passed' "$PREFLIGHT_DIR/linux-renameat2.txt"
 ! grep -qi 'skipped' "$PREFLIGHT_DIR/linux-renameat2.txt"
 python -m pytest -q | tee "$PREFLIGHT_DIR/pytest-full.txt"
 test "${PIPESTATUS[0]}" -eq 0
-```
-
-## 4. Create one fresh, commit-qualified campaign
-
-Set these exact variables once. `CONFIG` is absolute. Both roots are fresh and
-contain the full commit. If `sharded-v1` was ever used with this commit, choose
-`sharded-v2`; never reuse an old commit, plan, or root.
-
-```bash
-export REPO="/root/autodl-tmp/2025.12.28LNN_Imputation"
-export CONFIG="/root/autodl-tmp/2025.12.28LNN_Imputation/configs/validation_v2/server_full.yaml"
-export COMMIT="$(git -C "$REPO" rev-parse HEAD)"
-export CAMPAIGN="${COMMIT}-sharded-v1"
-export AUDIT_DIR="/root/autodl-tmp/validation-v2-audit-${CAMPAIGN}"
-export PLAN="$AUDIT_DIR/server-full-8-shards-${COMMIT}.json"
-export SHARDS_ROOT="$REPO/results/validation_v2/server-full-shards-${CAMPAIGN}"
-export FINAL_ROOT="$REPO/results/validation_v2/server-full-final-${CAMPAIGN}"
-export SHARD_LOG_PATTERN="$AUDIT_DIR/shard-NNN.log"
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
-cd "$REPO"
-test -f "$CONFIG"
-test -z "$(git status --porcelain)"
-test ! -e "$AUDIT_DIR"
-test ! -e "$SHARDS_ROOT"
-test ! -e "$FINAL_ROOT"
-mkdir -p "$AUDIT_DIR" "$SHARDS_ROOT"
-printf '%s\n' "$COMMIT" > "$AUDIT_DIR/COMMIT"
-git status --porcelain > "$AUDIT_DIR/git-status-porcelain.txt"
-test ! -s "$AUDIT_DIR/git-status-porcelain.txt"
 cp "$PREFLIGHT_DIR/linux-renameat2.txt" "$PREFLIGHT_DIR/pytest-full.txt" "$AUDIT_DIR/"
 ```
 
-Freeze both the ordinary matrix dry-run and the eight-shard plan. The dry-run
-has one header plus 4,095 cells. The plan must say 175 training groups, 4,095
-cells, and 8 shards.
+## 4. Freeze and verify the eight-shard plan
+
+The dry-run has one header plus 4,095 cells. The plan must say 175 training
+groups, 4,095 cells, and 8 shards.
 
 ```bash
 python -m validation_v2.cli matrix --config "$CONFIG" --dry-run \
@@ -202,10 +209,8 @@ assert header["combination_count"] == 4095, header
 assert len(lines) == 4096, len(lines)
 PY
 python -m validation_v2.cli shard-plan \
-  --config "$CONFIG" \
-  --shard-count 8 \
-  --output "$PLAN" \
-  --device cuda | tee "$AUDIT_DIR/shard-plan.stdout.json"
+  --config "$CONFIG" --shard-count 8 --output "$PLAN" --device cuda \
+  | tee "$AUDIT_DIR/shard-plan.stdout.json"
 python - "$PLAN" <<'PY'
 import json
 import sys
@@ -218,217 +223,465 @@ assert len(plan["shards"]) == 8, plan
 PY
 ```
 
-## 5. Launch the two-worker pilot
+## 5. Install the auditable rollout helpers
 
-Each shard has an independent `$SHARDS_ROOT/NNN` root and
-`$AUDIT_DIR/shard-NNN.log`. The `.shard_execution.lock` prevents concurrent
-reuse of one root, but the operator must still use `pgrep` and inspect the root
-before launch. A shard command runs its full assigned group list; it is not a
-one-group command. Training may be quiet. The shard's stdout ends with its final
-JSON report, so redirect both streams to the shard log and do not parse an
-incomplete log as a result.
+Each command runs its shard's full assigned group list, not one group. Each
+shard has an independent `$SHARDS_ROOT/NNN` root and
+`$AUDIT_DIR/shard-NNN.log`. The `.shard_execution.lock` is the final duplicate
+guard, but the operator still checks roots and PIDs before launch. Training can
+be quiet; stdout contains the final JSON only when the shard command returns.
 
-Use this single-shard command after setting `SHARD` to a zero-padded index:
+Define these copy-pasteable Bash functions in the offline shell:
 
 ```bash
-export SHARD=000
-test "$SHARD" = "$(printf '%03d' "$((10#$SHARD))")"
-test ! -e "$SHARDS_ROOT/$SHARD"
-! pgrep -af "validation_v2\.cli shard.*--shard-index $((10#$SHARD))" \
-  | grep -F -- "$PLAN"
-nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-  /root/miniconda3/envs/pinn_imu/bin/python -m validation_v2.cli shard \
-  --config "$CONFIG" \
-  --plan "$PLAN" \
-  --shard-index "$((10#$SHARD))" \
-  --output-root "$SHARDS_ROOT/$SHARD" \
-  --device cuda \
-  > "$AUDIT_DIR/shard-$SHARD.log" 2>&1 &
-echo "$!" > "$AUDIT_DIR/shard-$SHARD.pid"
-```
-
-First launch shard 000 and shard 001 as two workers:
-
-```bash
-for SHARD in 000 001; do
-  test ! -e "$SHARDS_ROOT/$SHARD"
-  ! pgrep -af "validation_v2\.cli shard.*--shard-index $((10#$SHARD))" \
-    | grep -F -- "$PLAN"
+launch_shard() {
+  local shard="$1"
+  local index=$((10#$shard))
+  test "$shard" = "$(printf '%03d' "$index")"
+  test ! -e "$SHARDS_ROOT/$shard"
+  if pgrep -af "validation_v2\.cli shard.*--shard-index $index" \
+      | grep -F -- "$PLAN"; then
+    echo "duplicate shard process: $shard" >&2
+    return 2
+  fi
   nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
     /root/miniconda3/envs/pinn_imu/bin/python -m validation_v2.cli shard \
-    --config "$CONFIG" --plan "$PLAN" \
-    --shard-index "$((10#$SHARD))" \
-    --output-root "$SHARDS_ROOT/$SHARD" --device cuda \
-    > "$AUDIT_DIR/shard-$SHARD.log" 2>&1 &
-  echo "$!" > "$AUDIT_DIR/shard-$SHARD.pid"
-done
-pgrep -af 'validation_v2\.cli shard'
-nvidia-smi --query-compute-apps=pid,used_memory --format=csv
-```
+    --config "$CONFIG" --plan "$PLAN" --shard-index "$index" \
+    --output-root "$SHARDS_ROOT/$shard" --device cuda \
+    > "$AUDIT_DIR/shard-$shard.log" 2>&1 &
+  echo "$!" > "$AUDIT_DIR/shard-$shard.pid"
+}
 
-Watch both markers until each has completed at least one group. The marker's
-`completed_group_ids` is the authoritative group count; a quiet log is not a
-hang.
-
-```bash
-while :; do
-  export READY=0
-  date -Is
-  pgrep -af 'validation_v2\.cli shard' || true
-  nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv
-  for SHARD in 000 001; do
-    export MARKER="$SHARDS_ROOT/$SHARD/shard_execution.json"
-    if test -f "$MARKER"; then
-      python - "$MARKER" <<'PY'
+wait_shard() {
+  local shard="$1"
+  local marker="$SHARDS_ROOT/$shard/shard_execution.json"
+  while :; do
+    if test -f "$marker"; then
+      if STATE="$(python - "$marker" <<'PY'
 import json
 import sys
 
 marker = json.load(open(sys.argv[1], encoding="utf-8"))
-print(marker["status"], len(marker["completed_group_ids"]))
+print(marker["status"], len(marker["group_runs"]))
 if marker["status"] == "failed":
     print(json.dumps(marker, sort_keys=True), file=sys.stderr)
     raise SystemExit(2)
+if marker["status"] == "completed":
+    raise SystemExit(0)
+if marker["status"] != "started":
+    raise SystemExit(3)
+raise SystemExit(4)
 PY
-      test "$?" -ne 2 || exit 2
-      GROUPS="$(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["completed_group_ids"]))' "$MARKER")"
-      test "$GROUPS" -lt 1 || READY=$((READY + 1))
-    else
-      echo "$SHARD waiting-for-marker"
+)"; then
+        printf '%s %s\n' "$(date -Is)" "$shard $STATE" \
+          | tee -a "$AUDIT_DIR/wait-shards.log"
+        return 0
+      else
+        local rc=$?
+        test "$rc" -ne 2 -a "$rc" -ne 3 || return "$rc"
+        local pid
+        pid="$(cat "$AUDIT_DIR/shard-$shard.pid")"
+        if ! kill -0 "$pid" 2>/dev/null; then
+          echo "started marker but shard PID is gone: $shard pid=$pid" \
+            | tee -a "$AUDIT_DIR/wait-shards.log" >&2
+          return 3
+        fi
+      fi
+    elif test -f "$AUDIT_DIR/shard-$shard.pid"; then
+      local pid
+      pid="$(cat "$AUDIT_DIR/shard-$shard.pid")"
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "missing marker and shard PID is gone: $shard pid=$pid" \
+          | tee -a "$AUDIT_DIR/wait-shards.log" >&2
+        return 3
+      fi
     fi
+    {
+      date -Is
+      pgrep -af 'validation_v2\.cli shard' || true
+      nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+        --format=csv,noheader,nounits
+    } | tee -a "$AUDIT_DIR/wait-shards.log"
+    sleep 10
   done
-  test "$READY" -eq 2 && break
-  sleep 60
-done
+}
+
+run_queue() {
+  local max_parallel="$1"
+  shift
+  local -a pending=("$@")
+  local -a active=()
+  while test "${#pending[@]}" -gt 0 -o "${#active[@]}" -gt 0; do
+    while test "${#pending[@]}" -gt 0 -a "${#active[@]}" -lt "$max_parallel"; do
+      local shard="${pending[0]}"
+      pending=("${pending[@]:1}")
+      launch_shard "$shard"
+      active+=("$shard")
+    done
+    local -a next=()
+    for shard in "${active[@]}"; do
+      local marker="$SHARDS_ROOT/$shard/shard_execution.json"
+      if test -f "$marker"; then
+        local state
+        state="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$marker")"
+        if test "$state" = failed; then
+          cat "$marker" >&2
+          return 2
+        fi
+        if test "$state" != completed; then
+          local pid
+          pid="$(cat "$AUDIT_DIR/shard-$shard.pid")"
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "nonterminal marker but shard PID is gone: $shard" >&2
+            return 3
+          fi
+          next+=("$shard")
+        fi
+      else
+        local pid
+        pid="$(cat "$AUDIT_DIR/shard-$shard.pid")"
+        if ! kill -0 "$pid" 2>/dev/null; then
+          echo "missing marker and shard PID is gone: $shard" >&2
+          return 3
+        fi
+        next+=("$shard")
+      fi
+    done
+    active=("${next[@]}")
+    printf '%s max=%s pending=%s active=%s\n' \
+      "$(date -Is)" "$max_parallel" "${pending[*]}" "${active[*]}" \
+      | tee -a "$AUDIT_DIR/queue.log"
+    test "${#pending[@]}" -eq 0 -a "${#active[@]}" -eq 0 || sleep 10
+  done
+}
+
+start_gpu_sampler() {
+  local label="$1"
+  local csv="$AUDIT_DIR/gpu-$label.csv"
+  printf 'timestamp_utc,memory_used_mib,memory_total_mib,utilization_percent\n' > "$csv"
+  (
+    while :; do
+      local timestamp
+      timestamp="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+      nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+        --format=csv,noheader,nounits \
+        | awk -F, -v timestamp="$timestamp" \
+          '{gsub(/ /, ""); print timestamp "," $1 "," $2 "," $3}' \
+        | tee -a "$csv"
+      sleep 10
+    done
+  ) &
+  echo "$!" > "$AUDIT_DIR/gpu-$label.pid"
+}
+
+stop_gpu_sampler() {
+  local label="$1"
+  local pid
+  pid="$(cat "$AUDIT_DIR/gpu-$label.pid")"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+wait_until_groups() {
+  local shard="$1"
+  local required="$2"
+  local marker="$SHARDS_ROOT/$shard/shard_execution.json"
+  while :; do
+    if test -f "$marker"; then
+      local status groups
+      read -r status groups < <(python - "$marker" <<'PY'
+import json
+import sys
+
+marker = json.load(open(sys.argv[1], encoding="utf-8"))
+print(marker["status"], len(marker["group_runs"]))
+PY
+)
+      if test "$status" = failed; then
+        cat "$marker" >&2
+        return 2
+      fi
+      test "$groups" -lt "$required" || return 0
+    fi
+    {
+      date -Is
+      echo "waiting shard=$shard required_groups=$required"
+      nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+        --format=csv,noheader,nounits
+    } | tee -a "$AUDIT_DIR/baseline-monitor.log"
+    sleep 10
+  done
+}
 ```
 
-Before the pilot, put a same-commit/config/device one-worker reference in the
-audit record as `ONE_WORKER_GROUPS_PER_HOUR` and
-`ONE_WORKER_MEDIAN_GROUP_SECONDS`. If no trustworthy reference exists, retain
-two workers and do not scale. After each pilot shard completes at least one
-group, record aggregate completed groups/hour, median seconds per completed
-group, peak GPU memory, and any failed marker. Scale only if all are true:
-
-- aggregate throughput improvement is >= 50% over the one-worker reference;
-- single-group median elapsed-time growth is < 80% over the reference;
-- GPU memory remains < 80% of total; and
-- neither marker nor log reports `failed`, CUDA OOM, or another error.
-
-If any gate fails, keep the lower worker count. Do not change seeds, epochs,
-config, plan, device, or batch size inside this campaign.
-
-This snapshot reports the required aggregate completed groups/hour and the
-median elapsed seconds per completed group from marker time. Keep the periodic
-samples above in the audit log so the first transition for each group is
-available rather than inferred later.
+Install one audit helper that computes real, ordered group durations. For each
+shard, the first duration is the first run ledger's completion minus
+`marker.started_at`; later durations are adjacent
+`test_evaluation.completed_at` differences in `marker.group_runs` order. GPU
+peak is the maximum observed CSV sample, not the last sample or a cumulative
+average. Its `groups_per_hour` field is the aggregate completed groups/hour for
+the stage window. A not-yet-large-enough window exits 4; a failed marker exits
+2; a gate assertion exits nonzero after writing the metrics JSON.
 
 ```bash
-python - "$SHARDS_ROOT" <<'PY'
+cat > "$AUDIT_DIR/collect_stage_metrics.py" <<'PY'
+import argparse
+import csv
 from datetime import datetime
 import json
-import pathlib
+from pathlib import Path
 import statistics
-import sys
 
-root = pathlib.Path(sys.argv[1])
-counts = []
-seconds_per_group = []
-starts = []
-finishes = []
-for shard in ("000", "001"):
-    marker_path = root / shard / "shard_execution.json"
-    marker = json.loads(marker_path.read_text())
-    assert marker["status"] != "failed", marker
-    count = len(marker["completed_group_ids"])
-    assert count >= 1, marker
-    started = datetime.fromisoformat(marker["started_at"]).timestamp()
-    finished = marker_path.stat().st_mtime
-    starts.append(started)
-    finishes.append(finished)
-    counts.append(count)
-    seconds_per_group.append((finished - started) / count)
-hours = (max(finishes) - min(starts)) / 3600
-print("aggregate completed groups/hour", sum(counts) / hours)
-print("single-group median elapsed seconds", statistics.median(seconds_per_group))
+
+def timestamp(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--shards-root", type=Path, required=True)
+parser.add_argument("--indices", nargs="+", required=True)
+parser.add_argument("--stage-start", required=True)
+parser.add_argument("--gpu-csv", type=Path, required=True)
+parser.add_argument("--minimum-groups", type=int, required=True)
+parser.add_argument("--output", type=Path, required=True)
+parser.add_argument("--baseline", type=Path)
+args = parser.parse_args()
+
+stage_start = timestamp(args.stage_start)
+durations = []
+completion_times = []
+marker_statuses = {}
+for shard in args.indices:
+    marker_path = args.shards_root / shard / "shard_execution.json"
+    if not marker_path.is_file():
+        raise SystemExit(4)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker_statuses[shard] = marker["status"]
+    if marker["status"] == "failed":
+        print(json.dumps(marker, sort_keys=True))
+        raise SystemExit(2)
+    assert marker["status"] in {"started", "completed"}, marker
+    previous = timestamp(marker["started_at"])
+    for binding in marker["group_runs"]:
+        run_id = binding["run_ids"][0]
+        ledger_path = args.shards_root / shard / run_id / "test_evaluation.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        completed = timestamp(ledger["completed_at"])
+        duration = (completed - previous).total_seconds()
+        assert duration > 0, (shard, run_id, duration)
+        previous = completed
+        if completed >= stage_start:
+            durations.append(duration)
+            completion_times.append(completed)
+
+if len(durations) < args.minimum_groups:
+    print(f"waiting: {len(durations)}/{args.minimum_groups} new groups")
+    raise SystemExit(4)
+
+with args.gpu_csv.open(newline="", encoding="utf-8") as handle:
+    samples = list(csv.DictReader(handle))
+assert samples, "GPU sampler produced no rows"
+used_samples = [float(row["memory_used_mib"]) for row in samples]
+total_samples = [float(row["memory_total_mib"]) for row in samples]
+peak_used = max(used_samples)
+peak_gpu_memory_ratio = max(
+    used / total for used, total in zip(used_samples, total_samples)
+)
+elapsed_hours = (max(completion_times) - stage_start).total_seconds() / 3600
+assert elapsed_hours > 0, elapsed_hours
+metrics = {
+    "stage_start": stage_start.isoformat(),
+    "indices": args.indices,
+    "marker_statuses": marker_statuses,
+    "new_group_count": len(durations),
+    "group_durations_seconds": durations,
+    "groups_per_hour": len(durations) / elapsed_hours,
+    "median_group_seconds": statistics.median(durations),
+    "peak_gpu_memory_mib": peak_used,
+    "peak_gpu_memory_ratio": peak_gpu_memory_ratio,
+}
+baseline = None
+if args.baseline:
+    baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+    metrics["baseline"] = str(args.baseline)
+    metrics["gate_passed"] = (
+        metrics["groups_per_hour"] >= baseline["groups_per_hour"] * 1.5
+        and metrics["median_group_seconds"] < baseline["median_group_seconds"] * 1.8
+        and metrics["peak_gpu_memory_ratio"] < 0.8
+    )
+else:
+    metrics["gate_passed"] = metrics["peak_gpu_memory_ratio"] < 0.8
+args.output.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
+print(json.dumps(metrics, sort_keys=True))
+if baseline:
+    assert metrics["groups_per_hour"] >= baseline["groups_per_hour"] * 1.5
+    assert metrics["median_group_seconds"] < baseline["median_group_seconds"] * 1.8
+assert metrics["peak_gpu_memory_ratio"] < 0.8
 PY
-nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits \
-  | awk -F, '{ used=$1+0; total=$2+0; print "GPU memory", used "/" total; if (used/total >= 0.80) exit 1 }'
+
+wait_stage_metrics() {
+  local label="$1"
+  local stage_start="$2"
+  local baseline="$3"
+  local output="$4"
+  local minimum_groups="$5"
+  shift 5
+  while :; do
+    local -a command=(
+      /root/miniconda3/envs/pinn_imu/bin/python "$AUDIT_DIR/collect_stage_metrics.py"
+      --shards-root "$SHARDS_ROOT" --indices "$@" --stage-start "$stage_start"
+      --gpu-csv "$AUDIT_DIR/gpu-$label.csv" --minimum-groups "$minimum_groups"
+      --output "$output"
+    )
+    test -z "$baseline" || command+=(--baseline "$baseline")
+    local rc
+    if "${command[@]}" 2>&1 | tee -a "$AUDIT_DIR/gate-$label.log"; then
+      rc=0
+    else
+      rc="${PIPESTATUS[0]}"
+    fi
+    test "$rc" -ne 0 || return 0
+    test "$rc" -eq 4 || return "$rc"
+    {
+      date -Is
+      pgrep -af 'validation_v2\.cli shard' || true
+      nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
+        --format=csv,noheader,nounits
+    } | tee -a "$AUDIT_DIR/gate-$label.log"
+    sleep 10
+  done
+}
 ```
 
-## 6. Scale in stages: 2 -> 4 -> 8
+## 6. Establish the executable one-worker baseline
 
-Only after the two-worker gate passes, launch `002 003`. Re-measure the same
-throughput, per-group median, GPU memory, and failure gates. Only if the
-four-worker gate passes, launch `004 005 006 007`. Otherwise keep the lower
-worker count and let its commands finish their full assigned groups.
+Start only shard 000. Wait for two completed `group_runs` when possible (the
+minimum is explicitly two here), then compute and save the real duration
+sequence and baseline JSON. Shard 000 continues its full assignment afterward.
 
 ```bash
-# Run once with STAGE="002 003", then only after approval with
-# STAGE="004 005 006 007".
-export STAGE="002 003"
-for SHARD in $STAGE; do
-  test ! -e "$SHARDS_ROOT/$SHARD"
-  ! pgrep -af "validation_v2\.cli shard.*--shard-index $((10#$SHARD))" \
-    | grep -F -- "$PLAN"
-  nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-    /root/miniconda3/envs/pinn_imu/bin/python -m validation_v2.cli shard \
-    --config "$CONFIG" --plan "$PLAN" \
-    --shard-index "$((10#$SHARD))" \
-    --output-root "$SHARDS_ROOT/$SHARD" --device cuda \
-    > "$AUDIT_DIR/shard-$SHARD.log" 2>&1 &
-  echo "$!" > "$AUDIT_DIR/shard-$SHARD.pid"
+start_gpu_sampler baseline-1worker
+launch_shard 000
+wait_until_groups 000 2
+BASELINE_START="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["started_at"])' \
+  "$SHARDS_ROOT/000/shard_execution.json")"
+wait_stage_metrics baseline-1worker "$BASELINE_START" "" \
+  "$AUDIT_DIR/baseline-1worker.json" 2 000
+stop_gpu_sampler baseline-1worker
+```
+
+## 7. Execute the 2 -> 4 -> 8 rollout and its fallback queues
+
+The two-worker stage starts when shard 001 is launched while shard 000 keeps
+running. The UTC stage start, 10-second GPU samples, gate log, and metrics JSON
+are all retained. The gate waits for at least two new ledger completions after
+the stage start and actually asserts throughput >= 1.5x the one-worker
+baseline, median group time < 1.8x baseline, peak memory < 80%, and no failed
+marker. In percentage terms, throughput improvement must be >= 50%, median
+group-time growth must be < 80%, and GPU memory must remain < 80%.
+
+If the two-worker gate fails only its performance/resource assertions, let 000
+and 001 finish, then run 002..007 serially with `MAX_PARALLEL=1`. A failed shard
+marker is not a performance fallback and exits immediately.
+
+```bash
+date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-2worker-start.txt"
+STAGE2_START="$(cat "$AUDIT_DIR/stage-2worker-start.txt")"
+start_gpu_sampler stage-2worker
+launch_shard 001
+if wait_stage_metrics stage-2worker "$STAGE2_START" \
+    "$AUDIT_DIR/baseline-1worker.json" \
+    "$AUDIT_DIR/stage-2worker-metrics.json" 2 000 001; then
+  STAGE2_RC=0
+else
+  STAGE2_RC=$?
+fi
+stop_gpu_sampler stage-2worker
+test "$STAGE2_RC" -ne 2 || exit 2
+
+if test "$STAGE2_RC" -ne 0; then
+  echo 'two-worker gate failed; finish 000/001, then MAX_PARALLEL=1' \
+    | tee -a "$AUDIT_DIR/rollout.log"
+  wait_shard 000
+  wait_shard 001
+  run_queue 1 002 003 004 005 006 007
+else
+  date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-4worker-start.txt"
+  STAGE4_START="$(cat "$AUDIT_DIR/stage-4worker-start.txt")"
+  start_gpu_sampler stage-4worker
+  launch_shard 002
+  launch_shard 003
+  if wait_stage_metrics stage-4worker "$STAGE4_START" \
+      "$AUDIT_DIR/stage-2worker-metrics.json" \
+      "$AUDIT_DIR/stage-4worker-metrics.json" 2 000 001 002 003; then
+    STAGE4_RC=0
+  else
+    STAGE4_RC=$?
+  fi
+  stop_gpu_sampler stage-4worker
+  test "$STAGE4_RC" -ne 2 || exit 2
+
+  if test "$STAGE4_RC" -ne 0; then
+    echo 'four-worker gate failed; finish 000..003, then MAX_PARALLEL=2' \
+      | tee -a "$AUDIT_DIR/rollout.log"
+    wait_shard 000
+    wait_shard 001
+    wait_shard 002
+    wait_shard 003
+    run_queue 2 004 005 006 007
+  else
+    date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-8worker-start.txt"
+    STAGE8_START="$(cat "$AUDIT_DIR/stage-8worker-start.txt")"
+    start_gpu_sampler stage-8worker
+    launch_shard 004
+    launch_shard 005
+    launch_shard 006
+    launch_shard 007
+    if wait_stage_metrics stage-8worker "$STAGE8_START" \
+        "$AUDIT_DIR/stage-4worker-metrics.json" \
+        "$AUDIT_DIR/stage-8worker-metrics.json" 2 \
+        000 001 002 003 004 005 006 007; then
+      STAGE8_RC=0
+    else
+      STAGE8_RC=$?
+    fi
+    stop_gpu_sampler stage-8worker
+    test "$STAGE8_RC" -ne 2 || exit 2
+    if test "$STAGE8_RC" -ne 0; then
+      echo 'eight-worker resource/performance anomaly: launch no new campaign; diagnose; do not kill a group mid-write' \
+        | tee -a "$AUDIT_DIR/rollout.log"
+    fi
+  fi
+fi
+```
+
+The four-worker gate uses the last stable two-worker metrics as its baseline and
+the same executable 1.5x/1.8x/0.8 assertions. The eight-worker measurement is
+not a pre-launch gate: shards 004..007 already own formal plan directories and
+must reach a terminal marker. On an eight-worker anomaly, do not start another
+campaign or kill a group mid-write; retain diagnostics and wait for safe formal
+completion. Whichever branch was taken, the following condition-based waits
+must finish, then the explicit all-eight assertion must pass before merge.
+
+```bash
+for SHARD in 000 001 002 003 004 005 006 007; do
+  wait_shard "$SHARD"
 done
-```
-
-## 7. Wait by marker state, not by elapsed time
-
-After all eight shards have been launched, use this condition-based loop. It
-reads every `shard_execution.json`: `"completed"` counts as done,
-`"started"` or a missing marker continues waiting, and `"failed"` prints the
-marker and exits immediately. Every 60 seconds it prints marker progress,
-processes, and GPU state, so this is not an infinite blind sleep.
-
-```bash
-while :; do
-  if python - "$SHARDS_ROOT" <<'PY'
+python - "$SHARDS_ROOT" <<'PY'
 import json
-import pathlib
+from pathlib import Path
 import sys
 
-root = pathlib.Path(sys.argv[1])
+root = Path(sys.argv[1])
 completed = 0
-progress = []
 for index in range(8):
     marker_path = root / f"{index:03d}" / "shard_execution.json"
-    if not marker_path.is_file():
-        progress.append((f"{index:03d}", "waiting", 0))
-        continue
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    status = marker.get("status")
-    groups = len(marker.get("completed_group_ids", []))
-    progress.append((f"{index:03d}", status, groups))
-    if status == "failed":
-        print(json.dumps(marker, sort_keys=True), file=sys.stderr)
-        raise SystemExit(2)
-    if status == "completed":
-        completed += 1
-    elif status != "started":
-        print(f"invalid status in {marker_path}: {status!r}", file=sys.stderr)
-        raise SystemExit(3)
-print(f"completed_shards={completed}/8 progress={progress}")
-raise SystemExit(0 if completed == 8 else 1)
+    assert marker["status"] == "completed", (marker_path, marker)
+    completed += 1
+assert completed == 8, completed
+print("all eight shard markers completed")
 PY
-  then
-    STATUS=0
-  else
-    STATUS=$?
-  fi
-  test "$STATUS" -ne 2 -a "$STATUS" -ne 3 || exit "$STATUS"
-  test "$STATUS" -eq 0 && break
-  date -Is
-  pgrep -af 'validation_v2\.cli shard' || true
-  nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv
-  sleep 60
-done
 ```
 
 ## 8. Resume and failure policy
