@@ -253,7 +253,11 @@ def test_server_runbook_waits_for_all_eight_shards_in_one_audited_scan():
     assert "failed" in wait_all and "return 2" in wait_all
     assert "missing" in wait_all and "started" in wait_all and "return 3" in wait_all
     assert "deadline" in wait_all and "return 4" in wait_all
-    assert "sleep 60" in wait_all
+    poll_default = re.search(
+        r"ALL_SHARDS_WAIT_POLL_SECONDS:-([0-9]+)", wait_all
+    )
+    assert poll_default is not None and int(poll_default.group(1)) == 60
+    assert 'sleep "$poll_seconds"' in wait_all
     assert "pgrep -af" in wait_all and "nvidia-smi" in wait_all
     assert "tee -a" in wait_all
     assert "wait_all_shards 000 001 002 003 004 005 006 007 || exit $?" in runbook
@@ -384,6 +388,206 @@ def test_server_runbook_metrics_code_compiles_and_uses_real_group_durations():
     assert re.search(r"assert\s+.*peak_gpu_memory_ratio.*<\s*0\.8", metrics_block)
 
 
+def _write_stage_metrics_fixture(
+    tmp_path: Path, completions_by_shard: dict[str, list[str]]
+) -> tuple[Path, Path, Path]:
+    shards_root = tmp_path / "shards"
+    for shard, completions in completions_by_shard.items():
+        shard_root = shards_root / shard
+        shard_root.mkdir(parents=True)
+        group_runs = []
+        for index, completed_at in enumerate(completions):
+            run_id = f"{shard}-run-{index}"
+            run_root = shard_root / run_id
+            run_root.mkdir()
+            (run_root / "test_evaluation.json").write_text(
+                json.dumps({"completed_at": completed_at}), encoding="utf-8"
+            )
+            group_runs.append({"run_ids": [run_id]})
+        (shard_root / "shard_execution.json").write_text(
+            json.dumps(
+                {
+                    "status": "started",
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "group_runs": group_runs,
+                }
+            ),
+            encoding="utf-8",
+        )
+    gpu_csv = tmp_path / "gpu.csv"
+    gpu_csv.write_text(
+        "timestamp_utc,memory_used_mib,memory_total_mib,utilization_percent\n"
+        "2026-01-01T01:00:00+00:00,100,1000,50\n",
+        encoding="utf-8",
+    )
+    metrics_script = tmp_path / "collect_stage_metrics.py"
+    metrics_script.write_text(
+        next(
+            block
+            for block in _runbook_python_blocks(_server_runbook())
+            if "median_group_seconds" in block
+        ),
+        encoding="utf-8",
+    )
+    return shards_root, gpu_csv, metrics_script
+
+
+def _run_stage_metrics(
+    tmp_path: Path,
+    completions_by_shard: dict[str, list[str]],
+    *,
+    marker_statuses=None,
+) -> subprocess.CompletedProcess[str]:
+    shards_root, gpu_csv, metrics_script = _write_stage_metrics_fixture(
+        tmp_path, completions_by_shard
+    )
+    for shard, status in (marker_statuses or {}).items():
+        marker_path = shards_root / shard / "shard_execution.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["status"] = status
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            str(metrics_script),
+            "--shards-root",
+            str(shards_root),
+            "--indices",
+            *completions_by_shard,
+            "--stage-start",
+            "2026-01-01T01:00:00+00:00",
+            "--gpu-csv",
+            str(gpu_csv),
+            "--minimum-groups",
+            "2",
+            "--output",
+            str(tmp_path / "metrics.json"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_server_runbook_stage_gate_rejects_aggregate_progress_from_one_shard(
+    tmp_path: Path,
+):
+    result = _run_stage_metrics(
+        tmp_path,
+        {
+            "000": [
+                "2026-01-01T01:01:00+00:00",
+                "2026-01-01T01:02:00+00:00",
+            ],
+            "001": ["2026-01-01T00:30:00+00:00"],
+        },
+    )
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert "001" in result.stdout
+
+
+def test_server_runbook_stage_metrics_report_each_active_shards_new_groups(
+    tmp_path: Path,
+):
+    result = _run_stage_metrics(
+        tmp_path,
+        {
+            "000": ["2026-01-01T01:01:00+00:00"],
+            "001": ["2026-01-01T01:02:00+00:00"],
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    metrics = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["per_shard_new_groups"] == {"000": 1, "001": 1}
+
+
+def test_server_runbook_stage_gate_fails_fast_if_completed_shard_cannot_contribute(
+    tmp_path: Path,
+):
+    result = _run_stage_metrics(
+        tmp_path,
+        {
+            "000": ["2026-01-01T00:30:00+00:00"],
+            "001": ["2026-01-01T01:02:00+00:00"],
+        },
+        marker_statuses={"000": "completed"},
+    )
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "cannot contribute" in result.stdout
+
+
+def test_server_runbook_full_waits_have_multi_day_total_and_idle_timeouts(
+    tmp_path: Path,
+):
+    runbook = _server_runbook()
+    wait_shard = _runbook_bash_function(runbook, "wait_shard")
+    wait_all = _runbook_bash_function(runbook, "wait_all_shards")
+
+    shard_default = int(
+        re.search(r"SHARD_WAIT_MAX_SECONDS:-([0-9]+)", wait_shard).group(1)
+    )
+    all_default = int(
+        re.search(r"ALL_SHARDS_WAIT_MAX_SECONDS:-([0-9]+)", wait_all).group(1)
+    )
+    assert shard_default >= 5 * 24 * 60 * 60
+    assert all_default >= 10 * 24 * 60 * 60
+
+    root = tmp_path.as_posix()
+    result = _run_bash(tmp_path, f'''set -Eeuo pipefail
+wait_shard() {{
+{wait_shard}
+}}
+audit_active() {{ return 0; }}
+python() {{ printf 'started 0\\n'; return 4; }}
+export SHARDS_ROOT="{root}/shards"
+export AUDIT_DIR="{root}/audit"
+export SHARD_WAIT_MAX_SECONDS=100
+export SHARD_WAIT_MAX_IDLE_SECONDS=1
+export SHARD_WAIT_POLL_SECONDS=0.1
+mkdir -p "$SHARDS_ROOT/000" "$AUDIT_DIR"
+printf '{{"status":"started","group_runs":[]}}\\n' > "$SHARDS_ROOT/000/shard_execution.json"
+printf '%s\\n' "$$" > "$AUDIT_DIR/shard-000.pid"
+: > "$AUDIT_DIR/shard-000.log"
+if wait_shard 000; then rc=0; else rc=$?; fi
+test "$rc" -eq 4
+export SHARD_WAIT_MAX_SECONDS=1
+export SHARD_WAIT_MAX_IDLE_SECONDS=100
+if wait_shard 000; then rc=0; else rc=$?; fi
+test "$rc" -eq 4
+''', timeout=5)
+
+    assert result.returncode == 0, result.stderr
+
+    all_result = _run_bash(tmp_path, f'''set -Eeuo pipefail
+wait_all_shards() {{
+{wait_all}
+}}
+python() {{ printf 'started 0\\n'; }}
+pgrep() {{ return 1; }}
+nvidia-smi() {{ printf '100, 1000, 50\\n'; }}
+export SHARDS_ROOT="{root}/all-shards"
+export AUDIT_DIR="{root}/all-audit"
+export ALL_SHARDS_WAIT_MAX_SECONDS=100
+export ALL_SHARDS_WAIT_MAX_IDLE_SECONDS=1
+export ALL_SHARDS_WAIT_POLL_SECONDS=0.1
+mkdir -p "$SHARDS_ROOT/000" "$AUDIT_DIR"
+printf '{{"status":"started","group_runs":[]}}\\n' > "$SHARDS_ROOT/000/shard_execution.json"
+printf '%s\\n' "$$" > "$AUDIT_DIR/shard-000.pid"
+: > "$AUDIT_DIR/shard-000.log"
+if wait_all_shards 000; then rc=0; else rc=$?; fi
+test "$rc" -eq 4
+export ALL_SHARDS_WAIT_MAX_SECONDS=1
+export ALL_SHARDS_WAIT_MAX_IDLE_SECONDS=100
+if wait_all_shards 000; then rc=0; else rc=$?; fi
+test "$rc" -eq 4
+''', timeout=5)
+
+    assert all_result.returncode == 0, all_result.stderr
+
+
 def test_server_runbook_has_executable_staged_gates_and_bounded_fallback_queues():
     runbook = _server_runbook()
 
@@ -447,7 +651,7 @@ def test_server_runbook_stages_independent_shards_two_four_eight_and_resumes_saf
     assert "nohup" in runbook and "--device cuda" in runbook
     assert "python -m validation_v2.cli shard" in runbook
     assert "completed groups/hour" in runbook
-    assert ">= 50%" in runbook and "< 80%" in runbook
+    assert re.search(r">=\s*50%", runbook) and re.search(r"<\s*80%", runbook)
     assert "GPU memory" in runbook and "failed" in runbook
     assert "shard_execution.json" in runbook
     assert '"completed"' in runbook and '"started"' in runbook and '"failed"' in runbook

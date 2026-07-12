@@ -281,6 +281,14 @@ be quiet; stdout contains the final JSON only when the shard command returns.
 
 Define these copy-pasteable Bash functions in the offline shell:
 
+`wait_until_groups` and `wait_stage_metrics` are four-hour rollout-sampling
+waits. They are deliberately separate from formal completion waits:
+`wait_shard` defaults to a seven-day total deadline and a six-hour no-progress
+deadline, while `wait_all_shards` defaults to fourteen days total and six hours
+without any new completed group. Override the corresponding
+`SHARD_WAIT_*`/`ALL_SHARDS_WAIT_*` variables only with a recorded operational
+reason; a healthy 25-hour shard must not be treated as a timeout.
+
 ```bash
 audit_active() {
   local now last=0 stamp="$AUDIT_DIR/.last-60s-audit"
@@ -381,9 +389,21 @@ launch_shard() {
 wait_shard() {
   local shard="$1"
   local marker="$SHARDS_ROOT/$shard/shard_execution.json"
-  local deadline=$((SECONDS + 14400))
+  local max_seconds="${SHARD_WAIT_MAX_SECONDS:-604800}"
+  local max_idle_seconds="${SHARD_WAIT_MAX_IDLE_SECONDS:-21600}"
+  local poll_seconds="${SHARD_WAIT_POLL_SECONDS:-60}"
+  if ! [[ "$max_seconds" =~ ^[1-9][0-9]*$ \
+      && "$max_idle_seconds" =~ ^[1-9][0-9]*$ \
+      && "$poll_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo 'invalid full-shard wait timeout/idle/poll settings' >&2
+    return 2
+  fi
+  local deadline=$((SECONDS + max_seconds))
+  local last_progress="$SECONDS"
+  local last_groups=-1
   while :; do
     audit_active "$shard" || return $?
+    local groups=0
     if test -f "$marker"; then
       if STATE="$(python - "$marker" <<'PY'
 import json
@@ -418,6 +438,11 @@ PY
             | tee -a "$AUDIT_DIR/wait-shards.log" >&2
           return 3
         fi
+        groups="${STATE##* }"
+        if ! [[ "$groups" =~ ^[0-9]+$ ]]; then
+          echo "invalid group count while waiting for shard: $shard state=$STATE" >&2
+          return 3
+        fi
       fi
     elif test -f "$AUDIT_DIR/shard-$shard.pid"; then
       local pid
@@ -433,20 +458,40 @@ PY
       tail -n 50 "$AUDIT_DIR/shard-$shard.log" >&2 || true
       return 3
     fi
+    if test "$groups" -ne "$last_groups"; then
+      last_groups="$groups"
+      last_progress="$SECONDS"
+    fi
     if test "$SECONDS" -ge "$deadline"; then
-      echo "wait_shard timeout after 14400 seconds: $shard" >&2
+      echo "full-shard total timeout: shard=$shard SHARD_WAIT_MAX_SECONDS=$max_seconds" >&2
       tail -n 50 "$AUDIT_DIR/shard-$shard.log" >&2 || true
       return 4
     fi
-    sleep 10
+    if test "$((SECONDS - last_progress))" -ge "$max_idle_seconds"; then
+      echo "full-shard no-progress timeout: shard=$shard SHARD_WAIT_MAX_IDLE_SECONDS=$max_idle_seconds groups=$groups" >&2
+      tail -n 50 "$AUDIT_DIR/shard-$shard.log" >&2 || true
+      return 4
+    fi
+    sleep "$poll_seconds"
   done
 }
 
 wait_all_shards() {
   local -a shards=("$@")
-  local deadline=$((SECONDS + 86400))
+  local max_seconds="${ALL_SHARDS_WAIT_MAX_SECONDS:-1209600}"
+  local max_idle_seconds="${ALL_SHARDS_WAIT_MAX_IDLE_SECONDS:-21600}"
+  local poll_seconds="${ALL_SHARDS_WAIT_POLL_SECONDS:-60}"
+  if ! [[ "$max_seconds" =~ ^[1-9][0-9]*$ \
+      && "$max_idle_seconds" =~ ^[1-9][0-9]*$ \
+      && "$poll_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo 'invalid all-shard wait timeout/idle/poll settings' >&2
+    return 2
+  fi
+  local deadline=$((SECONDS + max_seconds))
+  local last_progress="$SECONDS"
+  local last_total_groups=-1
   while :; do
-    local completed=0 outcome=0
+    local completed=0 outcome=0 total_groups=0
     local shard marker pid_file pid alive status groups
     for shard in "${shards[@]}"; do
       marker="$SHARDS_ROOT/$shard/shard_execution.json"
@@ -465,6 +510,13 @@ wait_all_shards() {
         read -r status groups < <(python -c \
           'import json,sys; marker=json.load(open(sys.argv[1])); print(marker["status"], len(marker["group_runs"]))' \
           "$marker")
+      fi
+      if [[ "$groups" =~ ^[0-9]+$ ]]; then
+        total_groups=$((total_groups + groups))
+      else
+        echo "invalid group count: $shard groups=$groups" \
+          | tee -a "$AUDIT_DIR/wait-all-shards.log" >&2
+        outcome=3
       fi
       printf '%s shard=%s status=%s group_runs=%s pid=%s alive=%s\n' \
         "$(date -Is)" "$shard" "$status" "$groups" "$pid" "$alive" \
@@ -506,12 +558,21 @@ wait_all_shards() {
       3) return 3 ;;
     esac
     test "$completed" -ne "${#shards[@]}" || return 0
+    if test "$total_groups" -ne "$last_total_groups"; then
+      last_total_groups="$total_groups"
+      last_progress="$SECONDS"
+    fi
     if test "$SECONDS" -ge "$deadline"; then
-      echo "all-shard wait timeout: completed=$completed/${#shards[@]}" \
+      echo "all-shard total timeout: completed=$completed/${#shards[@]} groups=$total_groups ALL_SHARDS_WAIT_MAX_SECONDS=$max_seconds" \
         | tee -a "$AUDIT_DIR/wait-all-shards.log" >&2
       return 4
     fi
-    sleep 60
+    if test "$((SECONDS - last_progress))" -ge "$max_idle_seconds"; then
+      echo "all-shard no-progress timeout: completed=$completed/${#shards[@]} groups=$total_groups ALL_SHARDS_WAIT_MAX_IDLE_SECONDS=$max_idle_seconds" \
+        | tee -a "$AUDIT_DIR/wait-all-shards.log" >&2
+      return 4
+    fi
+    sleep "$poll_seconds"
   done
 }
 
@@ -792,9 +853,14 @@ shard, the first duration is the first run ledger's completion minus
 `test_evaluation.completed_at` differences in `marker.group_runs` order. GPU
 peak is the maximum observed CSV sample, not the last sample or a cumulative
 average. Its `groups_per_hour` field is the aggregate completed groups/hour for
-the stage window. A not-yet-large-enough window exits 4; a failed marker exits
-2; a performance/resource assertion exits 10 after writing the metrics JSON.
-Only exit 10 is eligible for a lower-concurrency fallback.
+the stage window, while `per_shard_new_groups` records the same window by active
+shard. Every listed active shard must contribute at least one completion after
+`stage_start`; aggregate progress from a subset cannot open the gate. A still
+active but not-yet-large-enough window exits 4 and continues sampling. A shard
+that already completed without contributing after `stage_start` makes the
+stage contract impossible and exits 3 immediately. A failed marker exits 2; a
+performance/resource assertion exits 10 after writing the metrics JSON. Only
+exit 10 is eligible for a lower-concurrency fallback.
 
 ```bash
 cat > "$AUDIT_DIR/collect_stage_metrics.py" <<'PY'
@@ -824,6 +890,7 @@ stage_start = timestamp(args.stage_start)
 durations = []
 completion_times = []
 marker_statuses = {}
+per_shard_new_groups = {}
 for shard in args.indices:
     marker_path = args.shards_root / shard / "shard_execution.json"
     if not marker_path.is_file():
@@ -835,6 +902,7 @@ for shard in args.indices:
         raise SystemExit(2)
     assert marker["status"] in {"started", "completed"}, marker
     previous = timestamp(marker["started_at"])
+    new_groups = 0
     for binding in marker["group_runs"]:
         run_id = binding["run_ids"][0]
         ledger_path = args.shards_root / shard / run_id / "test_evaluation.json"
@@ -846,7 +914,30 @@ for shard in args.indices:
         if completed >= stage_start:
             durations.append(duration)
             completion_times.append(completed)
+            new_groups += 1
+    per_shard_new_groups[shard] = new_groups
 
+missing_shard_progress = [
+    shard for shard, count in per_shard_new_groups.items() if count < 1
+]
+completed_without_progress = [
+    shard
+    for shard in missing_shard_progress
+    if marker_statuses[shard] == "completed"
+]
+if completed_without_progress:
+    print(
+        "completed active shards cannot contribute after stage_start: "
+        f"{completed_without_progress}; per_shard_new_groups="
+        f"{per_shard_new_groups}"
+    )
+    raise SystemExit(3)
+if missing_shard_progress:
+    print(
+        "waiting: every active shard needs one new group after stage_start; "
+        f"per_shard_new_groups={per_shard_new_groups}"
+    )
+    raise SystemExit(4)
 if len(durations) < args.minimum_groups:
     print(f"waiting: {len(durations)}/{args.minimum_groups} new groups")
     raise SystemExit(4)
@@ -866,6 +957,7 @@ metrics = {
     "stage_start": stage_start.isoformat(),
     "indices": args.indices,
     "marker_statuses": marker_statuses,
+    "per_shard_new_groups": per_shard_new_groups,
     "new_group_count": len(durations),
     "group_durations_seconds": durations,
     "groups_per_hour": len(durations) / elapsed_hours,
@@ -887,6 +979,7 @@ else:
 args.output.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
 print(json.dumps(metrics, sort_keys=True))
 try:
+    assert all(count >= 1 for count in metrics["per_shard_new_groups"].values())
     if baseline:
         assert metrics["groups_per_hour"] >= baseline["groups_per_hour"] * 1.5
         assert metrics["median_group_seconds"] < baseline["median_group_seconds"] * 1.8
@@ -997,11 +1090,12 @@ stop_gpu_sampler baseline-1worker
 
 The two-worker stage starts when shard 001 is launched while shard 000 keeps
 running. The UTC stage start, 10-second GPU samples, gate log, and metrics JSON
-are all retained. The gate waits for at least two new ledger completions after
-the stage start and actually asserts throughput >= 1.5x the one-worker
-baseline, median group time < 1.8x baseline, peak memory < 80%, and no failed
-marker. In percentage terms, throughput improvement must be >= 50%, median
-group-time growth must be < 80%, and GPU memory must remain < 80%.
+are all retained. The gate waits for new ledger completions after the stage
+start from every active shard (`000..001`, then `000..003`, then `000..007`),
+with at least one completion per shard, and actually asserts throughput >= 1.5x
+the prior stable stage, median group time < 1.8x baseline, peak memory < 80%,
+and no failed marker. In percentage terms, throughput improvement must be >=
+50%, median group-time growth must be < 80%, and GPU memory must remain < 80%.
 
 If the two-worker gate fails only its performance/resource assertions, let 000
 and 001 finish, then run 002..007 serially with `MAX_PARALLEL=1`. A failed shard
