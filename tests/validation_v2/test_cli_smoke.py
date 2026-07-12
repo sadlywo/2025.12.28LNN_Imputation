@@ -776,7 +776,14 @@ def test_server_config_declares_real_scenarios_and_bounded_execution_inputs():
             encoding="utf-8"
         )
     )
+    smoke_config = yaml.safe_load(
+        (REPO_ROOT / "configs" / "validation_v2" / "smoke.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
 
+    assert config["require_clean_git"] is True
+    assert smoke_config["require_clean_git"] is False
     assert config["protocols"] == [
         "strict_file",
         "scenario_holdout:handbag",
