@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 from typing import Any, Mapping
 
@@ -13,6 +14,7 @@ import yaml
 
 from validation_v2.experiments import sharding
 from validation_v2.experiments.groups import enumerate_training_groups
+from validation_v2.experiments.matrix import enumerate_matrix
 from validation_v2.experiments.provenance import canonical_json
 from validation_v2.experiments.sharding import (
     SHARD_SCHEMA_VERSION,
@@ -20,9 +22,12 @@ from validation_v2.experiments.sharding import (
     load_shard_plan,
     write_shard_plan,
 )
+from test_server_handoff import _complete_root
 
 _run_group = getattr(sharding, "_run_group", None)
 execute_shard = getattr(sharding, "execute_shard", None)
+merge_shards = getattr(sharding, "merge_shards", None)
+preflight_shards = getattr(sharding, "preflight_shards", None)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -161,6 +166,412 @@ def _fake_group_runner(calls: list[str]):
         return {"status": "completed", "run_ids": [run_id]}
 
     return fake
+
+
+def _merge_config() -> dict[str, Any]:
+    config = _mini_config()
+    config["models"] = ["linear"]
+    config["protocols"] = ["global_random", "strict_file"]
+    return config
+
+
+def _write_merge_fixture(tmp_path: Path) -> tuple[dict[str, Any], Path, Path, Path]:
+    config = _merge_config()
+    commit = "a" * 40
+    plan = build_shard_plan(
+        config, shard_count=2, git_commit=commit, device="cpu"
+    )
+    shards_root = tmp_path / "shards"
+    shards_root.mkdir(parents=True)
+    groups = enumerate_training_groups(config)
+
+    for shard_index, shard in enumerate(plan["shards"]):
+        group = groups[shard["group_indices"][0]]
+        generated, _, manifest = _complete_root(
+            tmp_path / f"generated-{shard_index}",
+            protocol=group.protocol,
+            condition_id=group.combination_ids[0],
+        )
+        shard_root = shards_root / f"{shard_index:03d}"
+        generated.replace(shard_root)
+        (shard_root / "matrix_execution.json").unlink()
+        _write_raw(
+            shard_root / "shard_execution.json",
+            {
+                "schema_version": SHARD_SCHEMA_VERSION,
+                "plan_sha256": plan["plan_sha256"],
+                "source_config_sha256": plan["source_config_sha256"],
+                "git_commit": commit,
+                "device": "cpu",
+                "shard_index": shard_index,
+                "shard_count": 2,
+                "group_ids": list(shard["group_ids"]),
+                "combination_ids": list(shard["combination_ids"]),
+                "status": "completed",
+                "started_at": "2026-07-12T00:00:00Z",
+                "completed_at": "2026-07-12T00:01:00Z",
+                "completed_group_ids": list(shard["group_ids"]),
+                "run_ids": [manifest["run_id"]],
+                "group_runs": [
+                    {"group_id": group.group_id, "run_ids": [manifest["run_id"]]}
+                ],
+            },
+        )
+        (shard_root / ".shard_execution.lock").write_bytes(b"\0")
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+    plan_path = tmp_path / "plan.json"
+    write_shard_plan(plan_path, plan)
+    return plan, shards_root, config_path, plan_path
+
+
+def _tree_snapshot(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_preflight_is_read_only_and_returns_complete_promotion_manifest(
+    tmp_path: Path,
+):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    before = _tree_snapshot(shards_root)
+
+    promotion = preflight_shards(config, plan=plan, shards_root=shards_root)
+
+    assert _tree_snapshot(shards_root) == before
+    assert promotion["plan_sha256"] == plan["plan_sha256"]
+    assert promotion["source_config_sha256"] == plan["source_config_sha256"]
+    assert promotion["git_commit"] == plan["git_commit"]
+    assert promotion["device"] == "cpu"
+    assert promotion["total_groups"] == 2
+    assert promotion["total_cells"] == 2
+    assert promotion["selected_combination_ids"] == [
+        cell["combination_id"] for cell in enumerate_matrix(config)
+    ]
+    assert promotion["run_ids"] == sorted(promotion["run_ids"])
+    assert len(promotion["run_sources"]) == 2
+    assert len(promotion["asset_sources"]) == 4
+
+
+def test_merge_two_formal_shards_validates_and_preserves_sources(tmp_path: Path):
+    plan, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    before = _tree_snapshot(shards_root)
+    output_root = tmp_path / "merged"
+
+    report = merge_shards(
+        config_path=config_path,
+        plan_path=plan_path,
+        shards_root=shards_root,
+        output_root=output_root,
+    )
+
+    assert report["status"] == "complete"
+    assert _tree_snapshot(shards_root) == before
+    assert (output_root / "validation_report.json").is_file()
+    assert not (output_root / "shard_execution.json").exists()
+    assert not (output_root / ".shard_execution.lock").exists()
+    marker = json.loads(
+        (output_root / "matrix_execution.json").read_text(encoding="utf-8")
+    )
+    assert marker == {
+        "status": "completed",
+        "partial": False,
+        "selected_cells": plan["total_cells"],
+        "total_cells": plan["total_cells"],
+        "training_groups": plan["total_groups"],
+        "grouping_key": ["training_family", "seed", "protocol", "objective"],
+        "selected_combination_ids": [
+            cell["combination_id"]
+            for cell in enumerate_matrix(
+                yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            )
+        ],
+        "run_ids": sorted(report["run_ids"]),
+    }
+    assert not list(tmp_path.glob(".merged-merge-*"))
+    assert not list(tmp_path.glob(".failed-merge-*"))
+
+
+@pytest.mark.parametrize("status", ["started", "failed"])
+def test_preflight_rejects_incomplete_shard_status(tmp_path: Path, status: str):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    marker_path = shards_root / "000" / "shard_execution.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["status"] = status
+    if status == "started":
+        marker.pop("completed_at")
+    else:
+        marker["error_type"] = "RuntimeError"
+    _write_raw(marker_path, marker)
+
+    with pytest.raises(ValueError, match="completed|status|failed"):
+        preflight_shards(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            plan=plan,
+            shards_root=shards_root,
+        )
+
+
+def test_preflight_rejects_foreign_or_missing_shard_directories(tmp_path: Path):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    (shards_root / "README.md").write_text("foreign\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="foreign|shard director"):
+        preflight_shards(config, plan=plan, shards_root=shards_root)
+    (shards_root / "README.md").unlink()
+    shutil.rmtree(shards_root / "001")
+    with pytest.raises(ValueError, match="missing|shard director"):
+        preflight_shards(config, plan=plan, shards_root=shards_root)
+
+
+def test_preflight_rejects_tampered_asset_and_run(tmp_path: Path):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    asset = next((shards_root / "000").glob("scaler-*.json"))
+    asset.write_bytes(asset.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="SHA-256|digest|asset"):
+        preflight_shards(config, plan=plan, shards_root=shards_root)
+
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path / "run-case")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    marker = json.loads(
+        (shards_root / "000" / "shard_execution.json").read_text(encoding="utf-8")
+    )
+    (shards_root / "000" / marker["run_ids"][0] / "best.pt").unlink()
+    with pytest.raises(ValueError, match="incomplete|artifacts"):
+        preflight_shards(config, plan=plan, shards_root=shards_root)
+
+
+def test_preflight_rejects_duplicate_run_id_and_asset_name_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    first_marker = json.loads(
+        (shards_root / "000" / "shard_execution.json").read_text(encoding="utf-8")
+    )
+    second_marker_path = shards_root / "001" / "shard_execution.json"
+    second_marker = json.loads(second_marker_path.read_text(encoding="utf-8"))
+    old_run = shards_root / "001" / second_marker["run_ids"][0]
+    duplicate_run = shards_root / "001" / first_marker["run_ids"][0]
+    old_run.rename(duplicate_run)
+    manifest_path = duplicate_run / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["run_id"] = duplicate_run.name
+    _write_raw(manifest_path, manifest)
+    second_marker["run_ids"] = [duplicate_run.name]
+    second_marker["group_runs"][0]["run_ids"] = [duplicate_run.name]
+    _write_raw(second_marker_path, second_marker)
+    with pytest.raises(ValueError, match="duplicate run"):
+        preflight_shards(config, plan=plan, shards_root=shards_root)
+
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path / "asset-case")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    source = next((shards_root / "000").glob("scaler-*.json"))
+    source_digest = source.stem.removeprefix("scaler-")
+    second_run = json.loads(
+        (shards_root / "001" / "shard_execution.json").read_text(encoding="utf-8")
+    )["run_ids"][0]
+    second_manifest_path = shards_root / "001" / second_run / "run.json"
+    second_manifest = json.loads(second_manifest_path.read_text(encoding="utf-8"))
+    old_scaler = shards_root / "001" / f"scaler-{second_manifest['scaler_hash']}.json"
+    old_scaler.unlink()
+    second_manifest["scaler_hash"] = source_digest
+    _write_raw(second_manifest_path, second_manifest)
+    target = shards_root / "001" / source.name
+    target.write_bytes(b"different")
+    real_file_sha256 = sharding._file_sha256
+
+    def accept_named_asset(path: Path) -> str:
+        path = Path(path)
+        match = sharding._SCALER_ASSET.fullmatch(path.name)
+        return match.group(1) if match else real_file_sha256(path)
+
+    monkeypatch.setattr(sharding, "_file_sha256", accept_named_asset)
+    with pytest.raises(ValueError, match="conflict"):
+        preflight_shards(config, plan=plan, shards_root=shards_root)
+
+
+def test_merge_existing_destination_is_never_modified(tmp_path: Path):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    output_root = tmp_path / "merged"
+    output_root.mkdir()
+    sentinel = output_root / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exist"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=output_root,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert list(output_root.iterdir()) == [sentinel]
+
+
+@pytest.mark.parametrize("failure", ["copy", "validator", "publish"])
+def test_merge_failure_keeps_no_final_and_preserves_failed_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    before = _tree_snapshot(shards_root)
+    output_root = tmp_path / "merged"
+
+    if failure == "copy":
+        monkeypatch.setattr(sharding.shutil, "copy2", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("copy boom")))
+    elif failure == "validator":
+        monkeypatch.setattr(sharding, "validate_artifacts", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("validator boom")))
+    else:
+        monkeypatch.setattr(sharding.os, "rename", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("publish boom")))
+
+    with pytest.raises((OSError, ValueError), match=f"{failure} boom"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=output_root,
+        )
+
+    assert not output_root.exists()
+    assert _tree_snapshot(shards_root) == before
+    failed = list(tmp_path.glob(".failed-merge-*"))
+    assert len(failed) == 1
+    assert failed[0].is_dir()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("plan_sha256", "0" * 64),
+        ("source_config_sha256", "0" * 64),
+        ("git_commit", "wrong"),
+        ("device", "cuda"),
+        ("shard_index", 1),
+        ("shard_count", 3),
+        ("group_ids", []),
+        ("combination_ids", []),
+    ],
+)
+def test_preflight_rejects_marker_plan_config_and_coverage_tampering(
+    tmp_path: Path, field: str, value: Any
+):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    marker_path = shards_root / "000" / "shard_execution.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker[field] = value
+    _write_raw(marker_path, marker)
+
+    with pytest.raises(ValueError, match=field.replace("_sha256", "") + "|immutable|marker"):
+        preflight_shards(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            plan=plan,
+            shards_root=shards_root,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["foreign-root", "extra-run-file", "bad-asset-name"])
+def test_preflight_rejects_foreign_shard_and_run_content(
+    tmp_path: Path, mutation: str
+):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    shard_root = shards_root / "000"
+    marker = json.loads(
+        (shard_root / "shard_execution.json").read_text(encoding="utf-8")
+    )
+    if mutation == "foreign-root":
+        (shard_root / "notes.txt").write_text("foreign", encoding="utf-8")
+    elif mutation == "extra-run-file":
+        (shard_root / marker["run_ids"][0] / "partial.tmp").write_text(
+            "partial", encoding="utf-8"
+        )
+    else:
+        (shard_root / "scaler-partial.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="foreign|exactly six|content"):
+        preflight_shards(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            plan=plan,
+            shards_root=shards_root,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing-marker", "missing-run", "extra-asset"])
+def test_preflight_rejects_missing_or_extra_artifacts(tmp_path: Path, mutation: str):
+    plan, shards_root, config_path, _ = _write_merge_fixture(tmp_path)
+    shard_root = shards_root / "000"
+    marker = json.loads(
+        (shard_root / "shard_execution.json").read_text(encoding="utf-8")
+    )
+    if mutation == "missing-marker":
+        (shard_root / "shard_execution.json").unlink()
+    elif mutation == "missing-run":
+        shutil.rmtree(shard_root / marker["run_ids"][0])
+    else:
+        content = b"unreferenced asset"
+        digest = hashlib.sha256(content).hexdigest()
+        (shard_root / f"scaler-{digest}.json").write_bytes(content)
+
+    with pytest.raises(ValueError, match="missing|extra|match"):
+        preflight_shards(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            plan=plan,
+            shards_root=shards_root,
+        )
+
+
+def test_preflight_failure_creates_no_merge_temp_or_failed_directory(tmp_path: Path):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    (shards_root / "foreign").mkdir()
+
+    with pytest.raises(ValueError, match="foreign|shard director"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=tmp_path / "merged",
+        )
+
+    assert not (tmp_path / "merged").exists()
+    assert not list(tmp_path.glob(".merged-merge-*"))
+    assert not list(tmp_path.glob(".failed-merge-*"))
+
+
+def test_merge_creates_output_parent(tmp_path: Path):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    output_root = tmp_path / "new-parent" / "merged"
+
+    report = merge_shards(
+        config_path=config_path,
+        plan_path=plan_path,
+        shards_root=shards_root,
+        output_root=output_root,
+    )
+
+    assert report["status"] == "complete"
+    assert output_root.is_dir()
+
+
+def test_merge_rejects_output_inside_shards_without_mutating_sources(tmp_path: Path):
+    _, shards_root, config_path, plan_path = _write_merge_fixture(tmp_path)
+    before = _tree_snapshot(shards_root)
+
+    with pytest.raises(ValueError, match="overlap|shards_root"):
+        merge_shards(
+            config_path=config_path,
+            plan_path=plan_path,
+            shards_root=shards_root,
+            output_root=shards_root / "merged",
+        )
+
+    assert _tree_snapshot(shards_root) == before
+    assert {path.name for path in shards_root.iterdir()} == {"000", "001"}
 
 
 def test_server_plan_has_expected_counts_and_round_robin_assignment():

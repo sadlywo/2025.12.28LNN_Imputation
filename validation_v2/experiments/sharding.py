@@ -10,15 +10,19 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 from typing import Any, Union
+import uuid
 
 import yaml
 
 from .groups import TrainingGroup, enumerate_training_groups, group_execution_config
+from .matrix import enumerate_matrix
 from .provenance import canonical_json
 from .runner import run_smoke
+from .validate_artifacts import validate_artifacts
 
 
 SHARD_SCHEMA_VERSION = 1
@@ -64,6 +68,9 @@ _FORBIDDEN_ROOT_FILES = frozenset(
     {"matrix_execution.json", "smoke_summary.json", "validation_report.json"}
 )
 _LOCK_FILE = ".shard_execution.lock"
+_MERGE_LOCK_FILE = ".validation-v2-merge.lock"
+_SPLIT_ASSET = re.compile(r"split_manifest-([0-9a-f]{64})\.csv")
+_SCALER_ASSET = re.compile(r"scaler-([0-9a-f]{64})\.json")
 
 
 def _validate_shard_count(shard_count: Any) -> int:
@@ -808,10 +815,345 @@ def execute_shard(
         )
 
 
+def _file_sha256(path: Path) -> str:
+    path = Path(path)
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise ValueError(f"unable to hash artifact: {path}") from error
+    return digest.hexdigest()
+
+
+def _load_json_mapping(path: Path, label: str) -> dict[str, Any]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"unable to load {label}") from error
+    if not isinstance(loaded, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    return dict(loaded)
+
+
+def _validate_shard_assets(
+    shard_root: Path, run_ids: list[str]
+) -> list[dict[str, Any]]:
+    assets: dict[str, dict[str, Any]] = {}
+    for child in shard_root.iterdir():
+        split_match = _SPLIT_ASSET.fullmatch(child.name)
+        scaler_match = _SCALER_ASSET.fullmatch(child.name)
+        if not (split_match or scaler_match):
+            continue
+        if not child.is_file():
+            raise ValueError(f"asset is not a file: {child.name}")
+        expected = (split_match or scaler_match).group(1)  # type: ignore[union-attr]
+        actual = _file_sha256(child)
+        if actual != expected:
+            raise ValueError(f"asset filename digest does not match SHA-256: {child.name}")
+        assets[child.name] = {
+            "name": child.name,
+            "source": child,
+            "sha256": actual,
+        }
+
+    referenced: set[str] = set()
+    for run_id in run_ids:
+        manifest = _load_json_mapping(
+            shard_root / run_id / "run.json", f"run manifest in {run_id}"
+        )
+        split_hash = manifest.get("split_hash")
+        scaler_hash = manifest.get("scaler_hash")
+        for field, value in (("split_hash", split_hash), ("scaler_hash", scaler_hash)):
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"run manifest {field} must be 64 lowercase hex")
+        referenced.add(f"split_manifest-{split_hash}.csv")
+        referenced.add(f"scaler-{scaler_hash}.json")
+    if set(assets) != referenced:
+        missing = sorted(referenced - set(assets))
+        extra = sorted(set(assets) - referenced)
+        raise ValueError(f"asset set does not match run manifests; missing={missing}, extra={extra}")
+    return [assets[name] for name in sorted(assets)]
+
+
+def preflight_shards(
+    config: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    shards_root: Union[Path, str],
+) -> Mapping[str, Any]:
+    """Read and strictly validate every completed shard without writing files."""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("config must be a mapping")
+    if not isinstance(plan, Mapping):
+        raise ValueError("shard plan must be a mapping")
+    validated_plan = _validate_plan_mapping(
+        plan,
+        config=config,
+        git_commit=plan.get("git_commit"),
+        device=plan.get("device"),
+    )
+    root = Path(shards_root)
+    if not root.is_dir():
+        raise ValueError("shards_root must be a directory")
+    expected_names = {
+        f"{index:03d}" for index in range(validated_plan["shard_count"])
+    }
+    actual_names = {child.name for child in root.iterdir()}
+    if actual_names != expected_names or any(
+        not (root / name).is_dir() for name in actual_names
+    ):
+        missing = sorted(expected_names - actual_names)
+        foreign = sorted(actual_names - expected_names)
+        raise ValueError(
+            f"shard directories do not match plan; missing={missing}, foreign={foreign}"
+        )
+
+    groups = enumerate_training_groups(config)
+    run_sources: list[dict[str, Any]] = []
+    asset_sources: list[dict[str, Any]] = []
+    run_ids: list[str] = []
+    group_ids: list[str] = []
+    combination_ids: list[str] = []
+    assets_by_name: dict[str, tuple[str, bytes]] = {}
+
+    for shard_index, shard in enumerate(validated_plan["shards"]):
+        shard_root = root / f"{shard_index:03d}"
+        assigned_groups = [groups[index] for index in shard["group_indices"]]
+        marker_path = shard_root / "shard_execution.json"
+        if not marker_path.is_file():
+            raise ValueError(f"missing completed shard_execution.json in {shard_root.name}")
+        immutable = _immutable_marker_fields(validated_plan, shard, shard_index)
+        marker = _load_execution_marker(
+            marker_path, immutable, shard_root, assigned_groups
+        )
+        if marker["status"] != "completed":
+            raise ValueError(
+                f"shard {shard_root.name} status must be completed, got {marker['status']}"
+            )
+        marker_run_ids = list(marker["run_ids"])
+        allowed = {"shard_execution.json", _LOCK_FILE, *marker_run_ids}
+        shard_assets = _validate_shard_assets(shard_root, marker_run_ids)
+        allowed.update(asset["name"] for asset in shard_assets)
+        actual = {child.name for child in shard_root.iterdir()}
+        if actual - allowed or allowed - actual - {_LOCK_FILE}:
+            raise ValueError(
+                f"foreign or missing content in shard {shard_root.name}: "
+                f"foreign={sorted(actual - allowed)}, missing={sorted(allowed - actual - {_LOCK_FILE})}"
+            )
+        for run_id in marker_run_ids:
+            run_dir = shard_root / run_id
+            if not run_dir.is_dir() or {item.name for item in run_dir.iterdir()} != _RUN_FILES:
+                raise ValueError(f"run {run_id} must contain exactly six artifacts")
+            if run_id in run_ids:
+                raise ValueError(f"duplicate run_id across shards: {run_id}")
+            run_ids.append(run_id)
+            run_sources.append({"run_id": run_id, "source": run_dir})
+        for asset in shard_assets:
+            source = asset["source"]
+            content = source.read_bytes()
+            prior = assets_by_name.get(asset["name"])
+            if prior is not None and prior != (asset["sha256"], content):
+                raise ValueError(f"same-name asset conflict across shards: {asset['name']}")
+            assets_by_name[asset["name"]] = (asset["sha256"], content)
+            asset_sources.append(asset)
+        group_ids.extend(marker["group_ids"])
+        combination_ids.extend(marker["combination_ids"])
+
+    expected_group_ids = [
+        identifier
+        for shard in validated_plan["shards"]
+        for identifier in shard["group_ids"]
+    ]
+    expected_combination_ids = [
+        identifier
+        for shard in validated_plan["shards"]
+        for identifier in shard["combination_ids"]
+    ]
+    if group_ids != expected_group_ids or len(set(group_ids)) != len(group_ids):
+        raise ValueError("shard group IDs are not disjoint and exhaustive")
+    if (
+        combination_ids != expected_combination_ids
+        or len(set(combination_ids)) != len(combination_ids)
+    ):
+        raise ValueError("shard combination IDs are not disjoint and exhaustive")
+    if len(group_ids) != validated_plan["total_groups"]:
+        raise ValueError("shard group coverage does not match total_groups")
+    if len(combination_ids) != validated_plan["total_cells"]:
+        raise ValueError("shard combination coverage does not match total_cells")
+    ordered_combination_ids = [
+        cell["combination_id"] for cell in enumerate_matrix(config)
+    ]
+    if set(ordered_combination_ids) != set(combination_ids):
+        raise ValueError("shard combination IDs do not match the config matrix")
+
+    return {
+        "plan_sha256": validated_plan["plan_sha256"],
+        "source_config_sha256": validated_plan["source_config_sha256"],
+        "git_commit": validated_plan["git_commit"],
+        "device": validated_plan["device"],
+        "total_groups": validated_plan["total_groups"],
+        "total_cells": validated_plan["total_cells"],
+        "selected_combination_ids": ordered_combination_ids,
+        "run_ids": sorted(run_ids),
+        "run_sources": run_sources,
+        "asset_sources": asset_sources,
+        "asset_digests": {
+            name: digest for name, (digest, _) in sorted(assets_by_name.items())
+        },
+    }
+
+
+@contextmanager
+def _merge_publish_lock(parent: Path):
+    lock_path = parent / _MERGE_LOCK_FILE
+    handle = lock_path.open("a+b")
+    locked = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except OSError as error:
+            raise ValueError("merge parent is active or locked") from error
+        yield
+    finally:
+        if locked:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _copy_verified_file(source: Path, destination: Path) -> None:
+    source = Path(source)
+    destination = Path(destination)
+    shutil.copy2(source, destination)
+    if _file_sha256(source) != _file_sha256(destination):
+        raise ValueError(f"copied artifact SHA-256 mismatch: {source}")
+
+
+def _preserve_failed_merge(temporary: Path, parent: Path) -> None:
+    if not temporary.exists():
+        return
+    failed = parent / f".failed-merge-{uuid.uuid4().hex}"
+    os.replace(temporary, failed)
+
+
+def merge_shards(
+    *,
+    config_path: Union[Path, str],
+    plan_path: Union[Path, str],
+    shards_root: Union[Path, str],
+    output_root: Union[Path, str],
+) -> Mapping[str, Any]:
+    """Validate, copy, seal, and atomically publish completed shards."""
+
+    try:
+        config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ValueError("unable to load merge config") from error
+    if not isinstance(config, Mapping):
+        raise ValueError("merge config must be a mapping")
+    try:
+        plan = yaml.safe_load(Path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ValueError("unable to load shard plan") from error
+    if not isinstance(plan, Mapping):
+        raise ValueError("shard plan must be a mapping")
+
+    promotion = preflight_shards(config, plan=plan, shards_root=shards_root)
+    output = Path(output_root).absolute().resolve(strict=False)
+    source_root = Path(shards_root).absolute().resolve(strict=False)
+    if output == source_root or source_root in output.parents:
+        raise ValueError("output_root must not overlap shards_root")
+    parent = output.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    with _merge_publish_lock(parent):
+        if os.path.lexists(output):
+            raise ValueError("output_root already exists")
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f".{output.name}-merge-", dir=parent)
+        )
+        try:
+            copied_assets: set[str] = set()
+            for asset in promotion["asset_sources"]:
+                name = asset["name"]
+                if name in copied_assets:
+                    continue
+                _copy_verified_file(asset["source"], temporary / name)
+                copied_assets.add(name)
+            for run in promotion["run_sources"]:
+                destination = temporary / run["run_id"]
+                shutil.copytree(
+                    run["source"], destination, copy_function=_copy_verified_file
+                )
+            _atomic_write_json(
+                temporary / "matrix_execution.json",
+                {
+                    "status": "completed",
+                    "partial": False,
+                    "selected_cells": promotion["total_cells"],
+                    "total_cells": promotion["total_cells"],
+                    "training_groups": promotion["total_groups"],
+                    "grouping_key": [
+                        "training_family",
+                        "seed",
+                        "protocol",
+                        "objective",
+                    ],
+                    "selected_combination_ids": promotion[
+                        "selected_combination_ids"
+                    ],
+                    "run_ids": promotion["run_ids"],
+                },
+            )
+            report = validate_artifacts(temporary, config=config_path)
+            if (
+                not isinstance(report, Mapping)
+                or report.get("status") != "complete"
+                or not (temporary / "validation_report.json").is_file()
+            ):
+                raise ValueError("artifact validator did not complete and seal report")
+            if os.path.lexists(output):
+                raise ValueError("output_root appeared during merge")
+            os.rename(temporary, output)
+            return dict(report)
+        except BaseException:
+            try:
+                _preserve_failed_merge(temporary, parent)
+            except OSError:
+                pass
+            raise
+
+
 __all__ = [
     "SHARD_SCHEMA_VERSION",
     "build_shard_plan",
     "execute_shard",
     "load_shard_plan",
+    "merge_shards",
+    "preflight_shards",
     "write_shard_plan",
 ]
