@@ -672,8 +672,11 @@ def test_completed_shard_rerun_is_idempotent_without_group_calls(
     assert calls == []
 
 
-def test_started_marker_with_complete_prefix_resumes_only_remaining_groups(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+def test_interrupt_preserves_started_marker_and_resumes_only_remaining_groups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_type: type[BaseException],
 ):
     config = _mini_config()
     plan = _execution_plan(config, shard_count=1)
@@ -689,11 +692,11 @@ def test_started_marker_with_complete_prefix_resumes_only_remaining_groups(
         nonlocal attempts
         attempts += 1
         if attempts == 2:
-            raise KeyboardInterrupt
+            raise interrupt_type
         return runner(*args, **kwargs)
 
     monkeypatch.setattr("validation_v2.experiments.sharding._run_group", interrupt_after_one)
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(interrupt_type):
         execute_shard(
             config,
             plan=plan,
@@ -702,10 +705,12 @@ def test_started_marker_with_complete_prefix_resumes_only_remaining_groups(
             output_root=root,
             requested_device="cpu",
         )
-    failed = json.loads((root / "shard_execution.json").read_text(encoding="utf-8"))
-    failed["status"] = "started"
-    failed.pop("error_type")
-    _write_raw(root / "shard_execution.json", failed)
+    interrupted = json.loads(
+        (root / "shard_execution.json").read_text(encoding="utf-8")
+    )
+    assert interrupted["status"] == "started"
+    assert interrupted["completed_group_ids"] == [groups[0].group_id]
+    assert interrupted["run_ids"] == [groups[0].group_id[:16]]
     calls.clear()
 
     report = execute_shard(

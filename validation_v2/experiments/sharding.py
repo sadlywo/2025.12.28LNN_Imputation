@@ -622,7 +622,7 @@ def execute_shard(
             if sorted(marker["run_ids"]) != _root_run_ids(output_root):
                 raise ValueError("run_ids do not match shard run directories")
             _atomic_write_json(marker_path, marker)
-    except BaseException as error:
+    except Exception as error:
         marker["status"] = "failed"
         marker["error_type"] = type(error).__name__
         _atomic_write_json(marker_path, marker)
