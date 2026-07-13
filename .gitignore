@@ -1,4 +1,5 @@
 .worktrees/
+.venv-server/
 results/validation_v2/
 __pycache__/
 .pytest_cache/
