@@ -69,14 +69,10 @@ def test_server_runbooks_make_the_python312_runner_the_only_current_entrypoint()
     assert english.index("Historical implementation reference") < english.index(
         "conda activate"
     )
-    assert re.search(r"different\s+`--campaign-suffix`", english)
-    assert re.search(r"使用不同或新的\s+`--campaign-suffix`", chinese)
-    assert "runtime provenance" in english
-    assert "multiple days" in english
-    assert "created and successfully verified" in english
-    assert "运行时 provenance" in chinese
-    assert "持续数日" in chinese
-    assert re.search(r"已创建且可执行的\s+`.venv-server/bin/python`", chinese)
+    assert "--campaign-suffix" in english and re.search(r"same\s+suffix", english)
+    assert "--campaign-suffix" in chinese and "同一后缀" in chinese
+    assert "status 2" in english
+    assert "状态码 2" in chinese
 
 
 @pytest.fixture
