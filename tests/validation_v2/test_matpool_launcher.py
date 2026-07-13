@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -96,8 +97,35 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
     python = _to_bash_path(Path(sys.executable))
     bash_environment = tmp_path / "bash-env"
     bash_environment.write_text(
+        "if [ -n \"${FAKE_CALLER_UMASK:-}\" ]; then umask \"$FAKE_CALLER_UMASK\"; fi\n"
         "uname() { printf '%s\\n' Linux; }\n"
         "tail() { command \"$FAKE_BIN/tail\" \"$@\"; }\n"
+        "git() {\n"
+        "  if [[ \" $* \" == *\" status --porcelain \"* ]] && [ -n \"${FAKE_GIT_STATUS_RC:-}\" ]; then\n"
+        "    [ -z \"${FAKE_GIT_STATUS_STDERR:-}\" ] || builtin printf '%s\\n' \"$FAKE_GIT_STATUS_STDERR\" >&2\n"
+        "    return \"$FAKE_GIT_STATUS_RC\"\n"
+        "  fi\n"
+        "  command git \"$@\"\n"
+        "}\n"
+        "tee() {\n"
+        "  if [ -n \"${FAKE_COMMAND_PHASE:-}\" ] && [ -n \"${FAKE_TEE_RC:-}\" ]; then\n"
+        "    command /usr/bin/cat >/dev/null\n"
+        "    return \"$FAKE_TEE_RC\"\n"
+        "  fi\n"
+        "  command /usr/bin/tee \"$@\"\n"
+        "}\n"
+        "mv() {\n"
+        "  if [ -n \"${FAKE_COMMAND_PHASE:-}\" ] && [ -n \"${FAKE_MV_RC:-}\" ]; then\n"
+        "    return \"$FAKE_MV_RC\"\n"
+        "  fi\n"
+        "  command /usr/bin/mv \"$@\"\n"
+        "}\n"
+        "printf() {\n"
+        "  if [ -n \"${FAKE_COMMAND_PHASE:-}\" ] && [ -n \"${FAKE_EXIT_PRINTF_RC:-}\" ] && [ \"${1:-}\" = '%s\\n' ] && [[ \"${2:-}\" =~ ^[0-9]+$ ]]; then\n"
+        "    return \"$FAKE_EXIT_PRINTF_RC\"\n"
+        "  fi\n"
+        "  builtin printf \"$@\"\n"
+        "}\n"
         "date() {\n"
         "  if [ -n \"${FAKE_DATE_VALUE:-}\" ]; then printf '%s\\n' \"$FAKE_DATE_VALUE\";\n"
         "  else command /usr/bin/date \"$@\"; fi\n"
@@ -106,15 +134,19 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
         "  local -a converted=()\n"
         "  local argument\n"
         "  for argument in \"$@\"; do\n"
-        "    case \"$argument\" in\n"
-        "      /[A-Za-z]/*) argument=\"${argument:1:1}:${argument:2}\" ;;\n"
-        "    esac\n"
+        "    if [ \"${FAKE_WINDOWS_PYTHON:-0}\" = 1 ]; then\n"
+        "      case \"$argument\" in\n"
+        "        /[A-Za-z]/*) argument=\"${argument:1:1}:${argument:2}\" ;;\n"
+        "      esac\n"
+        "    fi\n"
         "    converted+=(\"$argument\")\n"
         "  done\n"
         "  local state_file=\"${MATPOOL_STATE_FILE:-}\"\n"
         "  local state_temp=\"${MATPOOL_STATE_TEMP:-}\"\n"
-        "  case \"$state_file\" in /[A-Za-z]/*) state_file=\"${state_file:1:1}:${state_file:2}\" ;; esac\n"
-        "  case \"$state_temp\" in /[A-Za-z]/*) state_temp=\"${state_temp:1:1}:${state_temp:2}\" ;; esac\n"
+        "  if [ \"${FAKE_WINDOWS_PYTHON:-0}\" = 1 ]; then\n"
+        "    case \"$state_file\" in /[A-Za-z]/*) state_file=\"${state_file:1:1}:${state_file:2}\" ;; esac\n"
+        "    case \"$state_temp\" in /[A-Za-z]/*) state_temp=\"${state_temp:1:1}:${state_temp:2}\" ;; esac\n"
+        "  fi\n"
         f"  MSYS2_ARG_CONV_EXCL='*' MSYS2_ENV_CONV_EXCL='*' MATPOOL_STATE_FILE=\"$state_file\" MATPOOL_STATE_TEMP=\"$state_temp\" {shlex.quote(python)} \"${{converted[@]}}\"\n"
         "}\n",
         encoding="utf-8",
@@ -123,9 +155,11 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
         fake_bin / "python3",
         "converted=()\n"
         "for argument in \"$@\"; do\n"
-        "  case \"$argument\" in\n"
-        "    /[A-Za-z]/*) argument=\"${argument:1:1}:${argument:2}\" ;;\n"
-        "  esac\n"
+        "  if [ \"${FAKE_WINDOWS_PYTHON:-0}\" = 1 ]; then\n"
+        "    case \"$argument\" in\n"
+        "      /[A-Za-z]/*) argument=\"${argument:1:1}:${argument:2}\" ;;\n"
+        "    esac\n"
+        "  fi\n"
         "  converted+=(\"$argument\")\n"
         "done\n"
         "export MSYS2_ARG_CONV_EXCL='*'\n"
@@ -136,7 +170,16 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
         fake_bin / "tmux",
         "printf '%s\\n' \"$*\" >> \"$FAKE_TMUX_LOG\"\n"
         "case \"${1:-}\" in\n"
-        "  has-session) exit \"${FAKE_TMUX_HAS_RC:-1}\" ;;\n"
+        "  has-session)\n"
+        "    has_rc=\"${FAKE_TMUX_HAS_RC:-1}\"\n"
+        "    if [ \"$has_rc\" -ne 0 ]; then\n"
+        "      if [ -n \"${FAKE_TMUX_HAS_STDERR:-}\" ]; then\n"
+        "        builtin printf '%s\\n' \"$FAKE_TMUX_HAS_STDERR\" >&2\n"
+        "      elif [ \"$has_rc\" -eq 1 ]; then\n"
+        "        builtin printf '%s\\n' \"can't find session: fake\" >&2\n"
+        "      fi\n"
+        "    fi\n"
+        "    exit \"$has_rc\" ;;\n"
         "  new-session)\n"
         "    if [ -n \"${FAKE_LOCK_OBSERVATION:-}\" ]; then\n"
         "      if [ -d \"$FAKE_EXPECT_LOCK_PATH\" ]; then\n"
@@ -144,6 +187,9 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
         "      else\n"
         "        printf '%s\\n' unlocked >> \"$FAKE_LOCK_OBSERVATION\"\n"
         "      fi\n"
+        "    fi\n"
+        "    if [ -n \"${FAKE_LOCK_MODE_OBSERVATION:-}\" ]; then\n"
+        "      /usr/bin/stat -c '%a' \"$FAKE_EXPECT_LOCK_PATH\" > \"$FAKE_LOCK_MODE_OBSERVATION\"\n"
         "    fi\n"
         "    if [ -n \"${FAKE_TMUX_BARRIER_ENTERED:-}\" ]; then\n"
         "      : > \"$FAKE_TMUX_BARRIER_ENTERED\"\n"
@@ -160,7 +206,12 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
         "    [ \"${1:-}\" = -d ] && shift\n"
         "    [ \"${1:-}\" = -s ] && shift 2\n"
         "    set +e\n"
+        "    export FAKE_COMMAND_PHASE=1\n"
         "    \"$@\"\n"
+        "    command_rc=$?\n"
+        "    if [ -n \"${FAKE_COMMAND_RC_LOG:-}\" ]; then\n"
+        "      builtin printf '%s\\n' \"$command_rc\" >> \"$FAKE_COMMAND_RC_LOG\"\n"
+        "    fi\n"
         "    exit 0 ;;\n"
         "  *) exit 97 ;;\n"
         "esac\n",
@@ -176,6 +227,7 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
         {
             "PATH": _to_bash_path(fake_bin) + ":" + environment["PATH"],
             "FAKE_BIN": _to_bash_path(fake_bin),
+            "FAKE_WINDOWS_PYTHON": "1" if os.name == "nt" else "0",
             "FAKE_GENERIC_ARGS": _to_bash_path(tmp_path / "generic-args.log"),
             "FAKE_TMUX_LOG": _to_bash_path(tmp_path / "tmux.log"),
             "FAKE_TAIL_LOG": _to_bash_path(tmp_path / "tail.log"),
@@ -187,7 +239,10 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
 
 
 def _run(
-    repository: Path, environment: dict[str, str], *arguments: str
+    repository: Path,
+    environment: dict[str, str],
+    *arguments: str,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [_bash(), _to_bash_path(repository / "scripts" / LAUNCHER.name), *arguments],
@@ -197,6 +252,7 @@ def _run(
         check=False,
         text=True,
         encoding="utf-8",
+        timeout=timeout,
     )
 
 
@@ -221,6 +277,12 @@ def _wait_until(predicate, *, timeout: float = 10.0) -> None:
             return
         time.sleep(0.02)
     raise AssertionError("timed out waiting for concurrent launcher condition")
+
+
+def _launcher_python_heredoc(function_name: str) -> str:
+    source = LAUNCHER.read_text(encoding="utf-8")
+    function = source.split(f"{function_name}() {{\n", 1)[1]
+    return function.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
 
 
 def _state(repository: Path) -> dict[str, object]:
@@ -330,6 +392,20 @@ def test_dirty_repository_fails_before_creating_launcher_state(tmp_path: Path) -
     assert not _from_bash_path(environment["FAKE_TMUX_LOG"]).exists()
 
 
+def test_git_status_error_fails_before_any_launcher_state_write(tmp_path: Path) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    environment["FAKE_GIT_STATUS_RC"] = "7"
+    environment["FAKE_GIT_STATUS_STDERR"] = "cannot inspect worktree"
+
+    completed = _run(repository, environment, "start")
+
+    assert completed.returncode == 2
+    assert "git status" in completed.stderr.lower()
+    assert "cannot inspect" in completed.stderr.lower()
+    assert not (repository / ".validation-v2-matpool").exists()
+    assert not _from_bash_path(environment["FAKE_TMUX_LOG"]).exists()
+
+
 @pytest.mark.parametrize(
     "arguments,expected",
     [
@@ -381,12 +457,151 @@ def test_state_is_atomic_complete_and_command_quotes_repository_with_spaces(
     assert not list(state_dir.glob(".current.json.*"))
     command = _from_bash_path(str(state["command_file"])).read_text(encoding="utf-8")
     assert "set -o pipefail" in command
-    assert "PIPESTATUS[0]" in command
+    assert "PIPESTATUS[@]" in command
+    assert "pipeline_status[0]" in command
+    assert "pipeline_status[1]" in command
     assert "run_validation_v2_server.sh" in command
     assert "validation_v2.cli" not in command
     assert "full-8-shards" not in command
     invocation = _from_bash_path(environment["FAKE_GENERIC_ARGS"]).read_text(encoding="utf-8")
     assert "clean repo with spaces" in invocation.splitlines()[0]
+
+
+def test_launcher_sets_private_umask_before_state_writes_and_in_command() -> None:
+    source = LAUNCHER.read_text(encoding="utf-8")
+    start_body = source.split("start_campaign() {\n", 1)[1].split(
+        "\n}\n\nshow_status()", 1
+    )[0]
+    command_body = source.split("write_command_file() {\n", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+
+    assert start_body.index("umask 077") < start_body.index('mkdir -m 700 "$STATE_DIR"')
+    assert "verify_state_dir_permissions" in start_body
+    assert "umask 077" in command_body
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Unix permission bits require Linux")
+def test_wide_caller_umask_still_creates_private_state_lock_and_files(
+    tmp_path: Path,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    state_dir = repository / ".validation-v2-matpool"
+    lock_mode = tmp_path / "lock-mode"
+    environment.update(
+        {
+            "FAKE_CALLER_UMASK": "000",
+            "FAKE_EXPECT_LOCK_PATH": state_dir.as_posix() + "/start.lock",
+            "FAKE_LOCK_MODE_OBSERVATION": lock_mode.as_posix(),
+        }
+    )
+
+    completed = _run(repository, environment, "start")
+
+    assert completed.returncode == 0, completed.stderr
+    state = _state(repository)
+    assert stat.S_IMODE(os.lstat(state_dir).st_mode) == 0o700
+    assert lock_mode.read_text(encoding="utf-8").strip() == "700"
+    assert stat.S_IMODE(os.lstat(state_dir / "current.json").st_mode) == 0o600
+    assert stat.S_IMODE(os.lstat(Path(str(state["command_file"]))).st_mode) == 0o700
+    assert stat.S_IMODE(os.lstat(Path(str(state["log_path"]))).st_mode) == 0o600
+    assert stat.S_IMODE(os.lstat(Path(str(state["exit_status_path"]))).st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Unix permission bits require Linux")
+def test_existing_world_accessible_state_directory_is_rejected(tmp_path: Path) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    state_dir = repository / ".validation-v2-matpool"
+    state_dir.mkdir()
+    state_dir.chmod(0o777)
+
+    completed = _run(repository, environment, "start")
+
+    assert completed.returncode == 2
+    assert "permission" in completed.stderr.lower() or "mode" in completed.stderr.lower()
+    assert stat.S_IMODE(os.lstat(state_dir).st_mode) == 0o777
+    assert not _from_bash_path(environment["FAKE_TMUX_LOG"]).exists()
+
+
+def test_state_directory_owned_by_another_euid_is_rejected_by_permission_check(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    check = _launcher_python_heredoc("verify_state_dir_permissions")
+    script = (
+        "import os\n"
+        "os.geteuid = lambda: os.lstat(os.sys.argv[1]).st_uid + 1\n"
+        + check
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-", str(state_dir)],
+        input=script,
+        capture_output=True,
+        check=False,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert completed.returncode != 0
+    assert "owner" in completed.stderr.lower() or "owned" in completed.stderr.lower()
+
+
+def test_runner_nonzero_status_is_preserved_in_atomic_exit_file(tmp_path: Path) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    command_rc = tmp_path / "command-rc"
+    environment["FAKE_GENERIC_RC"] = "17"
+    environment["FAKE_COMMAND_RC_LOG"] = _to_bash_path(command_rc)
+
+    completed = _run(repository, environment, "start")
+
+    assert completed.returncode == 0, completed.stderr
+    state = _state(repository)
+    assert _from_bash_path(str(state["exit_status_path"])).read_text(
+        encoding="utf-8"
+    ).strip() == "17"
+    assert command_rc.read_text(encoding="utf-8").strip() == "17"
+
+
+def test_tee_failure_forces_nonzero_command_and_exit_status(tmp_path: Path) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    command_rc = tmp_path / "command-rc"
+    environment["FAKE_TEE_RC"] = "23"
+    environment["FAKE_COMMAND_RC_LOG"] = _to_bash_path(command_rc)
+
+    completed = _run(repository, environment, "start")
+
+    assert completed.returncode == 0, completed.stderr
+    state = _state(repository)
+    exit_status = _from_bash_path(str(state["exit_status_path"])).read_text(
+        encoding="utf-8"
+    ).strip()
+    assert exit_status == "23"
+    assert command_rc.read_text(encoding="utf-8").strip() == "23"
+
+
+@pytest.mark.parametrize(
+    "failure_variable,failure_status,expected_command_status",
+    [("FAKE_EXIT_PRINTF_RC", "32", "126"), ("FAKE_MV_RC", "31", "127")],
+)
+def test_exit_status_write_or_move_failure_cannot_exit_zero(
+    tmp_path: Path,
+    failure_variable: str,
+    failure_status: str,
+    expected_command_status: str,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    command_rc = tmp_path / "command-rc"
+    environment[failure_variable] = failure_status
+    environment["FAKE_COMMAND_RC_LOG"] = _to_bash_path(command_rc)
+
+    completed = _run(repository, environment, "start")
+
+    assert completed.returncode == 0, completed.stderr
+    state = _state(repository)
+    assert command_rc.read_text(encoding="utf-8").strip() == expected_command_status
+    assert not _from_bash_path(str(state["exit_status_path"])).exists()
 
 
 def test_live_current_session_refuses_duplicate_start(tmp_path: Path) -> None:
@@ -494,7 +709,8 @@ def test_stale_start_lock_fails_closed_and_requires_manual_confirmation(
     repository, _, environment = _make_repository(tmp_path)
     state_dir = repository / ".validation-v2-matpool"
     start_lock = state_dir / "start.lock"
-    start_lock.mkdir(parents=True)
+    state_dir.mkdir(mode=0o700)
+    start_lock.mkdir(mode=0o700)
 
     completed = _run(repository, environment, "start")
 
@@ -536,7 +752,7 @@ def test_malformed_state_fails_closed_without_tmux_or_tail(
 ) -> None:
     repository, _, environment = _make_repository(tmp_path)
     state_dir = repository / ".validation-v2-matpool"
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     (state_dir / "current.json").write_text(
         '{"schema_version":1,"commit":"not-a-commit"}\n', encoding="utf-8"
     )
@@ -587,6 +803,23 @@ def test_status_distinguishes_inactive_from_tmux_inspection_error(tmp_path: Path
     assert errored.returncode == 2
     assert "tmux inspection failed" in errored.stderr.lower()
     assert "rc=7" in errored.stderr
+
+
+def test_tmux_rc_one_with_permission_error_is_not_reported_as_inactive(
+    tmp_path: Path,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    started = _run(repository, environment, "start")
+    assert started.returncode == 0, started.stderr
+    environment["FAKE_TMUX_HAS_RC"] = "1"
+    environment["FAKE_TMUX_HAS_STDERR"] = "error connecting to tmux socket: Permission denied"
+
+    completed = _run(repository, environment, "status")
+
+    assert completed.returncode == 2
+    assert "tmux inspection failed" in completed.stderr.lower()
+    assert "permission denied" in completed.stderr.lower()
+    assert "inactive" not in completed.stdout.lower()
 
 
 @pytest.mark.parametrize("command", ["status", "logs"])
@@ -664,3 +897,87 @@ def test_launcher_declares_strict_bash_and_never_offers_stop() -> None:
 
     assert "set -Eeuo pipefail" in source
     assert re.search(r"\bstop\b", source, flags=re.IGNORECASE) is None
+    tools = source.split("for tool in ", 1)[1].split("; do", 1)[0]
+    for required in ("bash", "git", "python3", "tmux", "tail", "tee", "date", "mv"):
+        assert required in tools
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real tmux integration requires Linux")
+def test_real_tmux_start_is_detached_and_publishes_log_and_exit_status(
+    tmp_path: Path,
+) -> None:
+    tmux = shutil.which("tmux")
+    assert tmux is not None, "tmux is required on the Linux MatPool host"
+    repository, _, _ = _make_repository(tmp_path)
+    entered = tmp_path / "real-runner-entered"
+    release = tmp_path / "real-runner-release"
+    generic_runner = repository / "scripts" / "run_validation_v2_server.sh"
+    _write_executable(
+        generic_runner,
+        "printf '%s\\n' 'real detached runner started'\n"
+        ": > \"$REAL_TMUX_RUNNER_ENTERED\"\n"
+        "while [ ! -e \"$REAL_TMUX_RUNNER_RELEASE\" ]; do sleep 0.05; done\n"
+        "printf '%s\\n' 'real detached runner completed'\n",
+    )
+    subprocess.run(["git", "add", str(generic_runner)], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "real tmux fixture"],
+        cwd=repository,
+        check=True,
+    )
+    tmux_tmpdir = tmp_path / "tmux-tmp"
+    tmux_tmpdir.mkdir(mode=0o700)
+    environment = os.environ.copy()
+    environment.pop("BASH_ENV", None)
+    environment.pop("TMUX", None)
+    environment.update(
+        {
+            "TMUX_TMPDIR": str(tmux_tmpdir),
+            "REAL_TMUX_RUNNER_ENTERED": str(entered),
+            "REAL_TMUX_RUNNER_RELEASE": str(release),
+        }
+    )
+
+    try:
+        started_at = time.monotonic()
+        started = _run(repository, environment, "start", timeout=10.0)
+        elapsed = time.monotonic() - started_at
+        assert started.returncode == 0, started.stderr
+        assert elapsed < 5.0
+        _wait_until(entered.exists)
+        state = _state(repository)
+        session = str(state["session"])
+
+        active = _run(repository, environment, "status")
+        assert active.returncode == 0, active.stderr
+        assert "state: active" in active.stdout.lower()
+
+        release.write_text("release\n", encoding="utf-8")
+
+        def session_finished() -> bool:
+            result = subprocess.run(
+                [tmux, "has-session", "-t", session],
+                env=environment,
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            return result.returncode == 1
+
+        _wait_until(session_finished)
+        exit_path = Path(str(state["exit_status_path"]))
+        _wait_until(exit_path.exists)
+        assert exit_path.read_text(encoding="utf-8").strip() == "0"
+        assert not list(exit_path.parent.glob(exit_path.name + ".tmp.*"))
+        log = Path(str(state["log_path"])).read_text(encoding="utf-8")
+        assert "real detached runner started" in log
+        assert "real detached runner completed" in log
+    finally:
+        release.write_text("release\n", encoding="utf-8")
+        subprocess.run(
+            [tmux, "kill-server"],
+            env=environment,
+            capture_output=True,
+            check=False,
+            text=True,
+        )

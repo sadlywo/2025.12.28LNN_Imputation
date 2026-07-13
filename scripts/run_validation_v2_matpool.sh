@@ -21,24 +21,62 @@ die() {
 require_linux_tools() {
   [[ "$(uname -s 2>/dev/null)" == Linux ]] || die 'this launcher requires Linux'
   local tool
-  for tool in bash git python3 tmux tail; do
+  for tool in bash git python3 tmux tail tee date mv; do
     command -v "$tool" >/dev/null 2>&1 || die "required tool is unavailable: $tool"
   done
 }
 
 inspect_session() {
   local session="$1"
-  local result
-  if tmux has-session -t "$session" >/dev/null 2>&1; then
+  local diagnostic result
+  if diagnostic="$(tmux has-session -t "$session" 2>&1)"; then
     result=0
   else
     result=$?
   fi
   case "$result" in
     0) SESSION_STATE=active ;;
-    1) SESSION_STATE=inactive ;;
-    *) die "tmux inspection failed: rc=$result" ;;
+    1)
+      local diagnostic_lower="${diagnostic,,}"
+      if [[ "$diagnostic_lower" == *"no server running"* \
+          || "$diagnostic_lower" == *"can't find session"* \
+          || "$diagnostic_lower" == *"no sessions"* \
+          || "$diagnostic_lower" == *"session not found"* ]]; then
+        SESSION_STATE=inactive
+      else
+        die "tmux inspection failed: rc=1: ${diagnostic:-unknown tmux error}"
+      fi
+      ;;
+    *) die "tmux inspection failed: rc=$result: ${diagnostic:-unknown tmux error}" ;;
   esac
+}
+
+verify_state_dir_permissions() {
+  python3 - "$STATE_DIR" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    metadata = os.lstat(path)
+except OSError as error:
+    raise SystemExit("cannot inspect launcher state directory permissions: {}".format(error))
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("launcher state directory must not be linked: {}".format(path))
+effective_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
+if metadata.st_uid != effective_uid:
+    raise SystemExit(
+        "launcher state directory is not owned by the effective user: {}".format(path)
+    )
+if os.name != "nt":
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & 0o077:
+        raise SystemExit(
+            "launcher state directory permissions must deny group and other access: "
+            "{:04o} {}".format(mode, path)
+        )
+PY
 }
 
 load_state() {
@@ -239,6 +277,7 @@ write_command_file() {
   {
     printf '%s\n' '#!/usr/bin/env bash'
     printf '%s\n' 'set -o pipefail'
+    printf '%s\n' 'umask 077'
     printf 'cd -- %q\n' "$REPO"
     printf '%s\n' 'set +e'
     printf '%q ' "$GENERIC_RUNNER" --commit "$COMMIT" --mode full \
@@ -247,13 +286,17 @@ write_command_file() {
       printf '%q ' --skip-dependency-install
     fi
     printf '2>&1 | tee -a -- %q\n' "$LOG_PATH"
-    printf '%s\n' 'runner_status=${PIPESTATUS[0]}'
+    printf '%s\n' 'pipeline_status=("${PIPESTATUS[@]}")'
+    printf '%s\n' 'runner_status=${pipeline_status[0]}'
+    printf '%s\n' 'tee_status=${pipeline_status[1]}'
+    printf '%s\n' 'final_status=$runner_status'
+    printf '%s\n' 'if (( final_status == 0 && tee_status != 0 )); then final_status=$tee_status; fi'
     printf 'exit_status_path=%q\n' "$EXIT_STATUS_PATH"
     printf '%s\n' 'status_tmp="${exit_status_path}.tmp.$$"'
     printf '%s\n' '(umask 077; set -o noclobber; : > "$status_tmp") || exit 125'
-    printf '%s\n' 'printf "%s\n" "$runner_status" > "$status_tmp"'
-    printf '%s\n' 'mv -- "$status_tmp" "$exit_status_path"'
-    printf '%s\n' 'exit "$runner_status"'
+    printf '%s\n' 'if ! printf "%s\n" "$final_status" > "$status_tmp"; then exit 126; fi'
+    printf '%s\n' 'if ! mv -- "$status_tmp" "$exit_status_path"; then exit 127; fi'
+    printf '%s\n' 'exit "$final_status"'
   } > "$COMMAND_FILE"
 }
 
@@ -296,6 +339,7 @@ acquire_start_lock() {
 }
 
 start_campaign() {
+  umask 077
   require_linux_tools
   [[ -L "$STATE_DIR" ]] && die "launcher state directory must not be linked: $STATE_DIR"
   if [[ -e "$STATE_DIR" ]]; then
@@ -306,16 +350,22 @@ start_campaign() {
     || die "cannot resolve repository HEAD: $REPO"
   [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] \
     || die "repository HEAD is not an exact 40-character lowercase commit: $COMMIT"
-  [[ -z "$(git -C "$REPO" status --porcelain)" ]] || die 'Git worktree must be clean'
+  local git_status
+  if ! git_status="$(git -C "$REPO" status --porcelain)"; then
+    die "cannot inspect Git worktree with git status: $REPO"
+  fi
+  [[ -z "$git_status" ]] || die 'Git worktree must be clean'
 
   if [[ ! -e "$STATE_DIR" ]]; then
-    if ! mkdir "$STATE_DIR" 2>/dev/null; then
+    if ! mkdir -m 700 "$STATE_DIR" 2>/dev/null; then
       [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
         || die "cannot create launcher state directory: $STATE_DIR"
     fi
   fi
   [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
     || die "launcher state directory must be a real directory: $STATE_DIR"
+  verify_state_dir_permissions \
+    || die "launcher state directory failed ownership or permission validation: $STATE_DIR"
   acquire_start_lock
 
   if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
@@ -343,7 +393,6 @@ start_campaign() {
     [[ ! -e "$target" && ! -L "$target" ]] || die "campaign target already exists: $target"
   done
 
-  umask 077
   (set -o noclobber; : > "$COMMAND_FILE") \
     || die "cannot reserve unique command file: $COMMAND_FILE"
   chmod 700 "$COMMAND_FILE" || die "cannot secure command file: $COMMAND_FILE"
@@ -371,6 +420,8 @@ show_status() {
   require_linux_tools
   [[ -L "$STATE_DIR" ]] && die "launcher state directory must not be linked: $STATE_DIR"
   [[ -d "$STATE_DIR" ]] || die "no current state: $STATE_FILE"
+  verify_state_dir_permissions \
+    || die "launcher state directory failed ownership or permission validation: $STATE_DIR"
   load_state
   inspect_session "$STATE_SESSION"
   printf 'state: %s\n' "$SESSION_STATE"
@@ -393,6 +444,8 @@ follow_logs() {
   require_linux_tools
   [[ -L "$STATE_DIR" ]] && die "launcher state directory must not be linked: $STATE_DIR"
   [[ -d "$STATE_DIR" ]] || die "no current state: $STATE_FILE"
+  verify_state_dir_permissions \
+    || die "launcher state directory failed ownership or permission validation: $STATE_DIR"
   load_state
   [[ -f "$STATE_LOG_PATH" && ! -L "$STATE_LOG_PATH" ]] \
     || die "campaign log does not exist: $STATE_LOG_PATH"
