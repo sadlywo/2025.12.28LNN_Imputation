@@ -61,6 +61,23 @@ _CREDENTIAL_LEAK_PATTERNS = (
         ),
     ),
     (
+        "SCP or SFTP access command",
+        re.compile(
+            r"(?:^|[;&|]\s*)[ \t]*(?:scp|sftp)\b[^\r\n]*[ \t]"
+            r"[a-z0-9._%+-]+@(?:[a-z0-9-]+\.)+[a-z0-9-]+"
+            r"(?::[^\s]+)?",
+            flags=re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "Markdown user-at-host access target",
+        re.compile(
+            r"`[a-z0-9._%+-]+@(?:[a-z0-9-]+\.)+[a-z0-9-]+"
+            r"(?::[^`\s]+)?`",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    (
         "MatPool host",
         re.compile(
             r"\b(?:[a-z0-9-]+\.)*matpool\.com\b",
@@ -72,7 +89,7 @@ _CREDENTIAL_LEAK_PATTERNS = (
         re.compile(
             r"\b(?:SSH_(?:HOST|PORT|USER(?:NAME)?|PASSWORD|PASSWD|PWD|PRIVATE_KEY)|"
             r"MATPOOL_(?:[A-Z0-9]+_)*(?:HOST|PORT|USER(?:NAME)?|PASSWORD|PASSWD|"
-            r"PWD|TOKEN|SECRET|PRIVATE_KEY)|(?:API|ACCESS)_TOKEN|"
+            r"PWD|TOKEN|SECRET|PRIVATE_KEY)|(?:[A-Z0-9]+_)*TOKEN|"
             r"[A-Z0-9]+(?:_[A-Z0-9]+)*_SECRET)"
             r"\s*(?::=|[=:])",
             flags=re.IGNORECASE,
@@ -96,7 +113,7 @@ _CREDENTIAL_LEAK_PATTERNS = (
     (
         "private key header",
         re.compile(
-            r"-{5}BEGIN[ \t]+(?:(?:OPENSSH|RSA|EC|DSA)[ \t]+)?"
+            r"-{5}BEGIN[ \t]+(?:(?:OPENSSH|ENCRYPTED|RSA|EC|DSA)[ \t]+)?"
             r"PRIVATE[ \t]+KEY-{5}",
             flags=re.IGNORECASE,
         ),
@@ -133,6 +150,8 @@ def _fictional_credential_payloads() -> tuple[str, ...]:
         _assembled("MATPOOL", "_TOKEN", " = dummy-value"),
         _assembled("api", "_token", ": dummy-value"),
         _assembled("ACCESS", "_TOKEN", " := dummy-value"),
+        _assembled("GITHUB", "_TOKEN", " = dummy-value"),
+        _assembled("hf", "_token", ": dummy-value"),
         _assembled("VALIDATION", "_SECRET", " = dummy-value"),
         _assembled("SSH", "_PRIVATE_KEY", " = dummy-value"),
         _assembled("s", "sh://", "operator", "@", "example.invalid/project"),
@@ -144,6 +163,22 @@ def _fictional_credential_payloads() -> tuple[str, ...]:
         ),
         _assembled("-----BEGIN ", "OPENSSH PRIVATE KEY-----"),
         _assembled("-----BEGIN ", "PRIVATE KEY-----"),
+        _assembled("-----BEGIN ", "ENCRYPTED PRIVATE KEY-----"),
+        _assembled(
+            "s",
+            "cp ",
+            "operator",
+            "@",
+            "example.invalid:/remote/file ./local-file",
+        ),
+        _assembled(
+            "s",
+            "ftp ",
+            "operator",
+            "@",
+            "example.invalid:/remote/path",
+        ),
+        _assembled("- `", "operator", "@", "example.invalid", "`"),
         _assembled("MATPOOL", "_SSH_HOST", "=compute.example.invalid"),
         _assembled("matpool", "_ssh_port", " := 65004"),
         _assembled("MATPOOL", "_SSH_USER", ": operator"),
@@ -207,9 +242,11 @@ def test_credential_leak_scanner_recognizes_fictional_payloads(
         "SSH access is documented without connection details.",
         "A password policy is not an assignment.",
         "token_count = 12",
+        "Token budgets and token counts are ordinary metrics.",
         "The secret concept is discussed without assigning a value.",
         "PWD = /workspace/project",
         "Git fixture email is test@example.invalid.",
+        "Contact support@example.invalid for documentation questions.",
     ),
 )
 def test_credential_leak_scanner_ignores_ordinary_narrative(narrative: str) -> None:
