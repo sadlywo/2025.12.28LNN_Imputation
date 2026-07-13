@@ -167,7 +167,6 @@ def write_metrics_atomically(output, metrics):
     except OSError as error:
         raise MetricsError("cannot reserve output publication: {}".format(output), 3) from error
     temporary = None
-    published = False
     try:
         if output.exists() or output.is_symlink():
             raise MetricsError("refusing to replace existing output: {}".format(output), 3)
@@ -180,7 +179,6 @@ def write_metrics_atomically(output, metrics):
             os.fsync(handle.fileno())
         os.replace(temporary, str(output))
         temporary = None
-        published = True
     except MetricsError:
         raise
     except OSError as error:
@@ -191,11 +189,10 @@ def write_metrics_atomically(output, metrics):
                 os.unlink(temporary)
             except OSError:
                 pass
-        if not published:
-            try:
-                os.rmdir(str(reservation))
-            except OSError:
-                pass
+        try:
+            os.rmdir(str(reservation))
+        except OSError:
+            pass
 
 
 def main():

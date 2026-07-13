@@ -1,10 +1,12 @@
 """Executable contracts for the Python 3.12 server validation runner."""
 
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -182,6 +184,28 @@ def _run_metrics(*arguments: str, optimized: bool = False) -> subprocess.Complet
     return subprocess.run(command, capture_output=True, check=False, text=True)
 
 
+def _git_bash_path(path: Path) -> str:
+    resolved = path.resolve().as_posix()
+    if len(resolved) >= 3 and resolved[1:3] == ":/":
+        return "/{}/{}".format(resolved[0].lower(), resolved[3:])
+    return resolved
+
+
+def _write_bash_executable(path: Path, source: str) -> None:
+    path.write_text("#!/usr/bin/env bash\nset -eu\n" + source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _run_helper_bash(script: str, *arguments: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [_bash(), "-c", script, "_", *(_git_bash_path(item) for item in arguments)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
 def test_stage_metrics_fails_closed_under_optimized_python_after_writing_gate(
     tmp_path: Path,
 ) -> None:
@@ -247,6 +271,109 @@ def test_stage_metrics_ignores_pre_stage_gpu_samples(tmp_path: Path) -> None:
 
     assert completed.returncode == 4
     assert not output.exists()
+
+
+def test_stage_metrics_removes_publish_reservation_after_success(tmp_path: Path) -> None:
+    shards_root, gpu_csv, _, output = _write_completed_stage(tmp_path)
+    gpu_csv.write_text(
+        "timestamp_utc,memory_used_mib,memory_total_mib,utilization_percent\n"
+        "2026-01-01T00:00:10+00:00,100,1000,10\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_metrics(
+        "--shards-root", str(shards_root), "--indices", "000",
+        "--stage-start", "2026-01-01T00:00:00+00:00",
+        "--gpu-csv", str(gpu_csv), "--minimum-groups", "1", "--output", str(output),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output.read_text(encoding="utf-8"))["gate_passed"] is True
+    assert not (tmp_path / ".metrics.json.publish.lock").exists()
+
+
+def test_audit_active_rejects_an_unexpected_pgrep_error(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_bash_executable(bin_dir / "pgrep", "exit 2\n")
+    fake_python = tmp_path / "fake-python"
+    _write_bash_executable(fake_python, "exit 97\n")
+    audit_dir = tmp_path / "audit"
+    shards_root = tmp_path / "shards"
+    audit_dir.mkdir()
+    shards_root.mkdir()
+
+    completed = _run_helper_bash(
+        'export PATH="$1:$PATH" PYTHON_BIN="$2" AUDIT_DIR="$3" SHARDS_ROOT="$4"; '
+        'source "$5"; audit_active 000',
+        bin_dir, fake_python, audit_dir, shards_root, HELPERS,
+    )
+
+    assert completed.returncode == 3
+    assert "cannot inspect shard processes: rc=2" in completed.stderr
+
+
+def test_launch_shard_reserves_ownership_before_a_second_launch(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_bash_executable(bin_dir / "pgrep", "exit 1\n")
+    fake_python = tmp_path / "fake-python"
+    invocation_log = tmp_path / "python.log"
+    _write_bash_executable(
+        fake_python,
+        'printf "%s\\n" "$*" >> "$FAKE_PYTHON_LOG"\nsleep 30\n',
+    )
+    audit_dir = tmp_path / "audit"
+    shards_root = tmp_path / "shards"
+    audit_dir.mkdir()
+    shards_root.mkdir()
+    config = tmp_path / "config.yaml"
+    plan = tmp_path / "plan.json"
+    config.write_text("{}\n", encoding="utf-8")
+    plan.write_text("{}\n", encoding="utf-8")
+
+    completed = _run_helper_bash(
+        'export PATH="$1:$PATH" PYTHON_BIN="$2" AUDIT_DIR="$3" SHARDS_ROOT="$4" '
+        'CONFIG="$5" PLAN="$6" FAKE_PYTHON_LOG="$7"; source "$8"; '
+        'launch_shard 000; first=$?; launch_shard 000; second=$?; '
+        'test "$first" -eq 0; test "$second" -eq 2; '
+        'test -d "$AUDIT_DIR/shard-000.ownership.lock"; '
+        'test "$(wc -l < "$FAKE_PYTHON_LOG")" -eq 1; '
+        'kill "$(cat "$AUDIT_DIR/shard-000.pid")" 2>/dev/null || true; exit 0',
+        bin_dir, fake_python, audit_dir, shards_root, config, plan, invocation_log, HELPERS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_gpu_sampler_waits_for_a_valid_row_before_returning(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_bash_executable(
+        bin_dir / "nvidia-smi",
+        'sleep 0.4\nprintf "%s\\n" "10, 1000, 1"\n',
+    )
+    fake_python = tmp_path / "fake-python"
+    _write_bash_executable(
+        fake_python,
+        'if [ "${1:-}" = "-" ]; then grep -q "10,1000,1" "$2"; exit $?; fi\n'
+        "exit 97\n",
+    )
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+
+    started = time.monotonic()
+    completed = _run_helper_bash(
+        'export PATH="$1:$PATH" PYTHON_BIN="$2" AUDIT_DIR="$3"; '
+        'source "$4"; start_gpu_sampler sample; rc=$?; '
+        'test "$rc" -eq 0; test -s "$AUDIT_DIR/gpu-sample.csv"; '
+        'stop_gpu_sampler sample; exit 0',
+        bin_dir, fake_python, audit_dir, HELPERS,
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode == 0, completed.stderr
+    assert elapsed >= 0.3
 
 
 def test_helpers_have_pipefail_and_atomic_shard_reservation() -> None:

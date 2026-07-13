@@ -41,6 +41,12 @@ audit_active() {
   test ! -f "$stamp" || last="$(cat "$stamp")"
   test "$((now - last))" -ge 60 || return 0
   printf '%s\n' "$now" > "$stamp"
+  local process_listing="" pgrep_rc=0
+  process_listing="$(pgrep -af 'validation_v2\.cli shard')" || pgrep_rc=$?
+  if test "$pgrep_rc" -ne 0 -a "$pgrep_rc" -ne 1; then
+    echo "cannot inspect shard processes: rc=$pgrep_rc" >&2
+    return 3
+  fi
   {
     date -Is
     local marker status groups pid alive
@@ -62,7 +68,7 @@ audit_active() {
       printf 'shard=%s marker=%s group_runs=%s pid=%s alive=%s\n' \
         "$shard" "$status" "$groups" "$pid" "$alive"
     done
-    pgrep -af 'validation_v2\.cli shard' || true
+    test -z "$process_listing" || printf '%s\n' "$process_listing"
     nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
       --format=csv,noheader,nounits
   } | tee -a "$AUDIT_DIR/monitor-60s.log"
