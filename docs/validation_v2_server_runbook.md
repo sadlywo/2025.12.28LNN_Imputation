@@ -6,6 +6,71 @@ immutable eight-shard plan, eight isolated shard roots, and one newly published
 final root. A smoke run, a partial run, or artifacts from another commit are
 diagnostic only.
 
+## Current supported execution path
+
+The Python 3.12 runner below is the **only current supported execution path**.
+It creates the repository-local `.venv-server`, installs the exact CUDA 12.1
+PyTorch build (`torch==2.3.1+cu121`) and the locked validation dependencies,
+records runtime provenance, runs the Linux atomic-race test and full test suite,
+creates the immutable eight-shard plan, applies the 1 -> 2 -> 4 -> 8 rollout
+gates, and finally merges, validates, and summarizes the five-seed campaign.
+Do not manually replace individual stages with the older commands further down
+this document.
+
+After cloning or fetching, enter the target revision by its exact 40-character
+SHA. Network Turbo is allowed only for the short clone/fetch/dependency-install
+operation; the runner never needs it during training.
+
+```bash
+cd /root/autodl-tmp/2025.12.28LNN_Imputation
+git checkout --detach "<40-HEX-VALIDATED-COMMIT>"
+test -z "$(git status --porcelain)"
+
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode preflight
+```
+
+`--mode preflight` is optional diagnostic preparation. It checks the
+Linux/RTX 4090D runtime, creates `REPO/.venv-server`, explicitly installs the
+cu121 Torch wheel, runs the complete test suite, and produces a clean
+175-group/4,095-cell/eight-shard plan. A failure is a hard stop: diagnose it;
+do not invoke `--mode full`. Every runner invocation creates an immutable
+campaign seal, so a later full campaign must use a different
+`--campaign-suffix`; do not run preflight and full consecutively with the same
+suffix.
+
+```bash
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full
+```
+
+For normal production work, use `--mode full` directly: it includes every
+preflight protection, then runs the formal
+1 -> 2 -> 4 -> 8 campaign and its fail-closed fallback queues. It can run for
+multiple days. Leave its `AUDIT_DIR`, shard roots, logs, and process identity
+files intact if it stops; do not delete or overwrite them to force a retry.
+Use `--skip-dependency-install` only after `.venv-server` has already been
+created and successfully verified on this same server; it never skips runtime,
+Git, test, or plan checks.
+
+If the optional diagnostic preflight was run first, give the later full
+campaign a fresh suffix, for example:
+
+```bash
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
+  --campaign-suffix "formal-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+The old `results/validation_v2/server_full-fcf81f8` root is diagnostic
+evidence only. It must never be copied into, merged with, or summarized with
+the new commit-qualified campaign.
+
+## Historical implementation reference
+
+The remaining sections preserve the previous manual operator contract for
+auditability and incident analysis. They are **not** the current recommended
+execution path and must not be mixed with the Python 3.12 runner above. In
+particular, any older Conda commands and hand-copied helper functions below
+are historical reference rather than prerequisites for a new campaign.
+
 ## 1. Quarantine the legacy single-process run
 
 The old `fcf81f8` single-process `matrix` root and the new commit's shard roots

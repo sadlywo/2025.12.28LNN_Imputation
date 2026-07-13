@@ -37,6 +37,36 @@ def test_server_runbook_uses_the_delivered_validation_branch() -> None:
     assert "validation-v2-server" not in runbook
 
 
+def test_server_runbooks_make_the_python312_runner_the_only_current_entrypoint() -> None:
+    english = (REPO_ROOT / "docs" / "validation_v2_server_runbook.md").read_text(
+        encoding="utf-8"
+    )
+    chinese = (REPO_ROOT / "docs" / "validation_v2_server_runbook_zh.md").read_text(
+        encoding="utf-8"
+    )
+    canonical_preflight = (
+        'bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" '
+        "--mode preflight"
+    )
+    canonical_full = (
+        'bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" '
+        "--mode full"
+    )
+
+    for runbook in (english, chinese):
+        assert "scripts/run_validation_v2_server.sh" in runbook
+        assert ".venv-server" in runbook
+        assert canonical_preflight in runbook
+        assert canonical_full in runbook
+        assert "git checkout --detach" in runbook
+        assert "server_full-fcf81f8" in runbook
+    assert "pinn_imu" not in chinese
+    assert "Current supported execution path" in english
+    assert "Historical implementation reference" in english
+    assert re.search(r"different\s+`--campaign-suffix`", english)
+    assert "different `--campaign-suffix`" in chinese
+
+
 @pytest.fixture
 def external_repo_tmp_path() -> Iterator[Path]:
     with tempfile.TemporaryDirectory(
@@ -632,7 +662,8 @@ def test_server_runbook_pins_the_offline_linux_shard_plan_contract():
         assert f"export {variable}=" in runbook
     assert 'export CONFIG="/root/' in runbook
     assert "CUBLAS_WORKSPACE_CONFIG=:4096:8" in runbook
-    assert "conda activate /root/miniconda3/envs/pinn_imu" in runbook
+    assert "scripts/run_validation_v2_server.sh" in runbook
+    assert ".venv-server" in runbook
     assert "shard-plan" in runbook
     assert "--shard-count 8" in runbook
     assert "total_groups" in runbook and "175" in runbook
