@@ -40,7 +40,9 @@ def _make_fake_python(tmp_path: Path, version: str) -> tuple[Path, Path]:
     executable.write_text(
         "#!/usr/bin/env bash\n"
         "set -eu\n"
-        "printf '%s\\n' \"$*\" >> \"$FAKE_PYTHON_LOG\"\n"
+        "for argument in \"$@\"; do\n"
+        "  printf '<%s>\\n' \"$argument\" >> \"$FAKE_PYTHON_LOG\"\n"
+        "done\n"
         "if [ \"${1:-}\" = \"--version\" ]; then\n"
         f"  printf '%s\\n' 'Python {version}'\n"
         "  exit 0\n"
@@ -109,8 +111,10 @@ def test_runner_rejects_non_python312_before_installation(tmp_path: Path) -> Non
     assert completed.returncode == 2
     assert "Python 3.12" in completed.stderr
     invocations = log.read_text(encoding="utf-8") if log.exists() else ""
+    assert "<--version>" in invocations
     assert "-m venv" not in invocations
     assert "-m pip" not in invocations
+    assert not (repository / ".venv-server").exists()
 
 
 def test_runner_uses_local_venv_and_explicit_cuda121_torch_index() -> None:
@@ -122,18 +126,19 @@ def test_runner_uses_local_venv_and_explicit_cuda121_torch_index() -> None:
     assert "https://download.pytorch.org/whl/cu121" in source
     assert "torch==2.3.1" in source
     assert 'torch.__version__ == "2.3.1+cu121"' in source
-    assert "conda" not in source
+    assert "/root/miniconda3" not in source
+    assert "conda activate" not in source
     assert "pinn_imu" not in source
 
 
 def test_runner_full_mode_calls_formal_workflow() -> None:
     source = RUNNER.read_text(encoding="utf-8")
 
+    assert 'run_formal_campaign "$MODE"' in source
     for token in (
         "test_linux_rename_noreplace_survives_real_directory_race",
         "-m pytest -q",
         "validation_v2.cli shard-plan",
-        "run_formal_campaign",
         "validation_v2.cli merge-shards",
         "validation_v2.experiments.validate_artifacts",
         "validation_v2.cli summarize",
