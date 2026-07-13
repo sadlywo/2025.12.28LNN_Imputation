@@ -1,0 +1,45 @@
+data_root: Oxford Dataset
+output_root: results/validation_v2/server_full
+selection_split: validation
+seeds: [2026, 2027, 2028, 2029, 2030]
+split_seed: 2026
+seq_len: 30
+batch_size: 32
+epochs: 100
+device: auto
+require_clean_git: true
+models:
+  - linear
+  - locf
+  - bilstm
+  - bilnn
+  - hybrid
+  - equal_average
+  - fixed_gate_0
+  - fixed_gate_0.5
+  - fixed_gate_1
+protocols:
+  - strict_file
+  - scenario_holdout:handbag
+  - scenario_holdout:handheld
+  - scenario_holdout:running
+  - scenario_holdout:slow_walking
+  - scenario_holdout:trolley
+  - scenario_holdout:user-2
+rates: [0.1, 0.2, 0.3, 0.4]
+topologies: [point, block, channel]
+irregular_cases:
+  - method: interval_jitter
+    requested_irregularity: 0.2
+    value_topology: point
+    value_requested_fraction: 0.3
+objective: reconstruction_only
+kinematic_ablation:
+  name: kinematic_ablation
+  enabled: false
+trajectory_enabled: true
+irregular_sampling_is_value_missing: false
+max_train_windows: 4096
+max_eval_samples: null
+hidden_size: 32
+learning_rate: 0.001
