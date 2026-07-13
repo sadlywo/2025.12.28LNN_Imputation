@@ -47,9 +47,10 @@ preflight protection, then runs the formal
 1 -> 2 -> 4 -> 8 campaign and its fail-closed fallback queues. It can run for
 multiple days. Leave its `AUDIT_DIR`, shard roots, logs, and process identity
 files intact if it stops; do not delete or overwrite them to force a retry.
-Use `--skip-dependency-install` only after `.venv-server` has already been
-created and successfully verified on this same server; it never skips runtime,
-Git, test, or plan checks.
+Use `--skip-dependency-install` only after the existing
+`.venv-server/bin/python` has been created and successfully verified on this
+same server. If that executable is absent, the runner exits with status 2; the
+option never skips runtime, Git, test, or plan checks.
 
 If the optional diagnostic preflight was run first, give the later full
 campaign a fresh suffix, for example:

@@ -10,7 +10,7 @@ helper 或逐条 shard 命令与它混用。英文完整历史契约见
 
 运行器在 `REPO/.venv-server` 创建项目内 Python 3.12 虚拟环境，并显式安装
 `torch==2.3.1+cu121` 和锁定的验证依赖。它随后会记录 Python、包版本、CUDA 和
-GPU 的 provenance，执行 Linux 原子写入竞态测试与完整 pytest，生成不可变的
+GPU 的运行时 provenance，执行 Linux 原子写入竞态测试与完整 pytest，生成不可变的
 8-shard 计划（175 个训练组、4,095 个实验单元），并在 full 模式执行
 1 -> 2 -> 4 -> 8 分阶段放量、严格合并、产物验证和五随机种子汇总。
 
@@ -45,8 +45,9 @@ bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode
 依赖，请只让安装命令处于一个短暂的 Network Turbo 子 shell；运行器本身会在
 `.venv-server` 内完成 pip 安装。
 
-`--skip-dependency-install` 仅可在同一服务器的 `.venv-server` 已创建并成功通过
-运行器运行时校验后使用。它不会跳过 Git、CUDA、完整测试或计划校验：
+`--skip-dependency-install` 仅可在同一服务器的 `.venv-server` 已创建且可执行的
+`.venv-server/bin/python` 已成功通过运行器运行时校验后使用。若该解释器不存在，
+运行器会以状态码 2 退出。它不会跳过 Git、CUDA、完整测试或计划校验：
 
 ```bash
 bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
@@ -62,8 +63,8 @@ bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode
 ```
 
 预检将创建不可变 campaign seal。预检失败时，不得启动 full；先修复环境、提交、
-GPU 或测试问题。预检成功后也不能以同一后缀再次运行 full：每次运行都必须使用
-different `--campaign-suffix`。因此，预检后的正式运行使用一个新的后缀，例如：
+GPU 或测试问题。预检成功后也不能以同一后缀再次运行 full：每次运行都必须使用不同或新的
+`--campaign-suffix`。因此，预检后的正式运行使用一个新的后缀，例如：
 
 ```bash
 bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \

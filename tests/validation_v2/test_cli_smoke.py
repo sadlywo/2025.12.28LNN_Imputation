@@ -56,6 +56,9 @@ def test_server_runbooks_make_the_python312_runner_the_only_current_entrypoint()
     for runbook in (english, chinese):
         assert "scripts/run_validation_v2_server.sh" in runbook
         assert ".venv-server" in runbook
+        assert ".venv-server/bin/python" in runbook
+        assert "cu121" in runbook
+        assert "--skip-dependency-install" in runbook
         assert canonical_preflight in runbook
         assert canonical_full in runbook
         assert "git checkout --detach" in runbook
@@ -63,8 +66,17 @@ def test_server_runbooks_make_the_python312_runner_the_only_current_entrypoint()
     assert "pinn_imu" not in chinese
     assert "Current supported execution path" in english
     assert "Historical implementation reference" in english
+    assert english.index("Historical implementation reference") < english.index(
+        "conda activate"
+    )
     assert re.search(r"different\s+`--campaign-suffix`", english)
-    assert "different `--campaign-suffix`" in chinese
+    assert re.search(r"使用不同或新的\s+`--campaign-suffix`", chinese)
+    assert "runtime provenance" in english
+    assert "multiple days" in english
+    assert "created and successfully verified" in english
+    assert "运行时 provenance" in chinese
+    assert "持续数日" in chinese
+    assert re.search(r"已创建且可执行的\s+`.venv-server/bin/python`", chinese)
 
 
 @pytest.fixture
