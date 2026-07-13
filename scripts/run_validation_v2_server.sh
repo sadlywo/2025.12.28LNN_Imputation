@@ -103,8 +103,21 @@ PYTHON_MINOR="${BASH_REMATCH[1]}"
 if ! "$PYTHON3_BIN" -m venv --help >/dev/null 2>&1; then
   die "Python venv support is unavailable; install the matching python3.${PYTHON_MINOR}-venv package"
 fi
+if ! "$PYTHON3_BIN" -m ensurepip --version >/dev/null 2>&1; then
+  die "Python ensurepip is unavailable; install the matching python3.${PYTHON_MINOR}-venv package (ensurepip required)"
+fi
+PYTHON_BIN="$REPO/.venv-server/bin/python"
+CAMPAIGN_PYTHON_MINOR="$PYTHON_MINOR"
+if [[ -e "$PYTHON_BIN" || -L "$PYTHON_BIN" ]]; then
+  VENV_RUNTIME="$("$PYTHON_BIN" -c \
+    "import platform, sys; print(platform.python_implementation(), '{}.{}'.format(*sys.version_info[:2]))" 2>&1)" \
+    || die "cannot inspect existing .venv-server Python: $PYTHON_BIN"
+  [[ "$VENV_RUNTIME" =~ ^CPython[[:space:]]3\.(10|11|12)$ ]] \
+    || die "existing .venv-server must use CPython 3.10, 3.11, or 3.12; found: $VENV_RUNTIME"
+  CAMPAIGN_PYTHON_MINOR="${BASH_REMATCH[1]}"
+fi
 if (( ! CAMPAIGN_SUFFIX_EXPLICIT )); then
-  CAMPAIGN_SUFFIX="sharded-v2-py3${PYTHON_MINOR}"
+  CAMPAIGN_SUFFIX="sharded-v2-py3${CAMPAIGN_PYTHON_MINOR}"
 fi
 [[ "$CAMPAIGN_SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'invalid --campaign-suffix'
 
@@ -152,7 +165,6 @@ trap 'cleanup_runner 130' INT
 trap 'cleanup_runner 143' TERM
 [[ "$(uname -s)" == Linux ]] || die 'this formal runner requires Linux'
 
-PYTHON_BIN="$REPO/.venv-server/bin/python"
 if (( SKIP_DEPENDENCY_INSTALL )) && [[ ! -x "$PYTHON_BIN" ]]; then
   die '--skip-dependency-install requires an existing .venv-server Python interpreter'
 fi

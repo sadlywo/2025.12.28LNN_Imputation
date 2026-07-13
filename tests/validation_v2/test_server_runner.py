@@ -50,6 +50,7 @@ def _make_fake_python(
     *,
     implementation: str = "CPython",
     venv_available: bool = True,
+    ensurepip_available: bool = True,
 ) -> tuple[Path, Path]:
     log = tmp_path / "fake-python.log"
     executable = tmp_path / "python3"
@@ -67,6 +68,10 @@ def _make_fake_python(
         "&& [ \"${3:-}\" = \"--help\" ]; then\n"
         f"  exit {0 if venv_available else 1}\n"
         "fi\n"
+        "if [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"ensurepip\" ] "
+        "&& [ \"${3:-}\" = \"--version\" ]; then\n"
+        f"  exit {0 if ensurepip_available else 1}\n"
+        "fi\n"
         "printf '%s\\n' 'unexpected fake Python invocation' >&2\n"
         "exit 97\n",
         encoding="utf-8",
@@ -82,7 +87,42 @@ def _fake_python_probe_log() -> list[str]:
         "<-m>",
         "<venv>",
         "<--help>",
+        "<-m>",
+        "<ensurepip>",
+        "<--version>",
     ]
+
+
+def _make_fake_venv_python(
+    repository: Path,
+    version: str,
+    *,
+    implementation: str = "CPython",
+) -> tuple[Path, Path]:
+    log = repository.parent / "fake-venv-python.log"
+    executable = repository / ".venv-server" / "bin" / "python"
+    executable.parent.mkdir(parents=True)
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "for argument in \"$@\"; do\n"
+        "  printf '<%s>\\n' \"$argument\" >> \"$FAKE_VENV_PYTHON_LOG\"\n"
+        "done\n"
+        "if [ \"${1:-}\" = \"-c\" ]; then\n"
+        f"  printf '%s\\n' '{implementation} {'.'.join(version.split('.')[:2])}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable, log
+
+
+def _make_non_linux_bash_env(tmp_path: Path) -> Path:
+    bash_env = tmp_path / "non-linux-bash-env"
+    bash_env.write_text("uname() { printf '%s\\n' TestOS; }\n", encoding="utf-8")
+    return bash_env
 
 
 def _make_clean_repository(tmp_path: Path) -> tuple[Path, str]:
@@ -136,11 +176,13 @@ def test_runner_accepts_supported_cpython_and_uses_dynamic_default_suffix(
     case.mkdir()
     fake_python, log = _make_fake_python(case, version)
     repository, commit = _make_clean_repository(case)
+    bash_env = _make_non_linux_bash_env(case)
 
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
         environment={
             "MSYS2_ARG_CONV_EXCL": "",
+            "BASH_ENV": bash_env.as_posix(),
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": log.as_posix(),
         },
@@ -219,12 +261,14 @@ def test_runner_preserves_explicit_campaign_suffix(tmp_path: Path) -> None:
     fake_python, _ = _make_fake_python(tmp_path, "3.10.14")
     repository, commit = _make_clean_repository(tmp_path)
     explicit = "operator-selected"
+    bash_env = _make_non_linux_bash_env(tmp_path)
 
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
         "--campaign-suffix", explicit,
         environment={
             "MSYS2_ARG_CONV_EXCL": "",
+            "BASH_ENV": bash_env.as_posix(),
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": (tmp_path / "log").as_posix(),
         },
@@ -255,6 +299,113 @@ def test_runner_rejects_an_explicit_empty_campaign_suffix_before_campaign_writes
     assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
     assert not (repository / ".venv-server").exists()
     assert not list(tmp_path.glob("validation-v2-audit-*"))
+
+
+def test_runner_rejects_missing_ensurepip_before_audit_or_venv_writes(
+    tmp_path: Path,
+) -> None:
+    fake_python, log = _make_fake_python(
+        tmp_path, "3.11.9", ensurepip_available=False
+    )
+    repository, commit = _make_clean_repository(tmp_path)
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "ensurepip" in completed.stderr
+    assert "python3.11-venv" in completed.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
+    assert not (repository / ".venv-server").exists()
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+
+
+def test_runner_uses_existing_venv_minor_for_the_dynamic_default_suffix(
+    tmp_path: Path,
+) -> None:
+    fake_python, system_log = _make_fake_python(tmp_path, "3.10.14")
+    repository, commit = _make_clean_repository(tmp_path)
+    _, venv_log = _make_fake_venv_python(repository, "3.12.3")
+    bash_env = _make_non_linux_bash_env(tmp_path)
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "BASH_ENV": bash_env.as_posix(),
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": system_log.as_posix(),
+            "FAKE_VENV_PYTHON_LOG": venv_log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "requires Linux" in completed.stderr
+    assert (tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py312").is_dir()
+    assert not (tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py310").exists()
+    assert venv_log.read_text(encoding="utf-8").splitlines() == [
+        "<-c>",
+        "<import platform, sys; print(platform.python_implementation(), '{}.{}'.format(*sys.version_info[:2]))>",
+    ]
+
+
+@pytest.mark.parametrize(
+    "implementation,version",
+    [("CPython", "3.9.19"), ("CPython", "3.13.0"), ("PyPy", "3.11.9")],
+)
+def test_runner_rejects_an_unsupported_existing_venv_before_campaign_writes(
+    tmp_path: Path, implementation: str, version: str
+) -> None:
+    fake_python, system_log = _make_fake_python(tmp_path, "3.10.14")
+    repository, commit = _make_clean_repository(tmp_path)
+    _, venv_log = _make_fake_venv_python(
+        repository, version, implementation=implementation
+    )
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": system_log.as_posix(),
+            "FAKE_VENV_PYTHON_LOG": venv_log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "existing .venv-server must use CPython 3.10, 3.11, or 3.12" in completed.stderr
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+
+
+def test_runner_explicit_suffix_is_authoritative_with_an_existing_venv(
+    tmp_path: Path,
+) -> None:
+    fake_python, system_log = _make_fake_python(tmp_path, "3.10.14")
+    repository, commit = _make_clean_repository(tmp_path)
+    _, venv_log = _make_fake_venv_python(repository, "3.12.3")
+    bash_env = _make_non_linux_bash_env(tmp_path)
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        "--campaign-suffix", "chosen",
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "BASH_ENV": bash_env.as_posix(),
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": system_log.as_posix(),
+            "FAKE_VENV_PYTHON_LOG": venv_log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert (tmp_path / f"validation-v2-audit-{commit}-chosen").is_dir()
+    assert not list(tmp_path.glob(f"validation-v2-audit-{commit}-sharded-v2-*"))
 
 
 def test_runner_skip_dependency_install_requires_an_existing_venv(tmp_path: Path) -> None:
@@ -329,6 +480,9 @@ def _run_fake_runtime(
     torch_version: str = "2.3.1+cu121",
     torch_cuda: str = "12.1",
     cuda_available: bool = True,
+    nvidia_smi_available: bool = True,
+    nvidia_smi_returncode: int = 0,
+    nvidia_smi_output: tuple[str, ...] = ("555.42",),
     output: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess, Path, Path]:
     fake_modules = tmp_path / "fake-modules"
@@ -354,22 +508,29 @@ def _run_fake_runtime(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     nvidia_log = tmp_path / "nvidia-smi.log"
-    posix_nvidia_smi = bin_dir / "nvidia-smi"
-    posix_nvidia_smi.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -eu\n"
-        "printf '%s\\n' \"$*\" >> \"$FAKE_NVIDIA_SMI_LOG\"\n"
-        "printf '%s\\n' '555.42'\n",
-        encoding="utf-8",
-    )
-    posix_nvidia_smi.chmod(0o755)
-    windows_nvidia_smi = bin_dir / "nvidia-smi.cmd"
-    windows_nvidia_smi.write_text(
-        "@echo off\n"
-        "echo %* >>\"%FAKE_NVIDIA_SMI_LOG%\"\n"
-        "echo 555.42\n",
-        encoding="utf-8",
-    )
+    if nvidia_smi_available:
+        posix_output = "".join(
+            f"printf '%s\\n' '{line}'\n" for line in nvidia_smi_output
+        )
+        posix_nvidia_smi = bin_dir / "nvidia-smi"
+        posix_nvidia_smi.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            "printf '%s\\n' \"$*\" >> \"$FAKE_NVIDIA_SMI_LOG\"\n"
+            + posix_output
+            + f"exit {nvidia_smi_returncode}\n",
+            encoding="utf-8",
+        )
+        posix_nvidia_smi.chmod(0o755)
+        windows_output = "".join(f"echo {line}\n" for line in nvidia_smi_output)
+        windows_nvidia_smi = bin_dir / "nvidia-smi.cmd"
+        windows_nvidia_smi.write_text(
+            "@echo off\n"
+            "echo %* >>\"%FAKE_NVIDIA_SMI_LOG%\"\n"
+            + windows_output
+            + f"exit /b {nvidia_smi_returncode}\n",
+            encoding="utf-8",
+        )
     environment = os.environ.copy()
     environment.update(
         {
@@ -379,7 +540,11 @@ def _run_fake_runtime(
             "FAKE_TORCH_CUDA": torch_cuda,
             "FAKE_CUDA_AVAILABLE": "1" if cuda_available else "0",
             "FAKE_NVIDIA_SMI_LOG": str(nvidia_log),
-            "PATH": str(bin_dir) + os.pathsep + environment.get("PATH", ""),
+            "PATH": (
+                str(bin_dir) + os.pathsep + environment.get("PATH", "")
+                if nvidia_smi_available
+                else str(bin_dir)
+            ),
             "PYTHONPATH": str(fake_modules),
         }
     )
@@ -486,6 +651,28 @@ def test_fake_nvidia_smi_includes_a_posix_executable_and_never_uses_the_host(
     assert bash_probe.returncode == 0, bash_probe.stderr
     assert bash_probe.stdout.strip() == "555.42"
     assert "--probe" in nvidia_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "nvidia_smi_overrides",
+    [
+        {"nvidia_smi_available": False},
+        {"nvidia_smi_returncode": 9},
+        {"nvidia_smi_output": ()},
+        {"nvidia_smi_output": ("555.42", "556.01")},
+    ],
+)
+def test_runner_runtime_rejects_invalid_nvidia_smi_results_without_manifest(
+    tmp_path: Path, nvidia_smi_overrides: dict[str, object]
+) -> None:
+    completed, output, _ = _run_fake_runtime(
+        tmp_path,
+        gpu_name="NVIDIA GeForce RTX 4090",
+        **nvidia_smi_overrides,
+    )
+
+    assert completed.returncode != 0
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(
@@ -661,10 +848,12 @@ def test_runner_preserves_a_new_audit_seal_and_exit_note_after_a_later_failure(
 ) -> None:
     repository, commit = _make_clean_repository(tmp_path)
     fake_python, log = _make_fake_python(tmp_path, "3.12.3")
+    bash_env = _make_non_linux_bash_env(tmp_path)
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
         environment={
             "MSYS2_ARG_CONV_EXCL": "",
+            "BASH_ENV": bash_env.as_posix(),
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": log.as_posix(),
         },
@@ -682,7 +871,11 @@ def _prepare_linux_runner_environment(tmp_path: Path, repository: Path) -> dict[
     fake_python, log = _make_fake_python(tmp_path, "3.12.3")
     venv_python = repository / ".venv-server" / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
-    _write_bash_executable(venv_python, "exit 97\n")
+    _write_bash_executable(
+        venv_python,
+        'if [ "${1:-}" = "-c" ]; then printf "%s\\n" "CPython 3.12"; exit 0; fi\n'
+        "exit 97\n",
+    )
     bash_env = tmp_path / "bash-env"
     bash_env.write_text("uname() { printf '%s\\n' Linux; }\n", encoding="utf-8")
     return {
