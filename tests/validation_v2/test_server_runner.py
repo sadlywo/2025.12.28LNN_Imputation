@@ -67,6 +67,7 @@ def _make_clean_repository(tmp_path: Path) -> tuple[Path, str]:
     repository = tmp_path / "repository"
     repository.mkdir()
     shutil.copytree(REPO_ROOT / "configs", repository / "configs")
+    shutil.copytree(REPO_ROOT / "scripts" / "lib", repository / "scripts" / "lib")
     shutil.copy2(
         REPO_ROOT / "requirements-validation-v2.txt",
         repository / "requirements-validation-v2.txt",
@@ -303,6 +304,59 @@ def test_runner_preserves_a_new_audit_seal_and_exit_note_after_a_later_failure(
     assert audit_dir.is_dir()
     assert "status=2" in (audit_dir / "runner-exit-note.txt").read_text(encoding="utf-8")
     assert not (repository / ".venv-server").exists()
+
+
+def _prepare_linux_runner_environment(tmp_path: Path, repository: Path) -> dict[str, str]:
+    fake_python, log = _make_fake_python(tmp_path, "3.12.3")
+    venv_python = repository / ".venv-server" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    _write_bash_executable(venv_python, "exit 97\n")
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text("uname() { printf '%s\\n' Linux; }\n", encoding="utf-8")
+    return {
+        "MSYS2_ARG_CONV_EXCL": "",
+        "BASH_ENV": bash_env.as_posix(),
+        "PYTHON3_BIN": fake_python.as_posix(),
+        "FAKE_PYTHON_LOG": log.as_posix(),
+    }
+
+
+def test_runner_creates_real_shard_output_parents_before_campaign_leaf(tmp_path: Path) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    environment = _prepare_linux_runner_environment(tmp_path, repository)
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        "--skip-dependency-install", environment=environment,
+    )
+
+    assert completed.returncode == 97
+    results = repository / "results"
+    validation_root = results / "validation_v2"
+    shard_root = validation_root / f"server-full-shards-{commit}-sharded-v2-py312"
+    assert results.is_dir() and not results.is_symlink()
+    assert validation_root.is_dir() and not validation_root.is_symlink()
+    assert shard_root.is_dir() and not shard_root.is_symlink()
+
+
+def test_runner_rejects_a_linked_shard_output_parent(tmp_path: Path) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    target = tmp_path / "linked-results-target"
+    target.mkdir()
+    try:
+        (repository / "results").symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip("symbolic links are unavailable: {}".format(error))
+    (repository / ".git" / "info" / "exclude").write_text("results/\n", encoding="utf-8")
+    environment = _prepare_linux_runner_environment(tmp_path, repository)
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        "--skip-dependency-install", environment=environment,
+    )
+
+    assert completed.returncode == 2
+    assert "shard output parent" in completed.stderr
+    assert not (target / "validation_v2").exists()
 
 
 def test_runner_cleanup_stops_recorded_samplers_and_preserves_campaign_seal(

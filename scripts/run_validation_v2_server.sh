@@ -25,6 +25,20 @@ die() {
   exit 2
 }
 
+ensure_shard_output_parent() {
+  local directory="$1"
+  if [[ -L "$directory" ]]; then
+    die "shard output parent is linked: $directory"
+  fi
+  if [[ -e "$directory" ]]; then
+    [[ -d "$directory" ]] || die "shard output parent is not a directory: $directory"
+  else
+    mkdir "$directory" || die "cannot create shard output parent: $directory"
+  fi
+  [[ -d "$directory" && ! -L "$directory" ]] \
+    || die "shard output parent is not a real directory: $directory"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 COMMIT=""
@@ -150,11 +164,14 @@ export REPO COMMIT PREFLIGHT_DIR AUDIT_DIR PLAN SHARDS_ROOT FINAL_ROOT CONFIG PY
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 [[ -f "$CONFIG" ]] || die "missing formal configuration: $CONFIG"
+ensure_shard_output_parent "$REPO/results"
+ensure_shard_output_parent "$REPO/results/validation_v2"
 for campaign_path in "$PREFLIGHT_DIR" "$SHARDS_ROOT" "$FINAL_ROOT"; do
   [[ ! -e "$campaign_path" && ! -L "$campaign_path" ]] \
     || die "campaign path already exists or is linked: $campaign_path"
 done
-mkdir "$PREFLIGHT_DIR" "$SHARDS_ROOT"
+mkdir "$PREFLIGHT_DIR"
+mkdir "$SHARDS_ROOT"
 printf '%s\n' "$COMMIT" > "$AUDIT_DIR/COMMIT"
 
 verify_runtime() {
