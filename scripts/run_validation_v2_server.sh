@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Execute the immutable Validation v2 formal campaign on a Linux RTX 4090D host.
+# Execute the immutable Validation v2 campaign on a supported Linux RTX 4090 host.
 
 set -Eeuo pipefail
 
@@ -14,7 +14,7 @@ Required:
 
 Options:
   --repo PATH                 Repository root (default: directory containing this script/..).
-  --campaign-suffix NAME      New campaign suffix (default: sharded-v2-py312).
+  --campaign-suffix NAME      New campaign suffix (default: sharded-v2-py310/py311/py312).
   --skip-dependency-install   Reuse an already-provisioned .venv-server, but still verify it.
   --help                      Show this help and exit.
 EOF
@@ -43,7 +43,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 COMMIT=""
 MODE=""
-CAMPAIGN_SUFFIX="sharded-v2-py312"
+CAMPAIGN_SUFFIX=""
 SKIP_DEPENDENCY_INSTALL=0
 
 while (($#)); do
@@ -85,17 +85,26 @@ done
 
 [[ "$MODE" == preflight || "$MODE" == full ]] || die '--mode must be preflight or full'
 [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || die '--commit must be a 40-character lowercase hexadecimal SHA'
-[[ "$CAMPAIGN_SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'invalid --campaign-suffix'
 [[ -d "$REPO" ]] || die "repository does not exist: $REPO"
 REPO="$(cd "$REPO" && pwd -P)"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "not a Git worktree: $REPO"
 
-# This must remain the first Python action: failures must not create a venv or
-# attempt any package installation.
+# These must remain the first Python actions: failures must precede the audit
+# seal, venv creation, package installation, and all other campaign writes.
 PYTHON3_BIN="${PYTHON3_BIN:-python3}"
-PYTHON3_VERSION="$("$PYTHON3_BIN" --version 2>&1)" || die "cannot run PYTHON3_BIN: $PYTHON3_BIN"
-[[ "$PYTHON3_VERSION" =~ ^Python[[:space:]]3\.12(\.|[[:space:]]) ]] \
-  || die "Python 3.12 is required; found: $PYTHON3_VERSION"
+PYTHON3_RUNTIME="$("$PYTHON3_BIN" -c \
+  "import platform, sys; print(platform.python_implementation(), '{}.{}'.format(*sys.version_info[:2]))" 2>&1)" \
+  || die "cannot run PYTHON3_BIN: $PYTHON3_BIN"
+[[ "$PYTHON3_RUNTIME" =~ ^CPython[[:space:]]3\.(10|11|12)$ ]] \
+  || die "CPython 3.10, 3.11, or 3.12 is required; found: $PYTHON3_RUNTIME"
+PYTHON_MINOR="${BASH_REMATCH[1]}"
+if ! "$PYTHON3_BIN" -m venv --help >/dev/null 2>&1; then
+  die "Python venv support is unavailable; install the matching python3.${PYTHON_MINOR}-venv package"
+fi
+if [[ -z "$CAMPAIGN_SUFFIX" ]]; then
+  CAMPAIGN_SUFFIX="sharded-v2-py3${PYTHON_MINOR}"
+fi
+[[ "$CAMPAIGN_SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'invalid --campaign-suffix'
 
 HEAD_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
 [[ "$HEAD_COMMIT" == "$COMMIT" ]] || die "HEAD does not match --commit: $HEAD_COMMIT != $COMMIT"
@@ -180,7 +189,10 @@ printf '%s\n' "$COMMIT" > "$AUDIT_DIR/COMMIT"
 verify_runtime() {
   "$PYTHON_BIN" - "$AUDIT_DIR/environment.json" <<'PY'
 import json
+import os
 import platform
+import shutil
+import subprocess
 import sys
 
 import torch
@@ -189,12 +201,61 @@ def require(condition, message):
     if not condition:
         raise SystemExit(message)
 
-require(sys.version_info[:2] == (3, 12), sys.version)
+require(platform.python_implementation() == "CPython", platform.python_implementation())
+require(sys.version_info[:2] in ((3, 10), (3, 11), (3, 12)), sys.version)
 require(torch.__version__ == "2.3.1+cu121", torch.__version__)
 require(torch.cuda.is_available(), "CUDA is unavailable")
 require(torch.version.cuda == "12.1", torch.version.cuda)
 name = torch.cuda.get_device_name(0)
-require("4090 D" in name.upper(), name)
+require("4090" in name.upper(), name)
+gpu_memory_bytes = int(torch.cuda.get_device_properties(0).total_memory)
+require(
+    gpu_memory_bytes >= 23 * 1024**3,
+    "GPU memory is below 23 GiB: {}".format(gpu_memory_bytes),
+)
+compute_capability = torch.cuda.get_device_capability(0)
+require(
+    isinstance(compute_capability, (tuple, list)) and len(compute_capability) == 2,
+    "invalid compute capability: {!r}".format(compute_capability),
+)
+try:
+    nvidia_smi = shutil.which("nvidia-smi")
+    require(nvidia_smi is not None, "nvidia-smi is unavailable")
+    driver_query = subprocess.run(
+        [
+            nvidia_smi,
+            "--query-gpu=driver_version",
+            "--format=csv,noheader,nounits",
+            "--id=0",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+except OSError as error:
+    raise SystemExit("cannot query NVIDIA driver version: {}".format(error))
+require(
+    driver_query.returncode == 0,
+    "nvidia-smi driver query failed: {}".format(driver_query.stderr.strip()),
+)
+driver_lines = [line.strip() for line in driver_query.stdout.splitlines() if line.strip()]
+require(len(driver_lines) == 1, "nvidia-smi returned an invalid driver version")
+driver_version = driver_lines[0]
+if hasattr(os, "sched_getaffinity"):
+    cpu_affinity_count = len(os.sched_getaffinity(0))
+else:
+    cpu_affinity_count = os.cpu_count()
+require(
+    isinstance(cpu_affinity_count, int) and cpu_affinity_count > 0,
+    "cannot determine CPU affinity count",
+)
+try:
+    host_memory_bytes = int(os.sysconf("SC_PAGE_SIZE")) * int(
+        os.sysconf("SC_PHYS_PAGES")
+    )
+except (AttributeError, OSError, ValueError) as error:
+    raise SystemExit("cannot determine host memory: {}".format(error))
+require(host_memory_bytes > 0, "host memory must be positive")
 with open(sys.argv[1], "x", encoding="utf-8") as handle:
     json.dump(
         {
@@ -205,6 +266,11 @@ with open(sys.argv[1], "x", encoding="utf-8") as handle:
             "torch_cuda": torch.version.cuda,
             "cuda_available": torch.cuda.is_available(),
             "gpu_0": name,
+            "gpu_memory_bytes": gpu_memory_bytes,
+            "compute_capability": compute_capability,
+            "driver_version": driver_version,
+            "cpu_affinity_count": cpu_affinity_count,
+            "host_memory_bytes": host_memory_bytes,
         },
         handle,
         indent=2,

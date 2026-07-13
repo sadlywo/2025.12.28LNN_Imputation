@@ -1,4 +1,6 @@
-"""Executable contracts for the Python 3.12 server validation runner."""
+"""Executable contracts for the CPython 3.10--3.12 server validation runner."""
+
+from __future__ import annotations
 
 import os
 import json
@@ -42,7 +44,13 @@ def _run_runner(*arguments: str, environment=None) -> subprocess.CompletedProces
     )
 
 
-def _make_fake_python(tmp_path: Path, version: str) -> tuple[Path, Path]:
+def _make_fake_python(
+    tmp_path: Path,
+    version: str,
+    *,
+    implementation: str = "CPython",
+    venv_available: bool = True,
+) -> tuple[Path, Path]:
     log = tmp_path / "fake-python.log"
     executable = tmp_path / "python3"
     executable.write_text(
@@ -51,9 +59,13 @@ def _make_fake_python(tmp_path: Path, version: str) -> tuple[Path, Path]:
         "for argument in \"$@\"; do\n"
         "  printf '<%s>\\n' \"$argument\" >> \"$FAKE_PYTHON_LOG\"\n"
         "done\n"
-        "if [ \"${1:-}\" = \"--version\" ]; then\n"
-        f"  printf '%s\\n' 'Python {version}'\n"
+        "if [ \"${1:-}\" = \"-c\" ]; then\n"
+        f"  printf '%s\\n' '{implementation} {'.'.join(version.split('.')[:2])}'\n"
         "  exit 0\n"
+        "fi\n"
+        "if [ \"${1:-}\" = \"-m\" ] && [ \"${2:-}\" = \"venv\" ] "
+        "&& [ \"${3:-}\" = \"--help\" ]; then\n"
+        f"  exit {0 if venv_available else 1}\n"
         "fi\n"
         "printf '%s\\n' 'unexpected fake Python invocation' >&2\n"
         "exit 97\n",
@@ -61,6 +73,16 @@ def _make_fake_python(tmp_path: Path, version: str) -> tuple[Path, Path]:
     )
     executable.chmod(0o755)
     return executable, log
+
+
+def _fake_python_probe_log() -> list[str]:
+    return [
+        "<-c>",
+        "<import platform, sys; print(platform.python_implementation(), '{}.{}'.format(*sys.version_info[:2]))>",
+        "<-m>",
+        "<venv>",
+        "<--help>",
+    ]
 
 
 def _make_clean_repository(tmp_path: Path) -> tuple[Path, str]:
@@ -100,18 +122,45 @@ def test_runner_help_declares_full_and_preflight_modes() -> None:
     assert "--mode preflight|full" in completed.stdout
     assert "--commit COMMIT" in completed.stdout
     assert "--skip-dependency-install" in completed.stdout
+    assert "sharded-v2-py310/py311/py312" in completed.stdout
 
 
-def test_runner_rejects_non_python312_before_installation(tmp_path: Path) -> None:
-    fake_python, log = _make_fake_python(tmp_path, "3.11.9")
-    repository, commit = _make_clean_repository(tmp_path)
+@pytest.mark.parametrize(
+    "version,suffix",
+    [("3.10.14", "py310"), ("3.11.9", "py311"), ("3.12.3", "py312")],
+)
+def test_runner_accepts_supported_cpython_and_uses_dynamic_default_suffix(
+    tmp_path: Path, version: str, suffix: str
+) -> None:
+    case = tmp_path / suffix
+    case.mkdir()
+    fake_python, log = _make_fake_python(case, version)
+    repository, commit = _make_clean_repository(case)
+
     completed = _run_runner(
-        "--commit",
-        commit,
-        "--mode",
-        "preflight",
-        "--repo",
-        repository.as_posix(),
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "requires Linux" in completed.stderr
+    assert (case / f"validation-v2-audit-{commit}-sharded-v2-{suffix}").is_dir()
+    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
+
+
+@pytest.mark.parametrize("version", ["3.9.19", "3.13.0"])
+def test_runner_rejects_unsupported_cpython_before_any_write(
+    tmp_path: Path, version: str
+) -> None:
+    fake_python, log = _make_fake_python(tmp_path, version)
+    repository, commit = _make_clean_repository(tmp_path)
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
         environment={
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": log.as_posix(),
@@ -119,10 +168,70 @@ def test_runner_rejects_non_python312_before_installation(tmp_path: Path) -> Non
     )
 
     assert completed.returncode == 2
-    assert "Python 3.12" in completed.stderr
-    invocations = log.read_text(encoding="utf-8") if log.exists() else ""
-    assert invocations.splitlines() == ["<--version>"]
+    assert "CPython 3.10, 3.11, or 3.12 is required" in completed.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()[:2]
     assert not (repository / ".venv-server").exists()
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+
+
+def test_runner_rejects_non_cpython_before_any_write(tmp_path: Path) -> None:
+    fake_python, log = _make_fake_python(tmp_path, "3.11.9", implementation="PyPy")
+    repository, commit = _make_clean_repository(tmp_path)
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "CPython 3.10, 3.11, or 3.12 is required" in completed.stderr
+    assert not (repository / ".venv-server").exists()
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+
+
+def test_runner_probes_venv_before_any_write_and_names_matching_package(
+    tmp_path: Path,
+) -> None:
+    fake_python, log = _make_fake_python(tmp_path, "3.11.9", venv_available=False)
+    repository, commit = _make_clean_repository(tmp_path)
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "python3.11-venv" in completed.stderr
+    assert log.read_text(encoding="utf-8").splitlines()[-3:] == [
+        "<-m>", "<venv>", "<--help>",
+    ]
+    assert not (repository / ".venv-server").exists()
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+
+
+def test_runner_preserves_explicit_campaign_suffix(tmp_path: Path) -> None:
+    fake_python, _ = _make_fake_python(tmp_path, "3.10.14")
+    repository, commit = _make_clean_repository(tmp_path)
+    explicit = "operator-selected"
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        "--campaign-suffix", explicit,
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": (tmp_path / "log").as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert (tmp_path / f"validation-v2-audit-{commit}-{explicit}").is_dir()
 
 
 def test_runner_skip_dependency_install_requires_an_existing_venv(tmp_path: Path) -> None:
@@ -144,7 +253,7 @@ def test_runner_skip_dependency_install_requires_an_existing_venv(tmp_path: Path
     assert completed.returncode == 2
     assert "existing .venv-server" in completed.stderr
     assert not (repository / ".venv-server").exists()
-    assert log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
+    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
 
 
 def test_runner_uses_local_venv_and_explicit_cuda121_torch_index() -> None:
@@ -187,6 +296,121 @@ def _runner_python_heredoc(name: str) -> str:
     return match.group(1)
 
 
+def _run_fake_runtime(
+    tmp_path: Path,
+    *,
+    gpu_name: str,
+    gpu_memory_bytes: int = 24 * 1024**3,
+    output: Path | None = None,
+) -> tuple[subprocess.CompletedProcess, Path, Path]:
+    fake_modules = tmp_path / "fake-modules"
+    fake_modules.mkdir()
+    (fake_modules / "torch.py").write_text(
+        "import os\n"
+        "from types import SimpleNamespace\n"
+        "__version__ = '2.3.1+cu121'\n"
+        "version = SimpleNamespace(cuda='12.1')\n"
+        "class _Cuda:\n"
+        "    @staticmethod\n"
+        "    def is_available(): return True\n"
+        "    @staticmethod\n"
+        "    def get_device_name(index): return os.environ['FAKE_GPU_NAME']\n"
+        "    @staticmethod\n"
+        "    def get_device_properties(index):\n"
+        "        return SimpleNamespace(total_memory=int(os.environ['FAKE_GPU_MEMORY']))\n"
+        "    @staticmethod\n"
+        "    def get_device_capability(index): return (8, 9)\n"
+        "cuda = _Cuda()\n",
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    nvidia_log = tmp_path / "nvidia-smi.log"
+    nvidia_smi = bin_dir / "nvidia-smi.cmd"
+    nvidia_smi.write_text(
+        "@echo off\n"
+        "echo %* >>\"%FAKE_NVIDIA_SMI_LOG%\"\n"
+        "echo 555.42\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "FAKE_GPU_NAME": gpu_name,
+            "FAKE_GPU_MEMORY": str(gpu_memory_bytes),
+            "FAKE_NVIDIA_SMI_LOG": str(nvidia_log),
+            "PATH": str(bin_dir) + os.pathsep + environment.get("PATH", ""),
+            "PYTHONPATH": str(fake_modules),
+        }
+    )
+    output = output or tmp_path / "environment.json"
+    prelude = (
+        "import os, sys\n"
+        "sys.version_info = (3, 12, 0, 'final', 0)\n"
+        "os.sched_getaffinity = lambda pid: set(range(4))\n"
+        "os.sysconf = lambda key: "
+        "{'SC_PAGE_SIZE': 4096, 'SC_PHYS_PAGES': 8388608}[key]\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-O", "-", str(output)],
+        input=prelude + _runner_python_heredoc("verify_runtime"),
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    return completed, output, nvidia_log
+
+
+@pytest.mark.parametrize(
+    "gpu_name", ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090 D"]
+)
+def test_runner_runtime_accepts_4090_variants_and_publishes_provenance(
+    tmp_path: Path, gpu_name: str
+) -> None:
+    completed, output, nvidia_log = _run_fake_runtime(tmp_path, gpu_name=gpu_name)
+
+    assert completed.returncode == 0, completed.stderr
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+    assert manifest["gpu_0"] == gpu_name
+    assert manifest["gpu_memory_bytes"] == 24 * 1024**3
+    assert manifest["compute_capability"] == [8, 9]
+    assert manifest["driver_version"] == "555.42"
+    assert manifest["cpu_affinity_count"] == 4
+    assert manifest["host_memory_bytes"] == 32 * 1024**3
+    assert "--query-gpu=driver_version" in nvidia_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "gpu_name,gpu_memory_bytes",
+    [
+        ("NVIDIA RTX A6000", 48 * 1024**3),
+        ("NVIDIA GeForce RTX 4090", 22 * 1024**3),
+    ],
+)
+def test_runner_runtime_rejects_wrong_gpu_or_insufficient_memory_without_manifest(
+    tmp_path: Path, gpu_name: str, gpu_memory_bytes: int
+) -> None:
+    completed, output, _ = _run_fake_runtime(
+        tmp_path, gpu_name=gpu_name, gpu_memory_bytes=gpu_memory_bytes
+    )
+
+    assert completed.returncode != 0
+    assert not output.exists()
+
+
+def test_runner_runtime_preserves_exclusive_environment_manifest(tmp_path: Path) -> None:
+    output = tmp_path / "environment.json"
+    output.write_text("reserved\n", encoding="utf-8")
+
+    completed, _, _ = _run_fake_runtime(
+        tmp_path, gpu_name="NVIDIA GeForce RTX 4090", output=output
+    )
+
+    assert completed.returncode != 0
+    assert output.read_text(encoding="utf-8") == "reserved\n"
+
+
 def test_runner_runtime_and_plan_checks_survive_optimized_python(tmp_path: Path) -> None:
     source = RUNNER.read_text(encoding="utf-8")
     assert "assert " not in source
@@ -221,7 +445,7 @@ def test_runner_ignores_its_venv_but_rejects_other_untracked_files(tmp_path: Pat
     repository, commit = _make_clean_repository(tmp_path)
     (repository / ".venv-server").mkdir()
     (repository / ".venv-server" / "sentinel").write_text("ignored\n", encoding="utf-8")
-    fake_python, log = _make_fake_python(tmp_path, "3.11.9")
+    fake_python, log = _make_fake_python(tmp_path, "3.13.0")
     ignored = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
         environment={
@@ -231,9 +455,9 @@ def test_runner_ignores_its_venv_but_rejects_other_untracked_files(tmp_path: Pat
         },
     )
     assert ignored.returncode == 2
-    assert "Python 3.12" in ignored.stderr
+    assert "CPython 3.10, 3.11, or 3.12 is required" in ignored.stderr
     assert "dirty" not in ignored.stderr.lower()
-    assert log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
+    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()[:2]
     assert subprocess.check_output(
         ["git", "-C", str(repository), "status", "--porcelain"], text=True
     ) == ""
@@ -252,7 +476,7 @@ def test_runner_ignores_its_venv_but_rejects_other_untracked_files(tmp_path: Pat
     )
     assert completed.returncode == 2
     assert "Git worktree must be clean" in completed.stderr
-    assert valid_log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
+    assert valid_log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
 
 
 def test_runner_rejects_a_preexisting_audit_seal_before_venv_or_other_writes(
@@ -272,7 +496,7 @@ def test_runner_rejects_a_preexisting_audit_seal_before_venv_or_other_writes(
     )
     assert completed.returncode == 2
     assert "AUDIT_DIR" in completed.stderr
-    assert log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
+    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
     assert audit_dir.is_dir()
     assert not (repository / ".venv-server").exists()
     assert not (tmp_path / f"validation-v2-preflight-{commit}-sharded-v2-py312").exists()
