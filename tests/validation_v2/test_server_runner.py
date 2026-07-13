@@ -119,10 +119,42 @@ def _make_fake_venv_python(
     return executable, log
 
 
-def _make_non_linux_bash_env(tmp_path: Path) -> Path:
-    bash_env = tmp_path / "non-linux-bash-env"
-    bash_env.write_text("uname() { printf '%s\\n' TestOS; }\n", encoding="utf-8")
-    return bash_env
+def _make_host_bash_env(
+    tmp_path: Path, *, kernel: str = "Linux"
+) -> tuple[Path, Path]:
+    bash_env = tmp_path / "host-bash-env"
+    probe_log = tmp_path / "host-probes.log"
+    bash_env.write_text(
+        "uname() {\n"
+        "  printf '<uname:%s>\\n' \"${1:-}\" >> \"$FAKE_HOST_PROBE_LOG\"\n"
+        f"  printf '%s\\n' '{kernel}'\n"
+        "}\n"
+        "command() {\n"
+        "  if [ \"${1:-}\" = \"-v\" ] && [ \"$#\" -eq 2 ]; then\n"
+        "    printf '<command-v:%s>\\n' \"$2\" >> \"$FAKE_HOST_PROBE_LOG\"\n"
+        "    if [ \"$2\" = \"${FAKE_MISSING_HOST_COMMAND:-}\" ]; then\n"
+        "      return 1\n"
+        "    fi\n"
+        "    printf '/controlled/%s\\n' \"$2\"\n"
+        "    return 0\n"
+        "  fi\n"
+        "  builtin command \"$@\"\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    return bash_env, probe_log
+
+
+def _host_environment(
+    tmp_path: Path, *, kernel: str = "Linux", missing_command: str = ""
+) -> tuple[dict[str, str], Path]:
+    bash_env, probe_log = _make_host_bash_env(tmp_path, kernel=kernel)
+    return {
+        "MSYS2_ARG_CONV_EXCL": "",
+        "BASH_ENV": bash_env.as_posix(),
+        "FAKE_HOST_PROBE_LOG": probe_log.as_posix(),
+        "FAKE_MISSING_HOST_COMMAND": missing_command,
+    }, probe_log
 
 
 def _make_clean_repository(tmp_path: Path) -> tuple[Path, str]:
@@ -212,22 +244,22 @@ def test_runner_accepts_supported_cpython_and_uses_dynamic_default_suffix(
     case.mkdir()
     fake_python, log = _make_fake_python(case, version)
     repository, commit = _make_clean_repository(case)
-    bash_env = _make_non_linux_bash_env(case)
+    environment, _ = _host_environment(case)
+    environment.update(
+        {
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        }
+    )
 
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
-            "BASH_ENV": bash_env.as_posix(),
-            "PYTHON3_BIN": fake_python.as_posix(),
-            "FAKE_PYTHON_LOG": log.as_posix(),
-        },
+        environment=environment,
     )
 
-    assert completed.returncode == 2
-    assert "requires Linux" in completed.stderr
+    assert completed.returncode == 97
     assert (case / f"validation-v2-audit-{commit}-sharded-v2-{suffix}").is_dir()
-    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
+    assert log.read_text(encoding="utf-8").splitlines()[:8] == _fake_python_probe_log()
 
 
 @pytest.mark.parametrize("version", ["3.9.19", "3.13.0"])
@@ -297,20 +329,21 @@ def test_runner_preserves_explicit_campaign_suffix(tmp_path: Path) -> None:
     fake_python, _ = _make_fake_python(tmp_path, "3.10.14")
     repository, commit = _make_clean_repository(tmp_path)
     explicit = "operator-selected"
-    bash_env = _make_non_linux_bash_env(tmp_path)
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": (tmp_path / "log").as_posix(),
+        }
+    )
 
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
         "--campaign-suffix", explicit,
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
-            "BASH_ENV": bash_env.as_posix(),
-            "PYTHON3_BIN": fake_python.as_posix(),
-            "FAKE_PYTHON_LOG": (tmp_path / "log").as_posix(),
-        },
+        environment=environment,
     )
 
-    assert completed.returncode == 2
+    assert completed.returncode == 97
     assert (tmp_path / f"validation-v2-audit-{commit}-{explicit}").is_dir()
 
 
@@ -319,15 +352,18 @@ def test_runner_rejects_an_explicit_empty_campaign_suffix_before_campaign_writes
 ) -> None:
     fake_python, log = _make_fake_python(tmp_path, "3.11.9")
     repository, commit = _make_clean_repository(tmp_path)
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        }
+    )
 
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
         "--campaign-suffix", "",
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
-            "PYTHON3_BIN": fake_python.as_posix(),
-            "FAKE_PYTHON_LOG": log.as_posix(),
-        },
+        environment=environment,
     )
 
     assert completed.returncode == 2
@@ -368,24 +404,24 @@ def test_runner_uses_existing_venv_minor_for_the_dynamic_default_suffix(
     fake_python, system_log = _make_fake_python(tmp_path, "3.10.14")
     repository, commit = _make_clean_repository(tmp_path)
     _, venv_log = _make_fake_venv_python(repository, "3.12.3")
-    bash_env = _make_non_linux_bash_env(tmp_path)
-
-    completed = _run_runner(
-        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
-            "BASH_ENV": bash_env.as_posix(),
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": system_log.as_posix(),
             "FAKE_VENV_PYTHON_LOG": venv_log.as_posix(),
-        },
+        }
     )
 
-    assert completed.returncode == 2
-    assert "requires Linux" in completed.stderr
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        "--skip-dependency-install", environment=environment,
+    )
+
+    assert completed.returncode == 97
     assert (tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py312").is_dir()
     assert not (tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py310").exists()
-    assert venv_log.read_text(encoding="utf-8").splitlines() == [
+    assert venv_log.read_text(encoding="utf-8").splitlines()[:2] == [
         "<-c>",
         "<import platform, sys; print(platform.python_implementation(), '{}.{}'.format(*sys.version_info[:2]))>",
     ]
@@ -403,15 +439,18 @@ def test_runner_rejects_an_unsupported_existing_venv_before_campaign_writes(
     _, venv_log = _make_fake_venv_python(
         repository, version, implementation=implementation
     )
-
-    completed = _run_runner(
-        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": system_log.as_posix(),
             "FAKE_VENV_PYTHON_LOG": venv_log.as_posix(),
-        },
+        }
+    )
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment=environment,
     )
 
     assert completed.returncode == 2
@@ -425,21 +464,22 @@ def test_runner_explicit_suffix_is_authoritative_with_an_existing_venv(
     fake_python, system_log = _make_fake_python(tmp_path, "3.10.14")
     repository, commit = _make_clean_repository(tmp_path)
     _, venv_log = _make_fake_venv_python(repository, "3.12.3")
-    bash_env = _make_non_linux_bash_env(tmp_path)
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": system_log.as_posix(),
+            "FAKE_VENV_PYTHON_LOG": venv_log.as_posix(),
+        }
+    )
 
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
         "--campaign-suffix", "chosen",
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
-            "BASH_ENV": bash_env.as_posix(),
-            "PYTHON3_BIN": fake_python.as_posix(),
-            "FAKE_PYTHON_LOG": system_log.as_posix(),
-            "FAKE_VENV_PYTHON_LOG": venv_log.as_posix(),
-        },
+        "--skip-dependency-install", environment=environment,
     )
 
-    assert completed.returncode == 2
+    assert completed.returncode == 97
     assert (tmp_path / f"validation-v2-audit-{commit}-chosen").is_dir()
     assert not list(tmp_path.glob(f"validation-v2-audit-{commit}-sharded-v2-*"))
 
@@ -447,17 +487,16 @@ def test_runner_explicit_suffix_is_authoritative_with_an_existing_venv(
 def test_runner_skip_dependency_install_requires_an_existing_venv(tmp_path: Path) -> None:
     repository, commit = _make_clean_repository(tmp_path)
     fake_python, log = _make_fake_python(tmp_path, "3.12.3")
-    bash_env = tmp_path / "bash-env"
-    bash_env.write_text("uname() { printf '%s\\n' Linux; }\n", encoding="utf-8")
-    completed = _run_runner(
-        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
-        "--skip-dependency-install",
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
-            "BASH_ENV": bash_env.as_posix(),
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": log.as_posix(),
-        },
+        }
+    )
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        "--skip-dependency-install", environment=environment,
     )
 
     assert completed.returncode == 2
@@ -1011,13 +1050,16 @@ def test_runner_rejects_a_preexisting_audit_seal_before_venv_or_other_writes(
     audit_dir = tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py312"
     audit_dir.mkdir()
     fake_python, log = _make_fake_python(tmp_path, "3.12.3")
-    completed = _run_runner(
-        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": log.as_posix(),
-        },
+        }
+    )
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment=environment,
     )
     assert completed.returncode == 2
     assert "AUDIT_DIR" in completed.stderr
@@ -1040,14 +1082,17 @@ def test_runner_rejects_a_linked_audit_seal_before_venv(tmp_path: Path) -> None:
     except OSError as error:
         pytest.skip("symbolic links are unavailable: {}".format(error))
     fake_python, log = _make_fake_python(tmp_path, "3.12.3")
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        }
+    )
 
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
-            "PYTHON3_BIN": fake_python.as_posix(),
-            "FAKE_PYTHON_LOG": log.as_posix(),
-        },
+        environment=environment,
     )
     assert completed.returncode == 2
     assert "AUDIT_DIR" in completed.stderr
@@ -1055,28 +1100,70 @@ def test_runner_rejects_a_linked_audit_seal_before_venv(tmp_path: Path) -> None:
     assert not (repository / ".venv-server").exists()
 
 
-def test_runner_preserves_a_new_audit_seal_and_exit_note_after_a_later_failure(
+def test_runner_rejects_non_linux_before_any_campaign_or_repository_writes(
     tmp_path: Path,
 ) -> None:
     repository, commit = _make_clean_repository(tmp_path)
     fake_python, log = _make_fake_python(tmp_path, "3.12.3")
-    bash_env = _make_non_linux_bash_env(tmp_path)
-    completed = _run_runner(
-        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
-        environment={
-            "MSYS2_ARG_CONV_EXCL": "",
-            "BASH_ENV": bash_env.as_posix(),
+    environment, host_log = _host_environment(tmp_path, kernel="TestOS")
+    environment.update(
+        {
             "PYTHON3_BIN": fake_python.as_posix(),
             "FAKE_PYTHON_LOG": log.as_posix(),
-        },
+        }
+    )
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment=environment,
     )
 
     assert completed.returncode == 2
     assert "requires Linux" in completed.stderr
-    audit_dir = tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py312"
-    assert audit_dir.is_dir()
-    assert "status=2" in (audit_dir / "runner-exit-note.txt").read_text(encoding="utf-8")
+    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
+    assert host_log.read_text(encoding="utf-8").splitlines() == ["<uname:-s>"]
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+    assert not list(tmp_path.glob("validation-v2-preflight-*"))
     assert not (repository / ".venv-server").exists()
+    assert not (repository / "results").exists()
+
+
+@pytest.mark.parametrize("missing_command", ["nvidia-smi", "pgrep", "nohup", "tee"])
+def test_runner_rejects_a_missing_host_command_before_any_write(
+    tmp_path: Path, missing_command: str
+) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    fake_python, python_log = _make_fake_python(tmp_path, "3.12.3")
+    environment, host_log = _host_environment(
+        tmp_path, missing_command=missing_command
+    )
+    environment.update(
+        {
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": python_log.as_posix(),
+        }
+    )
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment=environment,
+    )
+
+    required_commands = ["nvidia-smi", "pgrep", "nohup", "tee"]
+    missing_index = required_commands.index(missing_command)
+    assert completed.returncode == 2
+    assert missing_command in completed.stderr
+    assert python_log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
+    assert host_log.read_text(encoding="utf-8").splitlines() == [
+        "<uname:-s>",
+        *[
+            f"<command-v:{command}>"
+            for command in required_commands[: missing_index + 1]
+        ],
+    ]
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+    assert not list(tmp_path.glob("validation-v2-preflight-*"))
+    assert not (repository / ".venv-server").exists()
+    assert not (repository / "results").exists()
 
 
 def _prepare_linux_runner_environment(tmp_path: Path, repository: Path) -> dict[str, str]:
@@ -1088,14 +1175,14 @@ def _prepare_linux_runner_environment(tmp_path: Path, repository: Path) -> dict[
         'if [ "${1:-}" = "-c" ]; then printf "%s\\n" "CPython 3.12"; exit 0; fi\n'
         "exit 97\n",
     )
-    bash_env = tmp_path / "bash-env"
-    bash_env.write_text("uname() { printf '%s\\n' Linux; }\n", encoding="utf-8")
-    return {
-        "MSYS2_ARG_CONV_EXCL": "",
-        "BASH_ENV": bash_env.as_posix(),
-        "PYTHON3_BIN": fake_python.as_posix(),
-        "FAKE_PYTHON_LOG": log.as_posix(),
-    }
+    environment, _ = _host_environment(tmp_path)
+    environment.update(
+        {
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        }
+    )
+    return environment
 
 
 def test_runner_creates_real_shard_output_parents_before_campaign_leaf(tmp_path: Path) -> None:

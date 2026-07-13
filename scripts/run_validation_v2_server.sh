@@ -115,6 +115,15 @@ fi
 if ! "$PYTHON3_BIN" -m ensurepip --version >/dev/null 2>&1; then
   die "Python ensurepip is unavailable; install the matching python3.${PYTHON_MINOR}-venv package (ensurepip required)"
 fi
+HEAD_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
+[[ "$HEAD_COMMIT" == "$COMMIT" ]] || die "HEAD does not match --commit: $HEAD_COMMIT != $COMMIT"
+[[ -z "$(git -C "$REPO" status --porcelain)" ]] || die 'Git worktree must be clean'
+[[ "$(uname -s)" == Linux ]] || die 'this formal runner requires Linux'
+for REQUIRED_HOST_COMMAND in nvidia-smi pgrep nohup tee; do
+  command -v "$REQUIRED_HOST_COMMAND" >/dev/null 2>&1 \
+    || die "required host command is unavailable: $REQUIRED_HOST_COMMAND"
+done
+
 PYTHON_BIN="$REPO/.venv-server/bin/python"
 CAMPAIGN_PYTHON_MINOR="$PYTHON_MINOR"
 if [[ -e "$PYTHON_BIN" || -L "$PYTHON_BIN" ]]; then
@@ -129,10 +138,6 @@ if (( ! CAMPAIGN_SUFFIX_EXPLICIT )); then
   CAMPAIGN_SUFFIX="sharded-v2-py3${CAMPAIGN_PYTHON_MINOR}"
 fi
 [[ "$CAMPAIGN_SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'invalid --campaign-suffix'
-
-HEAD_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
-[[ "$HEAD_COMMIT" == "$COMMIT" ]] || die "HEAD does not match --commit: $HEAD_COMMIT != $COMMIT"
-[[ -z "$(git -C "$REPO" status --porcelain)" ]] || die 'Git worktree must be clean'
 
 PARENT_DIR="$(dirname "$REPO")"
 PREFLIGHT_DIR="$PARENT_DIR/validation-v2-preflight-${COMMIT}-${CAMPAIGN_SUFFIX}"
@@ -172,7 +177,6 @@ cleanup_runner() {
 trap cleanup_runner EXIT
 trap 'cleanup_runner 130' INT
 trap 'cleanup_runner 143' TERM
-[[ "$(uname -s)" == Linux ]] || die 'this formal runner requires Linux'
 
 if (( SKIP_DEPENDENCY_INSTALL )) && [[ ! -x "$PYTHON_BIN" ]]; then
   die '--skip-dependency-install requires an existing .venv-server Python interpreter'
