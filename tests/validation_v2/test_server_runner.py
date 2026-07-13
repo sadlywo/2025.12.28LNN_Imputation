@@ -125,6 +125,28 @@ def test_runner_rejects_non_python312_before_installation(tmp_path: Path) -> Non
     assert not (repository / ".venv-server").exists()
 
 
+def test_runner_skip_dependency_install_requires_an_existing_venv(tmp_path: Path) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    fake_python, log = _make_fake_python(tmp_path, "3.12.3")
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text("uname() { printf '%s\\n' Linux; }\n", encoding="utf-8")
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        "--skip-dependency-install",
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "BASH_ENV": bash_env.as_posix(),
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "existing .venv-server" in completed.stderr
+    assert not (repository / ".venv-server").exists()
+    assert log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
+
+
 def test_runner_uses_local_venv_and_explicit_cuda121_torch_index() -> None:
     source = RUNNER.read_text(encoding="utf-8")
 

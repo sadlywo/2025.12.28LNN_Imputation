@@ -142,6 +142,9 @@ trap 'cleanup_runner 143' TERM
 [[ "$(uname -s)" == Linux ]] || die 'this formal runner requires Linux'
 
 PYTHON_BIN="$REPO/.venv-server/bin/python"
+if (( SKIP_DEPENDENCY_INSTALL )) && [[ ! -x "$PYTHON_BIN" ]]; then
+  die '--skip-dependency-install requires an existing .venv-server Python interpreter'
+fi
 if [[ ! -x "$PYTHON_BIN" ]]; then
   "$PYTHON3_BIN" -m venv "$REPO/.venv-server"
 fi
