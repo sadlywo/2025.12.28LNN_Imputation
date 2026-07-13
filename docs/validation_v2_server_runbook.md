@@ -25,14 +25,16 @@ that generic runner; it does not replace or weaken any of these checks.
 
 ### MatPool: shortest clean-checkout operation
 
-From an already cloned repository, use the following commands. The status
-output must show the expected branch or detached commit and no changed or
-untracked file entries before `start`; the launcher also fails closed unless
-HEAD and the worktree are clean.
+From an already cloned repository, bind the reviewed 40-character commit before
+any `start`. The explicit equality and clean-worktree gates below are mandatory;
+the launcher repeats them and fails closed if either condition changes.
 
 ```bash
 cd /2025.12.28LNN_Imputation
-git status --short --branch
+VALIDATED_COMMIT="<40-HEX-VALIDATED-COMMIT>"
+git checkout --detach "$VALIDATED_COMMIT"
+test "$(git rev-parse HEAD)" = "$VALIDATED_COMMIT"
+test -z "$(git status --porcelain)"
 bash scripts/run_validation_v2_matpool.sh start
 bash scripts/run_validation_v2_matpool.sh status
 bash scripts/run_validation_v2_matpool.sh logs
@@ -57,32 +59,45 @@ seal, kill an unverified PID, or overwrite an existing root to force a retry.
 The MatPool default max-workers value is 4, but the complete plan still runs
 all 8 shards; the limit controls concurrency, not campaign coverage. Only after
 reviewing the four-worker GPU-memory, throughput, PID, marker, and audit
-evidence may an operator opt in to eight concurrent workers:
-
-```bash
-bash scripts/run_validation_v2_matpool.sh start --max-workers 8
-```
+evidence may an operator opt in to eight concurrent workers. After repeating
+the exact-commit and clean-worktree gate in the main block, use
+`bash scripts/run_validation_v2_matpool.sh start --max-workers 8`.
 
 ### Generic runner and dependency reuse
 
 For direct diagnostics or a non-MatPool Linux host, invoke the generic runner
-with the exact current commit. Preflight-only and full modes are explicit, and
-`--max-workers` caps concurrency while retaining the full eight-shard plan:
+with the exact current commit. Choose exactly one of these paths: (A) run full
+directly, or (B) run preflight and then full. In both paths `--max-workers` caps
+concurrency while retaining the complete eight-shard plan.
+
+Path A — direct full, without a separate preflight invocation:
 
 ```bash
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode preflight
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full --max-workers 4
+DIRECT_SUFFIX="formal-$(date -u +%Y%m%dT%H%M%SZ)"
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
+  --campaign-suffix "$DIRECT_SUFFIX" --max-workers 4
 ```
 
-Preflight-only creates an immutable campaign seal, so any later run needs a new
-campaign suffix. If dependency installation already completed successfully on
-this same host and the repository-local `.venv-server/bin/python` passes the
-runner's version and CUDA checks, a later MatPool campaign may reuse it while
-still running Git, runtime, test, plan, and full training checks:
+Path B — diagnostic preflight followed by full. Preflight creates an immutable
+campaign seal, so the formal run uses a separately named suffix. Dependency
+installation may be reused only after preflight successfully provisioned and
+verified `.venv-server/bin/python` on this same host:
 
 ```bash
-bash scripts/run_validation_v2_matpool.sh start --skip-dependency-install
+PREFLIGHT_SUFFIX="preflight-$(date -u +%Y%m%dT%H%M%SZ)"
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode preflight \
+  --campaign-suffix "$PREFLIGHT_SUFFIX"
+
+FORMAL_SUFFIX="formal-$(date -u +%Y%m%dT%H%M%SZ)"
+test "$PREFLIGHT_SUFFIX" != "$FORMAL_SUFFIX"
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
+  --campaign-suffix "$FORMAL_SUFFIX" --max-workers 4 --skip-dependency-install
 ```
+
+The reuse option never skips Git, runtime, test, plan, or full training checks.
+For the MatPool wrapper, the equivalent reuse form remains
+`bash scripts/run_validation_v2_matpool.sh start --skip-dependency-install`, but
+it is valid only after a successful dependency-provisioning run on this host.
 
 Completion requires an inactive tmux session, a zero value in the reported
 `run-*.exit`, eight completed `shard_execution.json` markers, and a new final

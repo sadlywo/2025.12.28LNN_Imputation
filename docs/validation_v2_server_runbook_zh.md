@@ -11,13 +11,15 @@ MatPool 启动器只是该合同的后台运维封装，不会跳过测试、计
 
 ## 1. clone 后直接启动
 
-仓库已经 clone 到服务器后，进入固定路径并先确认当前分支或 detached commit。
-`git status --short --branch` 除分支行外不得显示修改或未跟踪文件；`start` 自身也会
-再次检查 HEAD 和工作树是否干净。
+仓库已经 clone 到服务器后，必须在任何 `start` 之前绑定本次审阅通过的 40 位 commit。
+下面的 HEAD 相等断言和干净工作树门禁不可省略；启动器还会再次执行相同检查。
 
 ```bash
 cd /2025.12.28LNN_Imputation
-git status --short --branch
+VALIDATED_COMMIT="<40-HEX-VALIDATED-COMMIT>"
+git checkout --detach "$VALIDATED_COMMIT"
+test "$(git rev-parse HEAD)" = "$VALIDATED_COMMIT"
+test -z "$(git status --porcelain)"
 bash scripts/run_validation_v2_matpool.sh start
 bash scripts/run_validation_v2_matpool.sh status
 bash scripts/run_validation_v2_matpool.sh logs
@@ -28,11 +30,8 @@ bash scripts/run_validation_v2_matpool.sh logs
 
 默认最大同时 worker 数为 4，但完整计划仍会运行全部 8 个分片；这个参数只限制并发，
 不会减少覆盖范围。必须先审阅 4-worker 阶段的显存、吞吐、PID、marker 与审计证据，
-确认余量后才能显式选择 8 worker：
-
-```bash
-bash scripts/run_validation_v2_matpool.sh start --max-workers 8
-```
+确认余量后才能显式选择 8 worker。再次执行主代码块中的 exact-commit 与干净工作树
+门禁后，使用 `bash scripts/run_validation_v2_matpool.sh start --max-workers 8`。
 
 ## 2. 状态、日志与证据位置
 
@@ -53,29 +52,38 @@ campaign seal、日志或分片根目录，也不要向未核验身份的进程�
 
 ## 3. 预检-only 与通用运行器
 
-如果只需检查当前主机、依赖、测试和不可变计划，可用精确当前 commit 运行预检：
+使用通用运行器时必须二选一：（A）直接 full；或（B）先做独立 preflight，再以
+不同 campaign suffix 执行 full。两条路径都固定精确当前 commit；`--max-workers`
+只控制并发，仍执行完整 8-shard 计划。
+
+路径 A：不单独运行预检，直接 full：
 
 ```bash
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode preflight
+DIRECT_SUFFIX="formal-$(date -u +%Y%m%dT%H%M%SZ)"
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
+  --campaign-suffix "$DIRECT_SUFFIX" --max-workers 4
 ```
 
-通用运行器的 full 模式同样固定精确 commit；`--max-workers` 只控制并发，仍执行完整
-8-shard 计划：
+路径 B：先做诊断预检，再启动 formal full。预检会创建不可变 campaign seal，
+因此两个 suffix 必须分别命名。只有预检已在同一服务器成功创建并验证
+`.venv-server/bin/python`，后续 full 才能重用依赖：
 
 ```bash
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full --max-workers 4
+PREFLIGHT_SUFFIX="preflight-$(date -u +%Y%m%dT%H%M%SZ)"
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode preflight \
+  --campaign-suffix "$PREFLIGHT_SUFFIX"
+
+FORMAL_SUFFIX="formal-$(date -u +%Y%m%dT%H%M%SZ)"
+test "$PREFLIGHT_SUFFIX" != "$FORMAL_SUFFIX"
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
+  --campaign-suffix "$FORMAL_SUFFIX" --max-workers 4 --skip-dependency-install
 ```
 
-单独预检会创建不可变 campaign seal，后续运行必须使用新的 campaign suffix。
-若同一服务器已经成功安装依赖，并且仓库内 `.venv-server/bin/python` 再次通过
-Python、包版本与 CUDA 校验，可让新的 MatPool campaign 重用依赖：
-
-```bash
-bash scripts/run_validation_v2_matpool.sh start --skip-dependency-install
-```
-
-该选项只跳过重复安装；精确提交、干净工作树、运行时、完整 pytest、计划、训练、
-合并与验证仍会执行。若 `.venv-server/bin/python` 不存在或不合格，启动会失败关闭。
+依赖重用不会跳过精确提交、干净工作树、运行时、完整 pytest、计划、训练、合并或验证。
+MatPool wrapper 的等价重用形式是
+`bash scripts/run_validation_v2_matpool.sh start --skip-dependency-install`。它只允许在
+同一主机成功 provision 依赖之后、并再次执行主代码块的 exact-commit 与干净工作树
+门禁后使用；若解释器不存在或不合格，启动会失败关闭。
 
 ## 4. 失败诊断
 

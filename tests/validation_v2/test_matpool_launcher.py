@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 import re
 import shlex
@@ -18,6 +19,23 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / "scripts" / "run_validation_v2_matpool.sh"
+_TRACKED_SCAN_ROOTS = frozenset(
+    {"configs", "docs", "scripts", "tests", "validation_v2"}
+)
+_TRACKED_SCAN_SUFFIXES = frozenset(
+    {
+        ".bib",
+        ".json",
+        ".md",
+        ".py",
+        ".sh",
+        ".tex",
+        ".toml",
+        ".txt",
+        ".yaml",
+        ".yml",
+    }
+)
 _CREDENTIAL_LEAK_PATTERNS = (
     (
         "SSH command",
@@ -31,8 +49,14 @@ _CREDENTIAL_LEAK_PATTERNS = (
     (
         "user-at-host access target",
         re.compile(
-            r"(?<![a-z0-9._%+-])[a-z0-9._%+-]+@"
-            r"(?:[a-z0-9-]+\.)+[a-z0-9-]+\b",
+            r"^[ \t]*[a-z0-9._%+-]+@(?:[a-z0-9-]+\.)+[a-z0-9-]+[ \t]*$",
+            flags=re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "credential URL",
+        re.compile(
+            r"\b(?:ssh|https?|git)://[^\s/@:]+(?::[^\s/@]*)?@[^\s/]+",
             flags=re.IGNORECASE,
         ),
     ),
@@ -46,8 +70,10 @@ _CREDENTIAL_LEAK_PATTERNS = (
     (
         "SSH or MatPool access variable",
         re.compile(
-            r"\b(?:SSH_(?:HOST|PORT|USER(?:NAME)?|PASSWORD|PASSWD|PWD)|"
-            r"MATPOOL_(?:SSH_)?(?:HOST|PORT|USER(?:NAME)?|PASSWORD|PASSWD|PWD))"
+            r"\b(?:SSH_(?:HOST|PORT|USER(?:NAME)?|PASSWORD|PASSWD|PWD|PRIVATE_KEY)|"
+            r"MATPOOL_(?:[A-Z0-9]+_)*(?:HOST|PORT|USER(?:NAME)?|PASSWORD|PASSWD|"
+            r"PWD|TOKEN|SECRET|PRIVATE_KEY)|(?:API|ACCESS)_TOKEN|"
+            r"[A-Z0-9]+(?:_[A-Z0-9]+)*_SECRET)"
             r"\s*(?::=|[=:])",
             flags=re.IGNORECASE,
         ),
@@ -55,13 +81,21 @@ _CREDENTIAL_LEAK_PATTERNS = (
     (
         "credential assignment",
         re.compile(
-            r"\b(?:password|passwd|pwd)\s*(?::=|[=:])",
+            r"\b(?:password|passwd)\s*(?::=|[=:])",
             flags=re.IGNORECASE,
         ),
     ),
     (
         "Chinese credential assignment",
         re.compile(r"密码\s*(?:：|:=|[=:])", flags=re.IGNORECASE),
+    ),
+    (
+        "private key header",
+        re.compile(
+            r"-{5}BEGIN[ \t]+(?:(?:OPENSSH|RSA|EC|DSA)[ \t]+)?"
+            r"PRIVATE[ \t]+KEY-{5}",
+            flags=re.IGNORECASE,
+        ),
     ),
 )
 
@@ -70,6 +104,39 @@ def _credential_leaks(text: str) -> tuple[str, ...]:
     return tuple(
         label for label, pattern in _CREDENTIAL_LEAK_PATTERNS if pattern.search(text)
     )
+
+
+def _tracked_scan_path_is_in_scope(relative_path: Path) -> bool:
+    if relative_path.suffix.casefold() not in _TRACKED_SCAN_SUFFIXES:
+        return False
+    return len(relative_path.parts) == 1 or relative_path.parts[0] in _TRACKED_SCAN_ROOTS
+
+
+@lru_cache(maxsize=1)
+def _tracked_utf8_text_paths() -> tuple[Path, ...]:
+    serialized = subprocess.check_output(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "-z"]
+    )
+    tracked_text = []
+    for encoded_path in serialized.split(b"\0"):
+        if not encoded_path:
+            continue
+        relative_path = Path(encoded_path.decode("utf-8", errors="strict"))
+        if not _tracked_scan_path_is_in_scope(relative_path):
+            continue
+        raw = REPO_ROOT.joinpath(relative_path).read_bytes()
+        if b"\0" in raw:
+            raise AssertionError(
+                (relative_path, "tracked scan-scope file contains a NUL byte")
+            )
+        try:
+            raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise AssertionError(
+                (relative_path, "tracked scan-scope file is not UTF-8")
+            ) from error
+        tracked_text.append(relative_path)
+    return tuple(tracked_text)
 
 
 @pytest.mark.parametrize(
@@ -89,13 +156,21 @@ def _credential_leaks(text: str) -> tuple[str, ...]:
         "SSH_PASSWORD := dummy-value",
         "ssh_passwd= dummy-value",
         "SSH_PWD : dummy-value",
+        "MATPOOL_TOKEN = dummy-value",
+        "api_token: dummy-value",
+        "ACCESS_TOKEN := dummy-value",
+        "VALIDATION_SECRET = dummy-value",
+        "SSH_PRIVATE_KEY = dummy-value",
+        "ssh://operator@example.invalid/project",
+        "https://operator:dummy-value@example.invalid/project",
+        "-----BEGIN " + "OPENSSH PRIVATE KEY-----",
+        "-----BEGIN " + "PRIVATE KEY-----",
         "MATPOOL_SSH_HOST=compute.example.invalid",
         "matpool_ssh_port := 65004",
         "MATPOOL_SSH_USER: operator",
         "MATPOOL_SSH_PASSWORD = dummy-value",
         "password = dummy-value",
         "PassWd: dummy-value",
-        "pwd := dummy-value",
         "密码：虚构值",
     ),
 )
@@ -113,23 +188,65 @@ def test_credential_leak_scanner_recognizes_fictional_payloads(
         "The launcher does not accept SSH access data.",
         "SSH access is documented without connection details.",
         "A password policy is not an assignment.",
+        "token_count = 12",
+        "The secret concept is discussed without assigning a value.",
+        "PWD = /workspace/project",
+        "pwd := /workspace/project",
+        "Git fixture email is test@example.invalid.",
     ),
 )
 def test_credential_leak_scanner_ignores_ordinary_narrative(narrative: str) -> None:
     assert not _credential_leaks(narrative)
 
 
-def test_public_runner_material_contains_no_access_credentials() -> None:
-    public_material = (
-        REPO_ROOT / "scripts" / "run_validation_v2_server.sh",
-        LAUNCHER,
-        REPO_ROOT / "docs" / "validation_v2_server_runbook.md",
-        REPO_ROOT / "docs" / "validation_v2_server_runbook_zh.md",
-    )
-    for path in public_material:
+def test_credential_scan_scope_includes_tracked_repository_text() -> None:
+    tracked = set(_tracked_utf8_text_paths())
+
+    for relative_path in (
+        Path("scripts/run_validation_v2_server.sh"),
+        Path("docs/validation_v2_server_runbook.md"),
+        Path("tests/validation_v2/test_cli_smoke.py"),
+        Path("validation_v2/cli.py"),
+        Path("configs/validation_v2/server_full.yaml"),
+        Path("README.md"),
+    ):
+        assert relative_path in tracked
+
+    assert Path("output/review/README.md") not in tracked
+    assert not any(path.parts[0] == "results" for path in tracked)
+
+
+@pytest.mark.parametrize(
+    "relative_path,expected",
+    (
+        (Path("README.md"), True),
+        (Path("scripts/runner.sh"), True),
+        (Path("validation_v2/cli.py"), True),
+        (Path("tests/test_contract.py"), True),
+        (Path("docs/spec.md"), True),
+        (Path("configs/campaign.yaml"), True),
+        (Path("results/report.md"), False),
+        (Path("output/review.md"), False),
+        (Path("Oxford Dataset/metadata.txt"), False),
+        (Path("docs/figure.png"), False),
+    ),
+)
+def test_tracked_credential_scan_scope_is_bounded_to_repository_text(
+    relative_path: Path,
+    expected: bool,
+) -> None:
+    assert _tracked_scan_path_is_in_scope(relative_path) is expected
+
+
+def test_tracked_repository_text_contains_no_access_credentials() -> None:
+    scanner_fixture = Path("tests/validation_v2/test_matpool_launcher.py")
+    for relative_path in _tracked_utf8_text_paths():
+        if relative_path == scanner_fixture:
+            continue
+        path = REPO_ROOT / relative_path
         text = path.read_bytes().decode("utf-8", errors="strict")
         leaks = _credential_leaks(text)
-        assert not leaks, (path, leaks)
+        assert not leaks, (relative_path, leaks)
 
 
 def _bash() -> str:

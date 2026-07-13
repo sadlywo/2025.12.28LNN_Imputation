@@ -476,12 +476,9 @@ def test_tracked_runner_material_contains_no_ssh_credentials():
         ENGLISH_RUNBOOK,
         CHINESE_RUNBOOK,
     )
-    forbidden_patterns = (
-        b"ssh -p ", b"matpool.com", b"MATPOOL_SSH_PASSWORD", b"password=",
-    )
     for path in public_material:
         content = path.read_bytes()
-        assert all(pattern not in content for pattern in forbidden_patterns)
+        assert credential_leak_categories(content) == ()
 ```
 
 - [ ] **Step 2: Run tests and verify RED**

@@ -67,6 +67,62 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
         assert generic_preflight in runbook
         assert generic_full in runbook
 
+    for runbook, historical_marker in (
+        (english, "## Historical implementation reference"),
+        (chinese, "## 历史资料"),
+    ):
+        current = runbook.split(historical_marker, 1)[0]
+        bash_blocks = re.findall(r"```bash\n(.*?)\n```", current, flags=re.DOTALL)
+        matpool_start = next(
+            block
+            for block in bash_blocks
+            if "cd /2025.12.28LNN_Imputation" in block
+            and "run_validation_v2_matpool.sh start" in block
+        )
+        assert [
+            block
+            for block in bash_blocks
+            if "run_validation_v2_matpool.sh start" in block
+        ] == [matpool_start]
+        required_gate = (
+            'VALIDATED_COMMIT="<40-HEX-VALIDATED-COMMIT>"',
+            'git checkout --detach "$VALIDATED_COMMIT"',
+            'test "$(git rev-parse HEAD)" = "$VALIDATED_COMMIT"',
+            'test -z "$(git status --porcelain)"',
+            "bash scripts/run_validation_v2_matpool.sh start",
+        )
+        positions = [matpool_start.index(token) for token in required_gate]
+        assert positions == sorted(positions)
+
+        generic_sequence = next(
+            block
+            for block in bash_blocks
+            if "--mode preflight" in block and "--mode full" in block
+        )
+        preflight_suffix = re.search(
+            r'^PREFLIGHT_SUFFIX="([^"]+)"$', generic_sequence, flags=re.MULTILINE
+        )
+        formal_suffix = re.search(
+            r'^FORMAL_SUFFIX="([^"]+)"$', generic_sequence, flags=re.MULTILINE
+        )
+        assert preflight_suffix is not None and formal_suffix is not None
+        assert preflight_suffix.group(1) != formal_suffix.group(1)
+        commands = re.sub(r"\\\n\s*", " ", generic_sequence).splitlines()
+        preflight_command = next(line for line in commands if "--mode preflight" in line)
+        full_command = next(line for line in commands if "--mode full" in line)
+        assert '--campaign-suffix "$PREFLIGHT_SUFFIX"' in preflight_command
+        assert '--campaign-suffix "$FORMAL_SUFFIX"' in full_command
+        assert "--skip-dependency-install" in full_command
+        all_full_commands = (
+            line
+            for block in bash_blocks
+            for line in re.sub(r"\\\n\s*", " ", block).splitlines()
+            if "run_validation_v2_server.sh" in line and "--mode full" in line
+        )
+        assert all(
+            "--campaign-suffix" in command for command in all_full_commands
+        )
+
     english_current = english.split("## Historical implementation reference", 1)[0]
     chinese_current = chinese.split("## 历史资料", 1)[0]
     for current in (english_current, chinese_current):
@@ -84,7 +140,6 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
     assert re.search(r"not exclusive\s+requirements", english_current)
     assert "不是唯一要求" in chinese_current
     assert "cd /2025.12.28LNN_Imputation" in english
-    assert "git status --short --branch" in english
     assert re.search(r"exact\s+(?:40-character\s+)?commit", english)
     assert "preflight" in english and "full" in english
     assert "/2025.12.28LNN_Imputation" in chinese
@@ -92,6 +147,8 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
     assert "pinn_imu" not in chinese
     assert "network_turbo" not in chinese
     assert "Current supported execution path" in english
+    assert "Choose exactly one" in english_current
+    assert "二选一" in chinese_current
     assert "Historical implementation reference" in english
     assert english.index("Historical implementation reference") < english.index(
         "conda activate"
