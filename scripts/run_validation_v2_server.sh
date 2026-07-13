@@ -115,9 +115,12 @@ fi
 if ! "$PYTHON3_BIN" -m ensurepip --version >/dev/null 2>&1; then
   die "Python ensurepip is unavailable; install the matching python3.${PYTHON_MINOR}-venv package (ensurepip required)"
 fi
-HEAD_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
+HEAD_COMMIT="$(git -C "$REPO" rev-parse HEAD)" \
+  || die 'cannot resolve Git HEAD'
 [[ "$HEAD_COMMIT" == "$COMMIT" ]] || die "HEAD does not match --commit: $HEAD_COMMIT != $COMMIT"
-[[ -z "$(git -C "$REPO" status --porcelain)" ]] || die 'Git worktree must be clean'
+GIT_STATUS="$(git -C "$REPO" status --porcelain)" \
+  || die 'cannot inspect Git worktree status'
+[[ -z "$GIT_STATUS" ]] || die 'Git worktree must be clean'
 [[ "$(uname -s)" == Linux ]] || die 'this formal runner requires Linux'
 for REQUIRED_HOST_COMMAND in nvidia-smi pgrep nohup tee; do
   command -v "$REQUIRED_HOST_COMMAND" >/dev/null 2>&1 \

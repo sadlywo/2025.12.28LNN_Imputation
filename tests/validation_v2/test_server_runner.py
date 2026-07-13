@@ -1043,6 +1043,39 @@ def test_runner_ignores_its_venv_but_rejects_other_untracked_files(tmp_path: Pat
     assert valid_log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
 
 
+def test_runner_fails_closed_when_git_status_cannot_be_inspected(tmp_path: Path) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    fake_python, python_log = _make_fake_python(tmp_path, "3.12.3")
+    bash_env = tmp_path / "git-status-error-bash-env"
+    bash_env.write_text(
+        "git() {\n"
+        "  if [ \"${1:-}\" = \"-C\" ] && [ \"${3:-}\" = \"status\" ]; then\n"
+        "    return 86\n"
+        "  fi\n"
+        "  builtin command git \"$@\"\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "BASH_ENV": bash_env.as_posix(),
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": python_log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "cannot inspect Git worktree status" in completed.stderr
+    assert python_log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+    assert not list(tmp_path.glob("validation-v2-preflight-*"))
+    assert not (repository / ".venv-server").exists()
+    assert not (repository / "results").exists()
+
+
 def test_runner_rejects_a_preexisting_audit_seal_before_venv_or_other_writes(
     tmp_path: Path,
 ) -> None:
