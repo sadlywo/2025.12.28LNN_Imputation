@@ -29,6 +29,13 @@ From an already cloned repository, bind the reviewed 40-character commit before
 any `start`. The explicit equality and clean-worktree gates below are mandatory;
 the launcher repeats them and fails closed if either condition changes.
 
+**Paid-resource warning:** Closing or disconnecting SSH does not stop the
+detached tmux session, training, or billing. This launcher has no `stop`
+command. Before running `start`, confirm the budget and the MatPool rental
+window. To end billing, use the platform-verified shutdown or instance-release
+procedure and verify the resulting platform state; killing a shard process is
+not evidence that billing has ended.
+
 ```bash
 set -Eeuo pipefail
 cd /2025.12.28LNN_Imputation

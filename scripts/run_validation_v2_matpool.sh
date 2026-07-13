@@ -79,6 +79,84 @@ if os.name != "nt":
 PY
 }
 
+verify_previous_campaign_completion() {
+  python3 - "$STATE_EXIT_STATUS_PATH" "$STATE_DIR" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path, state_dir = sys.argv[1:]
+
+
+def reject(message):
+    raise SystemExit(message)
+
+
+if os.path.dirname(path) != state_dir:
+    reject("invalid previous campaign exit evidence path: {}".format(path))
+
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    reject(
+        "previous campaign completion is unproven: exit evidence is missing: {}".format(
+            path
+        )
+    )
+except OSError as error:
+    reject("invalid previous campaign exit evidence: {}".format(error))
+
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    reject(
+        "previous campaign exit evidence must be a regular non-symlink file: {}".format(
+            path
+        )
+    )
+
+effective_uid = getattr(os, "geteuid", lambda: metadata.st_uid)()
+if metadata.st_uid != effective_uid:
+    reject("previous campaign exit evidence has an unsafe owner: {}".format(path))
+if metadata.st_size > 4:
+    reject("invalid previous campaign exit evidence: content is oversized")
+
+flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError as error:
+    reject("invalid previous campaign exit evidence: {}".format(error))
+try:
+    opened_metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(opened_metadata.st_mode):
+        reject(
+            "previous campaign exit evidence must be a regular non-symlink file: {}".format(
+                path
+            )
+        )
+    if opened_metadata.st_uid != effective_uid:
+        reject("previous campaign exit evidence has an unsafe owner: {}".format(path))
+    if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+        metadata.st_dev,
+        metadata.st_ino,
+    ):
+        reject("invalid previous campaign exit evidence: file changed during validation")
+    data = os.read(descriptor, 5)
+finally:
+    os.close(descriptor)
+
+if data in (b"0", b"0\n"):
+    raise SystemExit(0)
+if re.fullmatch(rb"(?:[1-9]|[1-9][0-9]{1,2})\n?", data):
+    status = int(data)
+    if status <= 255:
+        reject(
+            "previous campaign exited nonzero ({}); diagnose it manually before "
+            "starting another paid campaign".format(status)
+        )
+reject("invalid previous campaign exit evidence: expected the single decimal value 0")
+PY
+}
+
 load_state() {
   [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || die "no current state: $STATE_FILE"
   local decoded
@@ -372,6 +450,8 @@ start_campaign() {
     load_state
     inspect_session "$STATE_SESSION"
     [[ "$SESSION_STATE" != active ]] || die "campaign is already active: $STATE_SESSION"
+    verify_previous_campaign_completion \
+      || die "refusing restart because previous campaign completion is not safely proven; diagnose it manually"
   fi
 
   local timestamp

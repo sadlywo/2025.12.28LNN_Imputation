@@ -19,10 +19,10 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / "scripts" / "run_validation_v2_matpool.sh"
-_TRACKED_SCAN_ROOTS = frozenset(
+_TRACKED_RELEASE_TEXT_ROOTS = frozenset(
     {"configs", "docs", "scripts", "tests", "validation_v2"}
 )
-_TRACKED_SCAN_SUFFIXES = frozenset(
+_TRACKED_RELEASE_TEXT_SUFFIXES = frozenset(
     {
         ".bib",
         ".json",
@@ -190,14 +190,17 @@ def _fictional_credential_payloads() -> tuple[str, ...]:
     )
 
 
-def _tracked_scan_path_is_in_scope(relative_path: Path) -> bool:
-    if relative_path.suffix.casefold() not in _TRACKED_SCAN_SUFFIXES:
+def _tracked_release_text_path_is_in_scope(relative_path: Path) -> bool:
+    if relative_path.suffix.casefold() not in _TRACKED_RELEASE_TEXT_SUFFIXES:
         return False
-    return len(relative_path.parts) == 1 or relative_path.parts[0] in _TRACKED_SCAN_ROOTS
+    return (
+        len(relative_path.parts) == 1
+        or relative_path.parts[0] in _TRACKED_RELEASE_TEXT_ROOTS
+    )
 
 
 @lru_cache(maxsize=1)
-def _tracked_utf8_text_paths() -> tuple[Path, ...]:
+def _tracked_release_utf8_text_paths() -> tuple[Path, ...]:
     serialized = subprocess.check_output(
         ["git", "-C", str(REPO_ROOT), "ls-files", "-z"]
     )
@@ -206,18 +209,18 @@ def _tracked_utf8_text_paths() -> tuple[Path, ...]:
         if not encoded_path:
             continue
         relative_path = Path(encoded_path.decode("utf-8", errors="strict"))
-        if not _tracked_scan_path_is_in_scope(relative_path):
+        if not _tracked_release_text_path_is_in_scope(relative_path):
             continue
         raw = REPO_ROOT.joinpath(relative_path).read_bytes()
         if b"\0" in raw:
             raise AssertionError(
-                (relative_path, "tracked scan-scope file contains a NUL byte")
+                (relative_path, "tracked release text contains a NUL byte")
             )
         try:
             raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError as error:
             raise AssertionError(
-                (relative_path, "tracked scan-scope file is not UTF-8")
+                (relative_path, "tracked release text is not UTF-8")
             ) from error
         tracked_text.append(relative_path)
     return tuple(tracked_text)
@@ -253,8 +256,8 @@ def test_credential_leak_scanner_ignores_ordinary_narrative(narrative: str) -> N
     assert not _credential_leaks(narrative)
 
 
-def test_credential_scan_scope_includes_tracked_repository_text() -> None:
-    tracked = set(_tracked_utf8_text_paths())
+def test_credential_scan_scope_includes_tracked_release_source_test_docs_and_config_text() -> None:
+    tracked = set(_tracked_release_utf8_text_paths())
 
     for relative_path in (
         Path("scripts/run_validation_v2_server.sh"),
@@ -286,15 +289,15 @@ def test_credential_scan_scope_includes_tracked_repository_text() -> None:
         (Path("docs/figure.png"), False),
     ),
 )
-def test_tracked_credential_scan_scope_is_bounded_to_repository_text(
+def test_credential_scan_scope_is_bounded_to_tracked_release_source_test_docs_and_config_text(
     relative_path: Path,
     expected: bool,
 ) -> None:
-    assert _tracked_scan_path_is_in_scope(relative_path) is expected
+    assert _tracked_release_text_path_is_in_scope(relative_path) is expected
 
 
-def test_tracked_repository_text_contains_no_access_credentials() -> None:
-    for relative_path in _tracked_utf8_text_paths():
+def test_tracked_release_source_test_docs_and_config_text_contains_no_access_credentials() -> None:
+    for relative_path in _tracked_release_utf8_text_paths():
         path = REPO_ROOT / relative_path
         text = path.read_bytes().decode("utf-8", errors="strict")
         leaks = _credential_leaks(text)
@@ -992,6 +995,21 @@ def test_success_holds_start_lock_through_tmux_then_cleans_it(tmp_path: Path) ->
     assert not (state_dir / "start.lock").exists()
 
 
+def test_restart_completion_gate_is_inside_start_lock_and_before_state_publish() -> None:
+    source = LAUNCHER.read_text(encoding="utf-8")
+    start_body = source.split("start_campaign() {\n", 1)[1].split(
+        "\n}\n\nshow_status()", 1
+    )[0]
+
+    assert start_body.index("acquire_start_lock") < start_body.index("load_state")
+    assert start_body.index("load_state") < start_body.index(
+        "verify_previous_campaign_completion"
+    )
+    assert start_body.index("verify_previous_campaign_completion") < start_body.index(
+        "publish_state"
+    )
+
+
 def test_stale_start_lock_fails_closed_and_requires_manual_confirmation(
     tmp_path: Path,
 ) -> None:
@@ -1010,7 +1028,7 @@ def test_stale_start_lock_fails_closed_and_requires_manual_confirmation(
     assert not _from_bash_path(environment["FAKE_TMUX_LOG"]).exists()
 
 
-def test_inactive_current_session_allows_new_campaign_without_overwriting_history(
+def test_inactive_completed_current_session_allows_new_campaign_without_overwriting_history(
     tmp_path: Path,
 ) -> None:
     repository, _, environment = _make_repository(tmp_path)
@@ -1033,6 +1051,179 @@ def test_inactive_current_session_allows_new_campaign_without_overwriting_histor
     assert new_state["max_workers"] == 1
     assert all(path.is_file() for path in old_paths)
     assert [path.read_bytes() for path in old_paths] == old_contents
+
+
+def test_inactive_current_session_without_exit_evidence_refuses_restart(
+    tmp_path: Path,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    first = _run(repository, environment, "start")
+    assert first.returncode == 0, first.stderr
+    old_state = _state(repository)
+    old_current = (repository / ".validation-v2-matpool" / "current.json").read_bytes()
+    old_command = _from_bash_path(str(old_state["command_file"]))
+    old_log = _from_bash_path(str(old_state["log_path"]))
+    old_command_bytes = old_command.read_bytes()
+    old_log_bytes = old_log.read_bytes()
+    _from_bash_path(str(old_state["exit_status_path"])).unlink()
+    environment["FAKE_TMUX_HAS_RC"] = "1"
+
+    restarted = _run(repository, environment, "start")
+
+    assert restarted.returncode == 2
+    assert "previous campaign completion is unproven" in restarted.stderr.lower()
+    assert _state(repository) == old_state
+    assert (repository / ".validation-v2-matpool" / "current.json").read_bytes() == old_current
+    assert old_command.read_bytes() == old_command_bytes
+    assert old_log.read_bytes() == old_log_bytes
+    tmux_calls = _from_bash_path(environment["FAKE_TMUX_LOG"]).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len([call for call in tmux_calls if call.startswith("new-session ")]) == 1
+
+
+@pytest.mark.parametrize("exit_status", ("1\n", "17\n"))
+def test_inactive_current_session_with_nonzero_exit_refuses_restart_for_manual_diagnosis(
+    tmp_path: Path, exit_status: str
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    first = _run(repository, environment, "start")
+    assert first.returncode == 0, first.stderr
+    old_state = _state(repository)
+    exit_path = _from_bash_path(str(old_state["exit_status_path"]))
+    exit_path.write_bytes(exit_status.encode("ascii"))
+    environment["FAKE_TMUX_HAS_RC"] = "1"
+
+    restarted = _run(repository, environment, "start")
+
+    assert restarted.returncode == 2
+    assert "previous campaign exited nonzero" in restarted.stderr.lower()
+    assert "manual" in restarted.stderr.lower()
+    assert _state(repository) == old_state
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence",
+    (b"", b"00\n", b" 0\n", b"0\nextra\n", b"256\n", b"0" * 4097),
+    ids=(
+        "empty",
+        "leading-zero",
+        "leading-space",
+        "extra-line",
+        "out-of-range",
+        "oversized",
+    ),
+)
+def test_inactive_current_session_with_invalid_exit_evidence_refuses_restart(
+    tmp_path: Path, invalid_evidence: bytes
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    first = _run(repository, environment, "start")
+    assert first.returncode == 0, first.stderr
+    old_state = _state(repository)
+    exit_path = _from_bash_path(str(old_state["exit_status_path"]))
+    exit_path.write_bytes(invalid_evidence)
+    environment["FAKE_TMUX_HAS_RC"] = "1"
+
+    restarted = _run(repository, environment, "start")
+
+    assert restarted.returncode == 2
+    assert "invalid previous campaign exit evidence" in restarted.stderr.lower()
+    assert _state(repository) == old_state
+
+
+def test_inactive_current_session_with_nonregular_exit_evidence_refuses_restart(
+    tmp_path: Path,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    first = _run(repository, environment, "start")
+    assert first.returncode == 0, first.stderr
+    old_state = _state(repository)
+    exit_path = _from_bash_path(str(old_state["exit_status_path"]))
+    exit_path.unlink()
+    exit_path.mkdir()
+    environment["FAKE_TMUX_HAS_RC"] = "1"
+
+    restarted = _run(repository, environment, "start")
+
+    assert restarted.returncode == 2
+    assert "regular non-symlink" in restarted.stderr.lower()
+    assert _state(repository) == old_state
+
+
+def test_inactive_current_session_with_linked_exit_evidence_refuses_restart(
+    tmp_path: Path,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    first = _run(repository, environment, "start")
+    assert first.returncode == 0, first.stderr
+    old_state = _state(repository)
+    exit_path = _from_bash_path(str(old_state["exit_status_path"]))
+    link_target = exit_path.with_name("untrusted-exit-target")
+    link_target.write_text("0\n", encoding="ascii")
+    exit_path.unlink()
+    try:
+        exit_path.symlink_to(link_target.name)
+    except OSError as error:
+        pytest.skip(f"symbolic links are unavailable: {error}")
+    environment["FAKE_TMUX_HAS_RC"] = "1"
+
+    restarted = _run(repository, environment, "start")
+
+    assert restarted.returncode == 2
+    assert "regular non-symlink" in restarted.stderr.lower()
+    assert _state(repository) == old_state
+
+
+def test_previous_campaign_exit_evidence_owned_by_another_euid_is_rejected(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    exit_path = state_dir / "run-matpool-20260713T110000Z.exit"
+    exit_path.write_bytes(b"0\n")
+    check = _launcher_python_heredoc("verify_previous_campaign_completion")
+    script = (
+        "import os\n"
+        "os.geteuid = lambda: os.lstat(os.sys.argv[1]).st_uid + 1\n"
+        + check
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-", str(exit_path), str(state_dir)],
+        input=script,
+        capture_output=True,
+        check=False,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert completed.returncode != 0
+    assert "unsafe owner" in completed.stderr.lower()
+
+
+def test_inactive_current_state_with_exit_path_outside_campaign_is_rejected(
+    tmp_path: Path,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    first = _run(repository, environment, "start")
+    assert first.returncode == 0, first.stderr
+    state = _state(repository)
+    outside_exit = tmp_path / "outside.exit"
+    outside_exit.write_bytes(b"0\n")
+    state["exit_status_path"] = _to_bash_path(outside_exit)
+    state_file = repository / ".validation-v2-matpool" / "current.json"
+    state_file.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    environment["FAKE_TMUX_HAS_RC"] = "1"
+
+    restarted = _run(repository, environment, "start")
+
+    assert restarted.returncode == 2
+    assert "malformed state" in restarted.stderr.lower()
+    tmux_calls = _from_bash_path(environment["FAKE_TMUX_LOG"]).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len([call for call in tmux_calls if call.startswith("new-session ")]) == 1
 
 
 @pytest.mark.parametrize("command", ["start", "status", "logs"])
@@ -1191,7 +1382,26 @@ def test_launcher_declares_strict_bash_and_never_offers_stop() -> None:
         assert required in tools
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="real tmux integration requires Linux")
+def test_matpool_runbooks_warn_that_disconnect_does_not_stop_billing() -> None:
+    english = REPO_ROOT.joinpath("docs/validation_v2_server_runbook.md").read_text(
+        encoding="utf-8"
+    )
+    chinese = REPO_ROOT.joinpath("docs/validation_v2_server_runbook_zh.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Closing or disconnecting SSH does not stop" in english
+    assert re.search(
+        r"platform-verified shutdown or instance-release\s+procedure", english
+    )
+    assert "关闭或断开 SSH 不会停止" in chinese
+    assert "平台核验的停机或实例释放流程" in chinese
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="real tmux integration requires Linux and an installed tmux",
+)
 def test_real_tmux_start_is_detached_and_publishes_log_and_exit_status(
     tmp_path: Path,
 ) -> None:
