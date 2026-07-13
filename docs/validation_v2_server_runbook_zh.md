@@ -15,6 +15,7 @@ MatPool 启动器只是该合同的后台运维封装，不会跳过测试、计
 下面的 HEAD 相等断言和干净工作树门禁不可省略；启动器还会再次执行相同检查。
 
 ```bash
+set -Eeuo pipefail
 cd /2025.12.28LNN_Imputation
 VALIDATED_COMMIT="<40-HEX-VALIDATED-COMMIT>"
 git checkout --detach "$VALIDATED_COMMIT"

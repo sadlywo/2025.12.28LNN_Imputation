@@ -30,6 +30,7 @@ any `start`. The explicit equality and clean-worktree gates below are mandatory;
 the launcher repeats them and fails closed if either condition changes.
 
 ```bash
+set -Eeuo pipefail
 cd /2025.12.28LNN_Imputation
 VALIDATED_COMMIT="<40-HEX-VALIDATED-COMMIT>"
 git checkout --detach "$VALIDATED_COMMIT"

@@ -86,6 +86,10 @@ _CREDENTIAL_LEAK_PATTERNS = (
         ),
     ),
     (
+        "lowercase pwd assignment",
+        re.compile(r"\bpwd\s*(?::=|[=:])"),
+    ),
+    (
         "Chinese credential assignment",
         re.compile(r"密码\s*(?:：|:=|[=:])", flags=re.IGNORECASE),
     ),
@@ -103,6 +107,51 @@ _CREDENTIAL_LEAK_PATTERNS = (
 def _credential_leaks(text: str) -> tuple[str, ...]:
     return tuple(
         label for label, pattern in _CREDENTIAL_LEAK_PATTERNS if pattern.search(text)
+    )
+
+
+def _assembled(*parts: str) -> str:
+    return "".join(parts)
+
+
+def _fictional_credential_payloads() -> tuple[str, ...]:
+    return (
+        _assembled("s", "sh -p 65001 ", "operator", "@", "example.invalid"),
+        _assembled("S", "SH ", "operator", "@", "example.invalid -p 65002"),
+        _assembled("s", "sh ", "operator", "@", "example.invalid"),
+        _assembled("s", "sh compute.", "example.invalid"),
+        _assembled("prepare; s", "sh compute.", "example.invalid"),
+        _assembled("operator", "@", "example.invalid"),
+        _assembled("compute-fictional.", "matpool", ".com"),
+        _assembled("SSH", "_HOST", " = gateway.example.invalid"),
+        _assembled("ssh", "_port", ": 65003"),
+        _assembled("SSH", "_USER", " = operator"),
+        _assembled("ssh", "_username", ": operator"),
+        _assembled("SSH", "_PASSWORD", " := dummy-value"),
+        _assembled("ssh", "_passwd", "= dummy-value"),
+        _assembled("SSH", "_PWD", " : dummy-value"),
+        _assembled("MATPOOL", "_TOKEN", " = dummy-value"),
+        _assembled("api", "_token", ": dummy-value"),
+        _assembled("ACCESS", "_TOKEN", " := dummy-value"),
+        _assembled("VALIDATION", "_SECRET", " = dummy-value"),
+        _assembled("SSH", "_PRIVATE_KEY", " = dummy-value"),
+        _assembled("s", "sh://", "operator", "@", "example.invalid/project"),
+        _assembled(
+            "http",
+            "s://operator:dummy-value",
+            "@",
+            "example.invalid/project",
+        ),
+        _assembled("-----BEGIN ", "OPENSSH PRIVATE KEY-----"),
+        _assembled("-----BEGIN ", "PRIVATE KEY-----"),
+        _assembled("MATPOOL", "_SSH_HOST", "=compute.example.invalid"),
+        _assembled("matpool", "_ssh_port", " := 65004"),
+        _assembled("MATPOOL", "_SSH_USER", ": operator"),
+        _assembled("MATPOOL", "_SSH_PASSWORD", " = dummy-value"),
+        _assembled("pass", "word = dummy-value"),
+        _assembled("Pass", "Wd: dummy-value"),
+        _assembled("p", "wd = dummy-value"),
+        _assembled("密", "码：虚构值"),
     )
 
 
@@ -141,38 +190,7 @@ def _tracked_utf8_text_paths() -> tuple[Path, ...]:
 
 @pytest.mark.parametrize(
     "fictional_payload",
-    (
-        "ssh -p 65001 operator@example.invalid",
-        "SSH operator@example.invalid -p 65002",
-        "ssh operator@example.invalid",
-        "ssh compute.example.invalid",
-        "prepare; ssh compute.example.invalid",
-        "operator@example.invalid",
-        "compute-fictional.matpool.com",
-        "SSH_HOST = gateway.example.invalid",
-        "ssh_port: 65003",
-        "SSH_USER = operator",
-        "ssh_username: operator",
-        "SSH_PASSWORD := dummy-value",
-        "ssh_passwd= dummy-value",
-        "SSH_PWD : dummy-value",
-        "MATPOOL_TOKEN = dummy-value",
-        "api_token: dummy-value",
-        "ACCESS_TOKEN := dummy-value",
-        "VALIDATION_SECRET = dummy-value",
-        "SSH_PRIVATE_KEY = dummy-value",
-        "ssh://operator@example.invalid/project",
-        "https://operator:dummy-value@example.invalid/project",
-        "-----BEGIN " + "OPENSSH PRIVATE KEY-----",
-        "-----BEGIN " + "PRIVATE KEY-----",
-        "MATPOOL_SSH_HOST=compute.example.invalid",
-        "matpool_ssh_port := 65004",
-        "MATPOOL_SSH_USER: operator",
-        "MATPOOL_SSH_PASSWORD = dummy-value",
-        "password = dummy-value",
-        "PassWd: dummy-value",
-        "密码：虚构值",
-    ),
+    _fictional_credential_payloads(),
 )
 def test_credential_leak_scanner_recognizes_fictional_payloads(
     fictional_payload: str,
@@ -191,7 +209,6 @@ def test_credential_leak_scanner_recognizes_fictional_payloads(
         "token_count = 12",
         "The secret concept is discussed without assigning a value.",
         "PWD = /workspace/project",
-        "pwd := /workspace/project",
         "Git fixture email is test@example.invalid.",
     ),
 )
@@ -206,6 +223,7 @@ def test_credential_scan_scope_includes_tracked_repository_text() -> None:
         Path("scripts/run_validation_v2_server.sh"),
         Path("docs/validation_v2_server_runbook.md"),
         Path("tests/validation_v2/test_cli_smoke.py"),
+        Path("tests/validation_v2/test_matpool_launcher.py"),
         Path("validation_v2/cli.py"),
         Path("configs/validation_v2/server_full.yaml"),
         Path("README.md"),
@@ -239,14 +257,19 @@ def test_tracked_credential_scan_scope_is_bounded_to_repository_text(
 
 
 def test_tracked_repository_text_contains_no_access_credentials() -> None:
-    scanner_fixture = Path("tests/validation_v2/test_matpool_launcher.py")
     for relative_path in _tracked_utf8_text_paths():
-        if relative_path == scanner_fixture:
-            continue
         path = REPO_ROOT / relative_path
         text = path.read_bytes().decode("utf-8", errors="strict")
         leaks = _credential_leaks(text)
         assert not leaks, (relative_path, leaks)
+
+
+def test_credential_scanner_source_contains_no_leak_instance() -> None:
+    relative_path = Path("tests/validation_v2/test_matpool_launcher.py")
+    text = REPO_ROOT.joinpath(relative_path).read_text(encoding="utf-8")
+    leaks = _credential_leaks(text)
+
+    assert not leaks, (relative_path, leaks)
 
 
 def _bash() -> str:

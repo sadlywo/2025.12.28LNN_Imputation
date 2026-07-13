@@ -85,6 +85,7 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
             if "run_validation_v2_matpool.sh start" in block
         ] == [matpool_start]
         required_gate = (
+            "set -Eeuo pipefail",
             'VALIDATED_COMMIT="<40-HEX-VALIDATED-COMMIT>"',
             'git checkout --detach "$VALIDATED_COMMIT"',
             'test "$(git rev-parse HEAD)" = "$VALIDATED_COMMIT"',
@@ -93,6 +94,7 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
         )
         positions = [matpool_start.index(token) for token in required_gate]
         assert positions == sorted(positions)
+        assert matpool_start.splitlines()[0] == "set -Eeuo pipefail"
 
         generic_sequence = next(
             block
@@ -222,6 +224,50 @@ def _run_bash(tmp_path: Path, source: str, *, timeout: float = 10) -> subprocess
         cwd=tmp_path, env=environment, capture_output=True, text=True,
         timeout=timeout + 5, check=False,
     )
+
+
+@pytest.mark.parametrize(
+    "runbook_name,historical_marker",
+    (
+        ("validation_v2_server_runbook.md", "## Historical implementation reference"),
+        ("validation_v2_server_runbook_zh.md", "## 历史资料"),
+    ),
+)
+def test_matpool_runbook_gate_failure_never_calls_start(
+    tmp_path: Path,
+    runbook_name: str,
+    historical_marker: str,
+) -> None:
+    runbook = REPO_ROOT.joinpath("docs", runbook_name).read_text(encoding="utf-8")
+    current = runbook.split(historical_marker, 1)[0]
+    block = next(
+        candidate
+        for candidate in re.findall(r"```bash\n(.*?)\n```", current, re.DOTALL)
+        if "cd /2025.12.28LNN_Imputation" in candidate
+        and "run_validation_v2_matpool.sh start" in candidate
+    )
+    start_command = "bash scripts/run_validation_v2_matpool.sh start"
+    gate = block[: block.index(start_command) + len(start_command)]
+    gate = "\n".join(line for line in gate.splitlines() if not line.startswith("cd "))
+    start_log = tmp_path.joinpath("start-called").as_posix()
+    result = _run_bash(
+        tmp_path,
+        f'''git() {{
+  case "$1 $2" in
+    "checkout --detach") return 0 ;;
+    "rev-parse HEAD") printf '%s\\n' '0000000000000000000000000000000000000000'; return 0 ;;
+    "status --porcelain") return 0 ;;
+    *) return 99 ;;
+  esac
+}}
+bash() {{ : > "$START_LOG"; }}
+export START_LOG="{start_log}"
+{gate}
+''',
+    )
+
+    assert result.returncode != 0
+    assert not tmp_path.joinpath("start-called").exists()
 
 
 def test_server_runbook_launch_preconditions_never_reach_nohup(tmp_path: Path):
