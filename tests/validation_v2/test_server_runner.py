@@ -121,9 +121,8 @@ def test_runner_uses_local_venv_and_explicit_cuda121_torch_index() -> None:
     assert "-m venv" in source
     assert "https://download.pytorch.org/whl/cu121" in source
     assert "torch==2.3.1" in source
-    assert "torch.__version__" in source
-    assert "2.3.1+cu121" in source
-    assert "conda activate" not in source
+    assert 'torch.__version__ == "2.3.1+cu121"' in source
+    assert "conda" not in source
     assert "pinn_imu" not in source
 
 
