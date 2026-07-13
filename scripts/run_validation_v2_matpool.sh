@@ -257,6 +257,44 @@ write_command_file() {
   } > "$COMMAND_FILE"
 }
 
+release_start_lock() {
+  if (( START_LOCK_HELD )); then
+    if ! rmdir -- "$START_LOCK_DIR"; then
+      printf '%s\n' \
+        "cannot remove campaign start lock: $START_LOCK_DIR; inspect it and confirm activity manually" >&2
+      return 2
+    fi
+    START_LOCK_HELD=0
+  fi
+}
+
+cleanup_start_lock() {
+  local status=$?
+  trap - EXIT INT TERM
+  if (( START_LOCK_HELD )); then
+    if rmdir -- "$START_LOCK_DIR"; then
+      START_LOCK_HELD=0
+    else
+      printf '%s\n' \
+        "cannot remove campaign start lock: $START_LOCK_DIR; inspect it and confirm activity manually" >&2
+      if (( status == 0 )); then
+        status=2
+      fi
+    fi
+  fi
+  exit "$status"
+}
+
+acquire_start_lock() {
+  if ! mkdir "$START_LOCK_DIR" 2>/dev/null; then
+    die "campaign is already starting or locked: $START_LOCK_DIR; confirm no launcher is active and remove it manually"
+  fi
+  START_LOCK_HELD=1
+  trap cleanup_start_lock EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
 start_campaign() {
   require_linux_tools
   [[ -L "$STATE_DIR" ]] && die "launcher state directory must not be linked: $STATE_DIR"
@@ -269,6 +307,16 @@ start_campaign() {
   [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] \
     || die "repository HEAD is not an exact 40-character lowercase commit: $COMMIT"
   [[ -z "$(git -C "$REPO" status --porcelain)" ]] || die 'Git worktree must be clean'
+
+  if [[ ! -e "$STATE_DIR" ]]; then
+    if ! mkdir "$STATE_DIR" 2>/dev/null; then
+      [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+        || die "cannot create launcher state directory: $STATE_DIR"
+    fi
+  fi
+  [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+    || die "launcher state directory must be a real directory: $STATE_DIR"
+  acquire_start_lock
 
   if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
     load_state
@@ -295,9 +343,6 @@ start_campaign() {
     [[ ! -e "$target" && ! -L "$target" ]] || die "campaign target already exists: $target"
   done
 
-  if [[ ! -e "$STATE_DIR" ]]; then
-    mkdir "$STATE_DIR" || die "cannot create launcher state directory: $STATE_DIR"
-  fi
   umask 077
   (set -o noclobber; : > "$COMMAND_FILE") \
     || die "cannot reserve unique command file: $COMMAND_FILE"
@@ -309,6 +354,9 @@ start_campaign() {
 
   local tmux_status
   if tmux new-session -d -s "$SESSION" bash "$COMMAND_FILE"; then
+    release_start_lock \
+      || die "session was launched but the campaign start lock remains; confirm activity manually"
+    trap - EXIT INT TERM
     printf 'started session: %s\n' "$SESSION"
     printf 'log: %s\n' "$LOG_PATH"
   else
@@ -355,6 +403,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 STATE_DIR="$REPO/.validation-v2-matpool"
 STATE_FILE="$STATE_DIR/current.json"
+START_LOCK_DIR="$STATE_DIR/start.lock"
+START_LOCK_HELD=0
 GENERIC_RUNNER="$REPO/scripts/run_validation_v2_server.sh"
 MAX_WORKERS=4
 SKIP_DEPENDENCY_INSTALL=false

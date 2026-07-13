@@ -98,6 +98,10 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
     bash_environment.write_text(
         "uname() { printf '%s\\n' Linux; }\n"
         "tail() { command \"$FAKE_BIN/tail\" \"$@\"; }\n"
+        "date() {\n"
+        "  if [ -n \"${FAKE_DATE_VALUE:-}\" ]; then printf '%s\\n' \"$FAKE_DATE_VALUE\";\n"
+        "  else command /usr/bin/date \"$@\"; fi\n"
+        "}\n"
         "python3() {\n"
         "  local -a converted=()\n"
         "  local argument\n"
@@ -134,6 +138,22 @@ def _make_repository(tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
         "case \"${1:-}\" in\n"
         "  has-session) exit \"${FAKE_TMUX_HAS_RC:-1}\" ;;\n"
         "  new-session)\n"
+        "    if [ -n \"${FAKE_LOCK_OBSERVATION:-}\" ]; then\n"
+        "      if [ -d \"$FAKE_EXPECT_LOCK_PATH\" ]; then\n"
+        "        printf '%s\\n' locked >> \"$FAKE_LOCK_OBSERVATION\"\n"
+        "      else\n"
+        "        printf '%s\\n' unlocked >> \"$FAKE_LOCK_OBSERVATION\"\n"
+        "      fi\n"
+        "    fi\n"
+        "    if [ -n \"${FAKE_TMUX_BARRIER_ENTERED:-}\" ]; then\n"
+        "      : > \"$FAKE_TMUX_BARRIER_ENTERED\"\n"
+        "      attempts=0\n"
+        "      while [ ! -e \"$FAKE_TMUX_BARRIER_RELEASE\" ]; do\n"
+        "        attempts=$((attempts + 1))\n"
+        "        [ \"$attempts\" -lt 500 ] || exit 96\n"
+        "        sleep 0.01\n"
+        "      done\n"
+        "    fi\n"
         "    new_rc=\"${FAKE_TMUX_NEW_RC:-0}\"\n"
         "    if [ \"$new_rc\" -ne 0 ]; then exit \"$new_rc\"; fi\n"
         "    shift\n"
@@ -178,6 +198,29 @@ def _run(
         text=True,
         encoding="utf-8",
     )
+
+
+def _popen(
+    repository: Path, environment: dict[str, str], *arguments: str
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [_bash(), _to_bash_path(repository / "scripts" / LAUNCHER.name), *arguments],
+        cwd=repository,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def _wait_until(predicate, *, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("timed out waiting for concurrent launcher condition")
 
 
 def _state(repository: Path) -> dict[str, object]:
@@ -363,6 +406,105 @@ def test_live_current_session_refuses_duplicate_start(tmp_path: Path) -> None:
     assert old_command.read_bytes() == old_bytes
 
 
+def test_concurrent_starts_are_serialized_before_state_publish_and_tmux(
+    tmp_path: Path,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    entered_first = tmp_path / "tmux-entered-first"
+    entered_second = tmp_path / "tmux-entered-second"
+    release = tmp_path / "tmux-release"
+    first_environment = environment.copy()
+    first_environment.update(
+        {
+            "FAKE_DATE_VALUE": "20260713T110001Z",
+            "FAKE_TMUX_BARRIER_ENTERED": _to_bash_path(entered_first),
+            "FAKE_TMUX_BARRIER_RELEASE": _to_bash_path(release),
+        }
+    )
+    second_environment = environment.copy()
+    second_environment.update(
+        {
+            "FAKE_DATE_VALUE": "20260713T110002Z",
+            "FAKE_TMUX_BARRIER_ENTERED": _to_bash_path(entered_second),
+            "FAKE_TMUX_BARRIER_RELEASE": _to_bash_path(release),
+        }
+    )
+
+    first = _popen(repository, first_environment, "start")
+    try:
+        _wait_until(entered_first.exists)
+        second = _popen(repository, second_environment, "start")
+        try:
+            _wait_until(lambda: second.poll() is not None or entered_second.exists())
+            release.write_text("release\n", encoding="utf-8")
+            first_stdout, first_stderr = first.communicate(timeout=10)
+            second_stdout, second_stderr = second.communicate(timeout=10)
+        finally:
+            if second.poll() is None:
+                second.kill()
+                second.communicate()
+    finally:
+        if first.poll() is None:
+            release.write_text("release\n", encoding="utf-8")
+            first.kill()
+            first.communicate()
+
+    assert sorted((first.returncode, second.returncode)) == [0, 2], (
+        first_stdout,
+        first_stderr,
+        second_stdout,
+        second_stderr,
+    )
+    loser_stderr = first_stderr if first.returncode == 2 else second_stderr
+    assert "already starting" in loser_stderr.lower() or "locked" in loser_stderr.lower()
+    tmux_lines = _from_bash_path(environment["FAKE_TMUX_LOG"]).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    new_sessions = [line for line in tmux_lines if line.startswith("new-session ")]
+    assert len(new_sessions) == 1
+    state = _state(repository)
+    assert str(state["session"]) in new_sessions[0]
+    state_dir = repository / ".validation-v2-matpool"
+    assert len(list(state_dir.glob("run-*.sh"))) == 1
+    assert len(list(state_dir.glob("run-*.log"))) == 1
+    assert len(list(state_dir.glob("run-*.exit"))) == 1
+
+
+def test_success_holds_start_lock_through_tmux_then_cleans_it(tmp_path: Path) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    state_dir = repository / ".validation-v2-matpool"
+    observation = tmp_path / "lock-observation"
+    environment.update(
+        {
+            "FAKE_LOCK_OBSERVATION": _to_bash_path(observation),
+            "FAKE_EXPECT_LOCK_PATH": _to_bash_path(state_dir / "start.lock"),
+        }
+    )
+
+    completed = _run(repository, environment, "start")
+
+    assert completed.returncode == 0, completed.stderr
+    assert observation.read_text(encoding="utf-8").splitlines() == ["locked"]
+    assert not (state_dir / "start.lock").exists()
+
+
+def test_stale_start_lock_fails_closed_and_requires_manual_confirmation(
+    tmp_path: Path,
+) -> None:
+    repository, _, environment = _make_repository(tmp_path)
+    state_dir = repository / ".validation-v2-matpool"
+    start_lock = state_dir / "start.lock"
+    start_lock.mkdir(parents=True)
+
+    completed = _run(repository, environment, "start")
+
+    assert completed.returncode == 2
+    assert "lock" in completed.stderr.lower()
+    assert "manual" in completed.stderr.lower()
+    assert start_lock.is_dir()
+    assert not _from_bash_path(environment["FAKE_TMUX_LOG"]).exists()
+
+
 def test_inactive_current_session_allows_new_campaign_without_overwriting_history(
     tmp_path: Path,
 ) -> None:
@@ -492,6 +634,10 @@ def test_tmux_start_failure_preserves_published_state_log_and_diagnostic(
 ) -> None:
     repository, _, environment = _make_repository(tmp_path)
     environment["FAKE_TMUX_NEW_RC"] = "9"
+    state_dir = repository / ".validation-v2-matpool"
+    observation = tmp_path / "lock-observation"
+    environment["FAKE_LOCK_OBSERVATION"] = _to_bash_path(observation)
+    environment["FAKE_EXPECT_LOCK_PATH"] = _to_bash_path(state_dir / "start.lock")
 
     completed = _run(repository, environment, "start")
 
@@ -503,6 +649,8 @@ def test_tmux_start_failure_preserves_published_state_log_and_diagnostic(
     assert "tmux start failed" in log.lower()
     assert not _from_bash_path(str(state["exit_status_path"])).exists()
     assert "active" not in completed.stdout.lower()
+    assert observation.read_text(encoding="utf-8").splitlines() == ["locked"]
+    assert not (state_dir / "start.lock").exists()
 
 
 def test_launcher_state_directory_is_ignored() -> None:
