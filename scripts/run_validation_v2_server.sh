@@ -82,11 +82,43 @@ PYTHON3_BIN="${PYTHON3_BIN:-python3}"
 PYTHON3_VERSION="$("$PYTHON3_BIN" --version 2>&1)" || die "cannot run PYTHON3_BIN: $PYTHON3_BIN"
 [[ "$PYTHON3_VERSION" =~ ^Python[[:space:]]3\.12(\.|[[:space:]]) ]] \
   || die "Python 3.12 is required; found: $PYTHON3_VERSION"
-[[ "$(uname -s)" == Linux ]] || die 'this formal runner requires Linux'
 
 HEAD_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
 [[ "$HEAD_COMMIT" == "$COMMIT" ]] || die "HEAD does not match --commit: $HEAD_COMMIT != $COMMIT"
 [[ -z "$(git -C "$REPO" status --porcelain)" ]] || die 'Git worktree must be clean'
+
+PARENT_DIR="$(dirname "$REPO")"
+PREFLIGHT_DIR="$PARENT_DIR/validation-v2-preflight-${COMMIT}-${CAMPAIGN_SUFFIX}"
+AUDIT_DIR="$PARENT_DIR/validation-v2-audit-${COMMIT}-${CAMPAIGN_SUFFIX}"
+PLAN="$AUDIT_DIR/server-full-8-shards-${COMMIT}.json"
+SHARDS_ROOT="$REPO/results/validation_v2/server-full-shards-${COMMIT}-${CAMPAIGN_SUFFIX}"
+FINAL_ROOT="$REPO/results/validation_v2/server-full-final-${COMMIT}-${CAMPAIGN_SUFFIX}"
+CAMPAIGN_RESERVATION="$PARENT_DIR/.validation-v2-campaign-${COMMIT}-${CAMPAIGN_SUFFIX}.lock"
+CAMPAIGN_RESERVED=0
+CAMPAIGN_RESERVATION_ID=""
+release_campaign_reservation() {
+  local status="$?"
+  if (( CAMPAIGN_RESERVED )); then
+    local current_reservation_id=""
+    current_reservation_id="$(stat -c '%d:%i' "$CAMPAIGN_RESERVATION" 2>/dev/null)" || true
+    if [[ "$current_reservation_id" == "$CAMPAIGN_RESERVATION_ID" ]]; then
+      rmdir -- "$CAMPAIGN_RESERVATION" 2>/dev/null || true
+    fi
+    CAMPAIGN_RESERVED=0
+  fi
+  exit "$status"
+}
+trap release_campaign_reservation EXIT
+if [[ -e "$CAMPAIGN_RESERVATION" || -L "$CAMPAIGN_RESERVATION" ]] \
+    || ! mkdir "$CAMPAIGN_RESERVATION" 2>/dev/null; then
+  die "campaign reservation already exists or is linked: $CAMPAIGN_RESERVATION"
+fi
+CAMPAIGN_RESERVED=1
+CAMPAIGN_RESERVATION_ID="$(stat -c '%d:%i' "$CAMPAIGN_RESERVATION")" || {
+  CAMPAIGN_RESERVED=0
+  die "cannot establish campaign reservation ownership: $CAMPAIGN_RESERVATION"
+}
+[[ "$(uname -s)" == Linux ]] || die 'this formal runner requires Linux'
 
 PYTHON_BIN="$REPO/.venv-server/bin/python"
 if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -106,12 +138,6 @@ if (( ! SKIP_DEPENDENCY_INSTALL )); then
   install_dependencies
 fi
 
-PARENT_DIR="$(dirname "$REPO")"
-PREFLIGHT_DIR="$PARENT_DIR/validation-v2-preflight-${COMMIT}-${CAMPAIGN_SUFFIX}"
-AUDIT_DIR="$PARENT_DIR/validation-v2-audit-${COMMIT}-${CAMPAIGN_SUFFIX}"
-PLAN="$AUDIT_DIR/server-full-8-shards-${COMMIT}.json"
-SHARDS_ROOT="$REPO/results/validation_v2/server-full-shards-${COMMIT}-${CAMPAIGN_SUFFIX}"
-FINAL_ROOT="$REPO/results/validation_v2/server-full-final-${COMMIT}-${CAMPAIGN_SUFFIX}"
 CONFIG="$REPO/configs/validation_v2/server_full.yaml"
 export REPO COMMIT PREFLIGHT_DIR AUDIT_DIR PLAN SHARDS_ROOT FINAL_ROOT CONFIG PYTHON_BIN
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
@@ -132,12 +158,16 @@ import sys
 
 import torch
 
-assert sys.version_info[:2] == (3, 12), sys.version
-assert torch.__version__ == "2.3.1+cu121", torch.__version__
-assert torch.cuda.is_available(), "CUDA is unavailable"
-assert torch.version.cuda == "12.1", torch.version.cuda
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+require(sys.version_info[:2] == (3, 12), sys.version)
+require(torch.__version__ == "2.3.1+cu121", torch.__version__)
+require(torch.cuda.is_available(), "CUDA is unavailable")
+require(torch.version.cuda == "12.1", torch.version.cuda)
 name = torch.cuda.get_device_name(0)
-assert "4090 D" in name.upper(), name
+require("4090 D" in name.upper(), name)
 with open(sys.argv[1], "x", encoding="utf-8") as handle:
     json.dump(
         {
@@ -175,8 +205,10 @@ import json
 import sys
 
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-assert len(lines) == 4096, len(lines)
-assert json.loads(lines[0])["combination_count"] == 4095
+if len(lines) != 4096:
+    raise SystemExit("matrix dry-run must contain 4096 JSONL records: {}".format(len(lines)))
+if json.loads(lines[0]).get("combination_count") != 4095:
+    raise SystemExit("matrix dry-run must report 4095 combinations")
 PY
 
   "$PYTHON_BIN" -m validation_v2.cli shard-plan \
@@ -187,12 +219,18 @@ import json
 import sys
 
 plan = json.load(open(sys.argv[1], encoding="utf-8"))
-assert plan["schema_version"] == 2
-assert plan["total_groups"] == 175
-assert plan["total_cells"] == 4095
-assert plan["shard_count"] == 8
-assert plan["dirty_state_digest"] == ""
-assert [len(shard["group_ids"]) for shard in plan["shards"]] == [22, 22, 22, 22, 22, 22, 22, 21]
+if plan.get("schema_version") != 2:
+    raise SystemExit("unexpected shard plan schema")
+if plan.get("total_groups") != 175 or plan.get("total_cells") != 4095:
+    raise SystemExit("unexpected formal shard plan totals")
+if plan.get("shard_count") != 8 or plan.get("dirty_state_digest") != "":
+    raise SystemExit("shard plan is not a clean formal eight-shard plan")
+try:
+    group_counts = [len(shard["group_ids"]) for shard in plan["shards"]]
+except (KeyError, TypeError):
+    raise SystemExit("shard plan has invalid shard group identifiers")
+if group_counts != [22, 22, 22, 22, 22, 22, 22, 21]:
+    raise SystemExit("unexpected formal shard distribution")
 PY
 }
 
@@ -296,7 +334,8 @@ run_formal_campaign() {
   "$PYTHON_BIN" - "$FINAL_ROOT/validation_report.json" <<'PY'
 import json
 import sys
-assert json.load(open(sys.argv[1], encoding="utf-8"))["status"] == "complete"
+if json.load(open(sys.argv[1], encoding="utf-8")).get("status") != "complete":
+    raise SystemExit("merged validation report is not complete")
 PY
   "$PYTHON_BIN" -m validation_v2.cli summarize \
     --root "$FINAL_ROOT" --config "$CONFIG" \

@@ -3,6 +3,7 @@
 import os
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +31,7 @@ def _run_runner(*arguments: str, environment=None) -> subprocess.CompletedProces
     variables = os.environ.copy()
     if environment:
         variables.update(environment)
-    variables["MSYS2_ARG_CONV_EXCL"] = "*"
+    variables.setdefault("MSYS2_ARG_CONV_EXCL", "*")
     return subprocess.run(
         [_bash(), RUNNER.as_posix(), *arguments],
         cwd=REPO_ROOT,
@@ -70,6 +71,7 @@ def _make_clean_repository(tmp_path: Path) -> tuple[Path, str]:
         REPO_ROOT / "requirements-validation-v2.txt",
         repository / "requirements-validation-v2.txt",
     )
+    shutil.copy2(REPO_ROOT / ".gitignore", repository / ".gitignore")
     subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
     subprocess.run(
         ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
@@ -149,6 +151,113 @@ def test_runner_full_mode_calls_formal_workflow() -> None:
         "validation_v2.cli summarize",
     ):
         assert token in source
+
+
+def _runner_python_heredoc(name: str) -> str:
+    source = RUNNER.read_text(encoding="utf-8")
+    match = re.search(
+        rf"{re.escape(name)}\(\) \{{.*?<<'PY'\n(.*?)\nPY",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group(1)
+
+
+def test_runner_runtime_and_plan_checks_survive_optimized_python(tmp_path: Path) -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "assert " not in source
+
+    environment = tmp_path / "environment.json"
+    runtime = subprocess.run(
+        [sys.executable, "-O", "-", str(environment)],
+        input=_runner_python_heredoc("verify_runtime"),
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert runtime.returncode != 0
+    assert not environment.exists()
+
+    plan = tmp_path / "invalid-plan.json"
+    plan.write_text("{}\n", encoding="utf-8")
+    plan_check = source.split('"$PYTHON_BIN" - "$PLAN" <<\'PY\'\n', 1)[1].split(
+        "\nPY", 1
+    )[0]
+    completed = subprocess.run(
+        [sys.executable, "-O", "-", str(plan)],
+        input=plan_check,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert completed.returncode != 0
+
+
+def test_runner_ignores_its_venv_but_rejects_other_untracked_files(tmp_path: Path) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    (repository / ".venv-server").mkdir()
+    (repository / ".venv-server" / "sentinel").write_text("ignored\n", encoding="utf-8")
+    fake_python, log = _make_fake_python(tmp_path, "3.11.9")
+    ignored = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+    assert ignored.returncode == 2
+    assert "Python 3.12" in ignored.stderr
+    assert "dirty" not in ignored.stderr.lower()
+    assert log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
+    assert subprocess.check_output(
+        ["git", "-C", str(repository), "status", "--porcelain"], text=True
+    ) == ""
+
+    (repository / "foreign-sentinel").write_text("must fail\n", encoding="utf-8")
+    valid_dir = tmp_path / "valid"
+    valid_dir.mkdir()
+    valid_python, valid_log = _make_fake_python(valid_dir, "3.12.3")
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": valid_python.as_posix(),
+            "FAKE_PYTHON_LOG": valid_log.as_posix(),
+        },
+    )
+    assert completed.returncode == 2
+    assert "Git worktree must be clean" in completed.stderr
+    assert valid_log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
+
+
+def test_runner_rejects_an_existing_campaign_reservation_before_venv(tmp_path: Path) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    lock = tmp_path / f".validation-v2-campaign-{commit}-sharded-v2-py312.lock"
+    lock.mkdir()
+    fake_python, log = _make_fake_python(tmp_path, "3.12.3")
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+    assert completed.returncode == 2
+    assert "campaign reservation" in completed.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
+    assert lock.is_dir()
+    assert not (repository / ".venv-server").exists()
+
+
+def test_runner_releases_only_the_campaign_reservation_it_created() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+
+    assert "CAMPAIGN_RESERVATION_ID" in source
+    assert "stat -c '%d:%i'" in source
+    assert '"$current_reservation_id" == "$CAMPAIGN_RESERVATION_ID"' in source
 
 
 def _write_completed_stage(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
