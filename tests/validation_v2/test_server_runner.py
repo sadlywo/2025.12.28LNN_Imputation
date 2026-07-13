@@ -162,7 +162,43 @@ def test_runner_help_declares_full_and_preflight_modes() -> None:
     assert "--mode preflight|full" in completed.stdout
     assert "--commit COMMIT" in completed.stdout
     assert "--skip-dependency-install" in completed.stdout
+    assert "--max-workers 1|2|4|8" in completed.stdout
+    assert "default: 8" in completed.stdout
     assert "sharded-v2-py310/py311/py312" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    "value,error",
+    [
+        (None, "--max-workers requires 1, 2, 4, or 8"),
+        ("0", "--max-workers must be one of 1, 2, 4, or 8"),
+        ("3", "--max-workers must be one of 1, 2, 4, or 8"),
+        ("16", "--max-workers must be one of 1, 2, 4, or 8"),
+        ("four", "--max-workers must be one of 1, 2, 4, or 8"),
+    ],
+)
+def test_runner_rejects_invalid_max_workers_before_campaign_writes(
+    tmp_path: Path, value: str | None, error: str
+) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    arguments = [
+        "--commit",
+        commit,
+        "--mode",
+        "preflight",
+        "--repo",
+        repository.as_posix(),
+        "--max-workers",
+    ]
+    if value is not None:
+        arguments.append(value)
+
+    completed = _run_runner(*arguments)
+
+    assert completed.returncode == 2
+    assert error in completed.stderr
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+    assert not (repository / ".venv-server").exists()
 
 
 @pytest.mark.parametrize(
@@ -447,6 +483,7 @@ def test_runner_uses_local_venv_and_explicit_cuda121_torch_index() -> None:
 def test_runner_full_mode_calls_formal_workflow() -> None:
     source = RUNNER.read_text(encoding="utf-8")
 
+    assert "MAX_WORKERS=8" in source
     assert 'run_formal_campaign "$MODE"' in source
     for token in (
         "test_linux_rename_noreplace_survives_real_directory_race",
@@ -457,6 +494,181 @@ def test_runner_full_mode_calls_formal_workflow() -> None:
         "validation_v2.cli summarize",
     ):
         assert token in source
+
+
+def _formal_campaign_function() -> str:
+    source = RUNNER.read_text(encoding="utf-8")
+    match = re.search(
+        r"run_formal_campaign\(\) \{\n(.*?)\n\}\n\ncd \"\$REPO\"",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return "run_formal_campaign() {\n" + match.group(1) + "\n}\n"
+
+
+def _run_formal_campaign_contract(
+    tmp_path: Path,
+    max_workers: int,
+    *,
+    stage2_rc: int = 0,
+    stage4_rc: int = 0,
+    stage8_rc: int = 0,
+    expected_rc: int = 0,
+) -> list[str]:
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    log = tmp_path / "schedule.log"
+    script = (
+        "set -Eeuo pipefail\n"
+        "log() { printf '%s\\n' \"$*\" >> \"$SCHEDULE_LOG\"; }\n"
+        "start_managed_sampler() { log start \"$1\"; }\n"
+        "stop_managed_sampler() { log stop \"$1\"; }\n"
+        "launch_formal_shard() { log launch \"$1\"; }\n"
+        "wait_until_groups() { :; }\n"
+        "wait_stage_metrics() {\n"
+        "  log gate \"$1\"\n"
+        "  case \"$1\" in\n"
+        "    stage-2worker) return \"$STAGE2_RC\" ;;\n"
+        "    stage-4worker) return \"$STAGE4_RC\" ;;\n"
+        "    stage-8worker) return \"$STAGE8_RC\" ;;\n"
+        "    *) return 0 ;;\n"
+        "  esac\n"
+        "}\n"
+        "wait_shard() { log wait \"$1\"; }\n"
+        "wait_all_shards() { log wait-all \"$@\"; }\n"
+        "run_queue() { log queue \"$@\"; }\n"
+        "fake_python() {\n"
+        "  if [ \"${1:-}\" = '-c' ]; then\n"
+        "    printf '%s\\n' '2026-01-01T00:00:00+00:00'\n"
+        "  elif [ \"${1:-}\" = '-' ]; then\n"
+        "    cat >/dev/null\n"
+        "  fi\n"
+        "}\n"
+        + _formal_campaign_function()
+        + "run_formal_campaign full\n"
+    )
+    completed = subprocess.run(
+        [_bash(), "-c", script],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "AUDIT_DIR": _git_bash_path(audit_dir),
+            "SHARDS_ROOT": _git_bash_path(tmp_path / "shards"),
+            "FINAL_ROOT": _git_bash_path(tmp_path / "final"),
+            "SCHEDULE_LOG": _git_bash_path(log),
+            "PYTHON_BIN": "fake_python",
+            "CONFIG": "config.yaml",
+            "PLAN": "plan.json",
+            "MAX_WORKERS": str(max_workers),
+            "STAGE2_RC": str(stage2_rc),
+            "STAGE4_RC": str(stage4_rc),
+            "STAGE8_RC": str(stage8_rc),
+        },
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert completed.returncode == expected_rc, completed.stderr
+    return log.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.parametrize(
+    "max_workers,stage2_rc,stage4_rc,stage8_rc,expected_stages,expected_queue",
+    [
+        (1, 0, 0, 0, [], "queue 1 001 002 003 004 005 006 007"),
+        (2, 0, 0, 0, ["stage-2worker"], "queue 2 002 003 004 005 006 007"),
+        (2, 10, 0, 0, ["stage-2worker"], "queue 1 002 003 004 005 006 007"),
+        (
+            4,
+            0,
+            0,
+            0,
+            ["stage-2worker", "stage-4worker"],
+            "queue 4 004 005 006 007",
+        ),
+        (4, 10, 0, 0, ["stage-2worker"], "queue 1 002 003 004 005 006 007"),
+        (
+            4,
+            0,
+            10,
+            0,
+            ["stage-2worker", "stage-4worker"],
+            "queue 2 004 005 006 007",
+        ),
+        (8, 10, 0, 0, ["stage-2worker"], "queue 1 002 003 004 005 006 007"),
+        (
+            8,
+            0,
+            10,
+            0,
+            ["stage-2worker", "stage-4worker"],
+            "queue 2 004 005 006 007",
+        ),
+        (8, 0, 0, 0, ["stage-2worker", "stage-4worker", "stage-8worker"], None),
+        (8, 0, 0, 10, ["stage-2worker", "stage-4worker", "stage-8worker"], None),
+    ],
+)
+def test_formal_campaign_respects_worker_ceiling_and_schedules_all_shards(
+    tmp_path: Path,
+    max_workers: int,
+    stage2_rc: int,
+    stage4_rc: int,
+    stage8_rc: int,
+    expected_stages: list[str],
+    expected_queue: str | None,
+) -> None:
+    events = _run_formal_campaign_contract(
+        tmp_path,
+        max_workers,
+        stage2_rc=stage2_rc,
+        stage4_rc=stage4_rc,
+        stage8_rc=stage8_rc,
+    )
+
+    actual_stages = [
+        line.removeprefix("start ")
+        for line in events
+        if line.startswith("start stage-")
+    ]
+    assert actual_stages == expected_stages
+    queues = [line for line in events if line.startswith("queue ")]
+    assert queues == ([] if expected_queue is None else [expected_queue])
+    scheduled = [line.split()[1] for line in events if line.startswith("launch ")]
+    for queue in queues:
+        scheduled.extend(queue.split()[2:])
+    assert scheduled == [f"{index:03d}" for index in range(8)]
+    assert events.count("wait-all 000 001 002 003 004 005 006 007") == 1
+    if expected_queue is not None:
+        queue_index = events.index(expected_queue)
+        if expected_queue == "queue 1 001 002 003 004 005 006 007":
+            assert events.index("wait 000") < queue_index
+        elif expected_queue.endswith("002 003 004 005 006 007"):
+            assert events.index("wait 001") < queue_index
+        elif expected_queue == "queue 4 004 005 006 007":
+            assert events.index("wait-all 000 001 002 003") < queue_index
+        else:
+            assert events.index("wait 003") < queue_index
+
+
+@pytest.mark.parametrize(
+    "max_workers,stage2_rc,stage4_rc", [(2, 2, 0), (4, 3, 0), (8, 0, 4)]
+)
+def test_formal_campaign_preserves_gate_error_statuses(
+    tmp_path: Path, max_workers: int, stage2_rc: int, stage4_rc: int
+) -> None:
+    expected_rc = stage2_rc or stage4_rc
+
+    events = _run_formal_campaign_contract(
+        tmp_path,
+        max_workers,
+        stage2_rc=stage2_rc,
+        stage4_rc=stage4_rc,
+        expected_rc=expected_rc,
+    )
+
+    assert not any(line.startswith("queue ") for line in events)
+    assert not any(line.startswith("wait-all ") for line in events)
 
 
 def _runner_python_heredoc(name: str) -> str:

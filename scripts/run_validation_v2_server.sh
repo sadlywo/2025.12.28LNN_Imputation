@@ -15,6 +15,7 @@ Required:
 Options:
   --repo PATH                 Repository root (default: directory containing this script/..).
   --campaign-suffix NAME      New campaign suffix (default: sharded-v2-py310/py311/py312).
+  --max-workers 1|2|4|8       Maximum concurrent workers for the formal campaign (default: 8).
   --skip-dependency-install   Reuse an already-provisioned .venv-server, but still verify it.
   --help                      Show this help and exit.
 EOF
@@ -46,6 +47,7 @@ MODE=""
 CAMPAIGN_SUFFIX=""
 CAMPAIGN_SUFFIX_EXPLICIT=0
 SKIP_DEPENDENCY_INSTALL=0
+MAX_WORKERS=8
 
 while (($#)); do
   case "$1" in
@@ -74,6 +76,11 @@ while (($#)); do
       CAMPAIGN_SUFFIX_EXPLICIT=1
       shift 2
       ;;
+    --max-workers)
+      (($# >= 2)) || die '--max-workers requires 1, 2, 4, or 8'
+      MAX_WORKERS="$2"
+      shift 2
+      ;;
     --skip-dependency-install)
       SKIP_DEPENDENCY_INSTALL=1
       shift
@@ -85,6 +92,8 @@ while (($#)); do
   esac
 done
 
+[[ "$MAX_WORKERS" == 1 || "$MAX_WORKERS" == 2 || "$MAX_WORKERS" == 4 || "$MAX_WORKERS" == 8 ]] \
+  || die '--max-workers must be one of 1, 2, 4, or 8'
 [[ "$MODE" == preflight || "$MODE" == full ]] || die '--mode must be preflight or full'
 [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || die '--commit must be a 40-character lowercase hexadecimal SHA'
 [[ -d "$REPO" ]] || die "repository does not exist: $REPO"
@@ -380,78 +389,90 @@ run_formal_campaign() {
     "$AUDIT_DIR/baseline-1worker.json" 2 000
   stop_managed_sampler baseline-1worker
 
-  date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-2worker-start.txt"
-  local stage2_start stage2_rc
-  stage2_start="$(cat "$AUDIT_DIR/stage-2worker-start.txt")"
-  start_managed_sampler stage-2worker
-  launch_formal_shard 001
-  if wait_stage_metrics stage-2worker "$stage2_start" \
-      "$AUDIT_DIR/baseline-1worker.json" "$AUDIT_DIR/stage-2worker-metrics.json" 2 000 001; then
-    stage2_rc=0
-  else
-    stage2_rc=$?
-  fi
-  stop_managed_sampler stage-2worker
-  case "$stage2_rc" in
-    0) ;;
-    10) echo 'two-worker performance/resource gate failed' | tee -a "$AUDIT_DIR/rollout.log" ;;
-    2|3|4) return "$stage2_rc" ;;
-    *) echo "unexpected two-worker gate status: $stage2_rc" >&2; return 3 ;;
-  esac
-  if (( stage2_rc == 10 )); then
+  if (( MAX_WORKERS == 1 )); then
     wait_shard 000
-    wait_shard 001
-    run_queue 1 002 003 004 005 006 007
+    run_queue 1 001 002 003 004 005 006 007
   else
-    date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-4worker-start.txt"
-    local stage4_start stage4_rc
-    stage4_start="$(cat "$AUDIT_DIR/stage-4worker-start.txt")"
-    start_managed_sampler stage-4worker
-    launch_formal_shard 002
-    launch_formal_shard 003
-    if wait_stage_metrics stage-4worker "$stage4_start" \
-        "$AUDIT_DIR/stage-2worker-metrics.json" "$AUDIT_DIR/stage-4worker-metrics.json" \
-        2 000 001 002 003; then
-      stage4_rc=0
+    date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-2worker-start.txt"
+    local stage2_start stage2_rc
+    stage2_start="$(cat "$AUDIT_DIR/stage-2worker-start.txt")"
+    start_managed_sampler stage-2worker
+    launch_formal_shard 001
+    if wait_stage_metrics stage-2worker "$stage2_start" \
+        "$AUDIT_DIR/baseline-1worker.json" "$AUDIT_DIR/stage-2worker-metrics.json" 2 000 001; then
+      stage2_rc=0
     else
-      stage4_rc=$?
+      stage2_rc=$?
     fi
-    stop_managed_sampler stage-4worker
-    case "$stage4_rc" in
+    stop_managed_sampler stage-2worker
+    case "$stage2_rc" in
       0) ;;
-      10) echo 'four-worker performance/resource gate failed' | tee -a "$AUDIT_DIR/rollout.log" ;;
-      2|3|4) return "$stage4_rc" ;;
-      *) echo "unexpected four-worker gate status: $stage4_rc" >&2; return 3 ;;
+      10) echo 'two-worker performance/resource gate failed' | tee -a "$AUDIT_DIR/rollout.log" ;;
+      2|3|4) return "$stage2_rc" ;;
+      *) echo "unexpected two-worker gate status: $stage2_rc" >&2; return 3 ;;
     esac
-    if (( stage4_rc == 10 )); then
+    if (( stage2_rc == 10 )); then
       wait_shard 000
       wait_shard 001
-      wait_shard 002
-      wait_shard 003
-      run_queue 2 004 005 006 007
+      run_queue 1 002 003 004 005 006 007
+    elif (( MAX_WORKERS == 2 )); then
+      wait_shard 000
+      wait_shard 001
+      run_queue 2 002 003 004 005 006 007
     else
-      date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-8worker-start.txt"
-      local stage8_start stage8_rc
-      stage8_start="$(cat "$AUDIT_DIR/stage-8worker-start.txt")"
-      start_managed_sampler stage-8worker
-      launch_formal_shard 004
-      launch_formal_shard 005
-      launch_formal_shard 006
-      launch_formal_shard 007
-      if wait_stage_metrics stage-8worker "$stage8_start" \
-          "$AUDIT_DIR/stage-4worker-metrics.json" "$AUDIT_DIR/stage-8worker-metrics.json" \
-          2 000 001 002 003 004 005 006 007; then
-        stage8_rc=0
+      date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-4worker-start.txt"
+      local stage4_start stage4_rc
+      stage4_start="$(cat "$AUDIT_DIR/stage-4worker-start.txt")"
+      start_managed_sampler stage-4worker
+      launch_formal_shard 002
+      launch_formal_shard 003
+      if wait_stage_metrics stage-4worker "$stage4_start" \
+          "$AUDIT_DIR/stage-2worker-metrics.json" "$AUDIT_DIR/stage-4worker-metrics.json" \
+          2 000 001 002 003; then
+        stage4_rc=0
       else
-        stage8_rc=$?
+        stage4_rc=$?
       fi
-      stop_managed_sampler stage-8worker
-      case "$stage8_rc" in
+      stop_managed_sampler stage-4worker
+      case "$stage4_rc" in
         0) ;;
-        10) echo 'eight-worker resource/performance anomaly; retaining diagnostics' | tee -a "$AUDIT_DIR/rollout.log" ;;
-        2|3|4) return "$stage8_rc" ;;
-        *) echo "unexpected eight-worker monitor status: $stage8_rc" >&2; return 3 ;;
+        10) echo 'four-worker performance/resource gate failed' | tee -a "$AUDIT_DIR/rollout.log" ;;
+        2|3|4) return "$stage4_rc" ;;
+        *) echo "unexpected four-worker gate status: $stage4_rc" >&2; return 3 ;;
       esac
+      if (( stage4_rc == 10 )); then
+        wait_shard 000
+        wait_shard 001
+        wait_shard 002
+        wait_shard 003
+        run_queue 2 004 005 006 007
+      elif (( MAX_WORKERS == 4 )); then
+        wait_all_shards 000 001 002 003
+        run_queue 4 004 005 006 007
+      else
+        date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-8worker-start.txt"
+        local stage8_start stage8_rc
+        stage8_start="$(cat "$AUDIT_DIR/stage-8worker-start.txt")"
+        start_managed_sampler stage-8worker
+        launch_formal_shard 004
+        launch_formal_shard 005
+        launch_formal_shard 006
+        launch_formal_shard 007
+        if wait_stage_metrics stage-8worker "$stage8_start" \
+            "$AUDIT_DIR/stage-4worker-metrics.json" "$AUDIT_DIR/stage-8worker-metrics.json" \
+            2 000 001 002 003 004 005 006 007; then
+          stage8_rc=0
+        else
+          stage8_rc=$?
+        fi
+        stop_managed_sampler stage-8worker
+        case "$stage8_rc" in
+          0) ;;
+          10) echo 'eight-worker resource/performance anomaly; retaining diagnostics' | tee -a "$AUDIT_DIR/rollout.log" ;;
+          2|3|4) return "$stage8_rc" ;;
+          *) echo "unexpected eight-worker monitor status: $stage8_rc" >&2; return 3 ;;
+        esac
+      fi
     fi
   fi
 
