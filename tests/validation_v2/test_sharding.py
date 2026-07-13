@@ -487,7 +487,7 @@ def test_merge_failure_keeps_no_final_and_preserves_failed_diagnostics(
     elif failure == "validator":
         monkeypatch.setattr(sharding, "validate_artifacts", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("validator boom")))
     else:
-        monkeypatch.setattr(sharding.os, "rename", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("publish boom")))
+        monkeypatch.setattr(sharding, "_rename_noreplace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("publish boom")))
 
     with pytest.raises((OSError, ValueError), match=f"{failure} boom"):
         merge_shards(

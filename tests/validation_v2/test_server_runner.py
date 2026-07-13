@@ -979,13 +979,9 @@ def test_runner_runtime_and_plan_checks_survive_optimized_python(tmp_path: Path)
     source = RUNNER.read_text(encoding="utf-8")
     assert "assert " not in source
 
-    environment = tmp_path / "environment.json"
-    runtime = subprocess.run(
-        [sys.executable, "-O", "-", str(environment)],
-        input=_runner_python_heredoc("verify_runtime"),
-        capture_output=True,
-        check=False,
-        text=True,
+    runtime, environment, _ = _run_fake_runtime(
+        tmp_path,
+        gpu_name="NVIDIA A100",
     )
     assert runtime.returncode != 0
     assert not environment.exists()
@@ -1243,7 +1239,7 @@ def test_runner_rejects_a_linked_shard_output_parent(tmp_path: Path) -> None:
         (repository / "results").symlink_to(target, target_is_directory=True)
     except OSError as error:
         pytest.skip("symbolic links are unavailable: {}".format(error))
-    (repository / ".git" / "info" / "exclude").write_text("results/\n", encoding="utf-8")
+    (repository / ".git" / "info" / "exclude").write_text("/results\n", encoding="utf-8")
     environment = _prepare_linux_runner_environment(tmp_path, repository)
 
     completed = _run_runner(

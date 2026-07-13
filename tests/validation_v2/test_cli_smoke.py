@@ -160,7 +160,7 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
 @pytest.fixture
 def external_repo_tmp_path() -> Iterator[Path]:
     with tempfile.TemporaryDirectory(
-        prefix="validation-v2-cli-", dir=REPO_ROOT.parents[2]
+        prefix="validation-v2-cli-", dir=REPO_ROOT.parent
     ) as directory:
         yield Path(directory)
 
