@@ -20,6 +20,27 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / "scripts" / "run_validation_v2_matpool.sh"
 
 
+def test_public_runner_material_contains_no_access_credentials() -> None:
+    public_material = (
+        REPO_ROOT / "scripts" / "run_validation_v2_server.sh",
+        LAUNCHER,
+        REPO_ROOT / "docs" / "validation_v2_server_runbook.md",
+        REPO_ROOT / "docs" / "validation_v2_server_runbook_zh.md",
+    )
+    forbidden_patterns = (
+        "ssh -p ",
+        "matpool.com",
+        "MATPOOL_SSH_PASSWORD",
+        "password=",
+        "密码：",
+    )
+
+    for path in public_material:
+        text = path.read_text(encoding="utf-8")
+        for pattern in forbidden_patterns:
+            assert pattern.casefold() not in text.casefold(), (path, pattern)
+
+
 def _bash() -> str:
     git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
     if git_bash.is_file():

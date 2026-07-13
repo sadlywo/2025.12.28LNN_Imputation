@@ -8,69 +8,97 @@ diagnostic only.
 
 ## Current supported execution path
 
-The Python 3.12 runner below is the **only current supported execution path**.
-It creates the repository-local `.venv-server`, installs the exact CUDA 12.1
-PyTorch build (`torch==2.3.1+cu121`) and the locked validation dependencies,
-records runtime provenance, runs the Linux atomic-race test and full test suite,
-creates the immutable eight-shard plan, applies the 1 -> 2 -> 4 -> 8 rollout
-gates, and finally merges, validates, and summarizes the five-seed campaign.
-Do not manually replace individual stages with the older commands further down
-this document.
+The supported runtime is Linux with generic CPython 3.10–3.12 and an RTX 4090
+series GPU (RTX 4090 or RTX 4090D). Every supported Python minor uses the same
+locked CUDA build, `torch==2.3.1+cu121`, and the same validation dependency
+lock. Python 3.12 and RTX 4090D are supported configurations, not exclusive
+requirements.
 
-After cloning or fetching, enter the target revision by its exact 40-character
-SHA. Network Turbo is allowed only for the short clone/fetch/dependency-install
-operation; the runner never needs it during training.
+The generic runner is the executable scientific contract. Given an exact
+40-character commit, it checks the clean worktree, performs the complete
+preflight, executes a full immutable eight-shard campaign, and controls the
+maximum concurrent worker count. It records provenance, runs the Linux atomic
+race and complete pytest suite, creates and verifies the 175-group/4,095-cell
+plan, trains every assigned shard, then merges, validates, and summarizes all
+five seeds. The MatPool launcher below is the current operator wrapper around
+that generic runner; it does not replace or weaken any of these checks.
+
+### MatPool: shortest clean-checkout operation
+
+From an already cloned repository, use the following commands. The status
+output must show the expected branch or detached commit and no changed or
+untracked file entries before `start`; the launcher also fails closed unless
+HEAD and the worktree are clean.
 
 ```bash
-cd /root/autodl-tmp/2025.12.28LNN_Imputation
-git checkout --detach "<40-HEX-VALIDATED-COMMIT>"
-test -z "$(git status --porcelain)"
+cd /2025.12.28LNN_Imputation
+git status --short --branch
+bash scripts/run_validation_v2_matpool.sh start
+bash scripts/run_validation_v2_matpool.sh status
+bash scripts/run_validation_v2_matpool.sh logs
+```
 
+`start` returns after creating a detached tmux session. Inside that session the
+generic runner executes its complete preflight before any training begins, so
+a successful background launch is not evidence that preflight or training has
+completed. A formal run can take multiple days. Use `status` to report the tmux
+state and campaign paths, and `logs` to follow the current campaign log. The
+launcher state is private under `REPO/.validation-v2-matpool/`: `current.json`
+records the current session and artifact paths, while `run-*.log` and
+`run-*.exit` preserve combined output and the eventual exit status. Audit data
+is stored in the commit-qualified `validation-v2-audit-*` sibling directory;
+shard and final roots are the paths printed by `status`.
+
+There is deliberately no `stop` command. On failure, preserve the state file,
+log, audit directory, shard roots, and exit-status evidence. Diagnose the first
+preflight or runner error from `logs` and `status`; do not delete a campaign
+seal, kill an unverified PID, or overwrite an existing root to force a retry.
+
+The MatPool default max-workers value is 4, but the complete plan still runs
+all 8 shards; the limit controls concurrency, not campaign coverage. Only after
+reviewing the four-worker GPU-memory, throughput, PID, marker, and audit
+evidence may an operator opt in to eight concurrent workers:
+
+```bash
+bash scripts/run_validation_v2_matpool.sh start --max-workers 8
+```
+
+### Generic runner and dependency reuse
+
+For direct diagnostics or a non-MatPool Linux host, invoke the generic runner
+with the exact current commit. Preflight-only and full modes are explicit, and
+`--max-workers` caps concurrency while retaining the full eight-shard plan:
+
+```bash
 bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode preflight
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full --max-workers 4
 ```
 
-`--mode preflight` is optional diagnostic preparation. It checks the
-Linux/RTX 4090D runtime, creates `REPO/.venv-server`, explicitly installs the
-cu121 Torch wheel, runs the complete test suite, and produces a clean
-175-group/4,095-cell/eight-shard plan. A failure is a hard stop: diagnose it;
-do not invoke `--mode full`. Every runner invocation creates an immutable
-campaign seal, so a later full campaign must use a different
-`--campaign-suffix`; do not run preflight and full consecutively with the same
-suffix.
+Preflight-only creates an immutable campaign seal, so any later run needs a new
+campaign suffix. If dependency installation already completed successfully on
+this same host and the repository-local `.venv-server/bin/python` passes the
+runner's version and CUDA checks, a later MatPool campaign may reuse it while
+still running Git, runtime, test, plan, and full training checks:
 
 ```bash
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full
+bash scripts/run_validation_v2_matpool.sh start --skip-dependency-install
 ```
 
-For normal production work, use `--mode full` directly: it includes every
-preflight protection, then runs the formal
-1 -> 2 -> 4 -> 8 campaign and its fail-closed fallback queues. It can run for
-multiple days. Leave its `AUDIT_DIR`, shard roots, logs, and process identity
-files intact if it stops; do not delete or overwrite them to force a retry.
-Use `--skip-dependency-install` only after the existing
-`.venv-server/bin/python` has been created and successfully verified on this
-same server. If that executable is absent, the runner exits with status 2; the
-option never skips runtime, Git, test, or plan checks.
-
-If the optional diagnostic preflight was run first, give the later full
-campaign a fresh suffix, for example:
-
-```bash
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
-  --campaign-suffix "formal-$(date -u +%Y%m%dT%H%M%SZ)"
-```
-
-The old `results/validation_v2/server_full-fcf81f8` root is diagnostic
-evidence only. It must never be copied into, merged with, or summarized with
-the new commit-qualified campaign.
+Completion requires an inactive tmux session, a zero value in the reported
+`run-*.exit`, eight completed `shard_execution.json` markers, and a new final
+root whose `validation_report.json` is `complete` and whose summaries cover
+seeds 2026–2030. Partial shards, a zero `start` status, or a quiet log are not
+completion evidence.
 
 ## Historical implementation reference
 
 The remaining sections preserve the previous manual operator contract for
-auditability and incident analysis. They are **not** the current recommended
-execution path and must not be mixed with the Python 3.12 runner above. In
-particular, any older Conda commands and hand-copied helper functions below
-are historical reference rather than prerequisites for a new campaign.
+auditability and incident analysis. Everything below this heading is
+**Historical only**: it is not the current execution path and must not be mixed
+with the MatPool or generic-runner commands above. In particular, old
+platform-specific paths, Conda commands, runtime assertions, and hand-copied
+helper functions are preserved evidence rather than prerequisites for a new
+campaign.
 
 ## 1. Quarantine the legacy single-process run
 

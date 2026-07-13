@@ -37,42 +37,65 @@ def test_server_runbook_uses_the_delivered_validation_branch() -> None:
     assert "validation-v2-server" not in runbook
 
 
-def test_server_runbooks_make_the_python312_runner_the_only_current_entrypoint() -> None:
+def test_server_runbooks_document_the_current_matpool_operations_contract() -> None:
     english = (REPO_ROOT / "docs" / "validation_v2_server_runbook.md").read_text(
         encoding="utf-8"
     )
     chinese = (REPO_ROOT / "docs" / "validation_v2_server_runbook_zh.md").read_text(
         encoding="utf-8"
     )
-    canonical_preflight = (
+    generic_preflight = (
         'bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" '
         "--mode preflight"
     )
-    canonical_full = (
+    generic_full = (
         'bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" '
         "--mode full"
     )
+    matpool_commands = (
+        "bash scripts/run_validation_v2_matpool.sh start",
+        "bash scripts/run_validation_v2_matpool.sh status",
+        "bash scripts/run_validation_v2_matpool.sh logs",
+    )
 
     for runbook in (english, chinese):
-        assert "scripts/run_validation_v2_server.sh" in runbook
-        assert ".venv-server" in runbook
-        assert ".venv-server/bin/python" in runbook
-        assert "cu121" in runbook
+        assert "CPython 3.10" in runbook and "3.12" in runbook
+        assert "torch==2.3.1+cu121" in runbook
+        assert all(command in runbook for command in matpool_commands)
+        assert "--max-workers 8" in runbook
         assert "--skip-dependency-install" in runbook
-        assert canonical_preflight in runbook
-        assert canonical_full in runbook
-        assert "git checkout --detach" in runbook
-        assert "server_full-fcf81f8" in runbook
+        assert generic_preflight in runbook
+        assert generic_full in runbook
+
+    english_current = english.split("## Historical implementation reference", 1)[0]
+    chinese_current = chinese.split("## 历史资料", 1)[0]
+    for current in (english_current, chinese_current):
+        assert re.search(
+            r"(?:default|默认).{0,40}(4|four).{0,100}(8|eight|八).{0,30}(?:shards|分片)",
+            current,
+            re.I | re.S,
+        )
+        assert "Python 3.12 runner below is the **only" not in current
+        assert not re.search(r"(?:only|唯一).{0,30}Python 3\.12", current, re.I | re.S)
+        assert not re.search(r"(?:4090D-only|仅支持.{0,20}4090D)", current, re.I | re.S)
+
+    assert re.search(r"RTX 4090\s+series", english_current)
+    assert re.search(r"RTX 4090\s+系列", chinese_current)
+    assert re.search(r"not exclusive\s+requirements", english_current)
+    assert "不是唯一要求" in chinese_current
+    assert "cd /2025.12.28LNN_Imputation" in english
+    assert "git status --short --branch" in english
+    assert re.search(r"exact\s+(?:40-character\s+)?commit", english)
+    assert "preflight" in english and "full" in english
+    assert "/2025.12.28LNN_Imputation" in chinese
+    assert "预检" in chinese and "完成判据" in chinese and "失败诊断" in chinese
     assert "pinn_imu" not in chinese
+    assert "network_turbo" not in chinese
     assert "Current supported execution path" in english
     assert "Historical implementation reference" in english
     assert english.index("Historical implementation reference") < english.index(
         "conda activate"
     )
-    assert "--campaign-suffix" in english and re.search(r"same\s+suffix", english)
-    assert "--campaign-suffix" in chinese and "同一后缀" in chinese
-    assert "status 2" in english
-    assert "状态码 2" in chinese
 
 
 @pytest.fixture

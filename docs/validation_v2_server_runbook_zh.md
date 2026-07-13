@@ -1,88 +1,105 @@
-# Validation v2 服务器正式验证操作手册（Python 3.12）
+# Validation v2 服务器正式验证操作手册（MatPool）
 
-本手册适用于 Linux + RTX 4090D 服务器上的论文级 `server_full` 正式验证。
-当前唯一推荐入口是仓库内的 Python 3.12 运行器；不要把旧的手工 Conda、复制
-helper 或逐条 shard 命令与它混用。英文完整历史契约见
-[validation_v2_server_runbook.md](validation_v2_server_runbook.md)，但以本文件的
-“当前执行路径”为准。
+本手册是论文级 `server_full` 正式验证的当前中文运维入口。支持环境为 Linux、
+通用 CPython 3.10–3.12，以及 RTX 4090 系列 GPU（RTX 4090 或 RTX 4090D）。
+各 Python 小版本均使用锁定的 `torch==2.3.1+cu121` 与同一组验证依赖；
+Python 3.12 和 RTX 4090D 都不是唯一要求。
 
-## 1. 运行器会做什么
+底层通用运行器负责科学执行合同：校验精确提交与干净工作树，执行完整预检，生成
+不可变的 8-shard 计划，训练全部分片，再严格合并、验证并汇总五个随机种子。
+MatPool 启动器只是该合同的后台运维封装，不会跳过测试、计划或完成检查。
 
-运行器在 `REPO/.venv-server` 创建项目内 Python 3.12 虚拟环境，并显式安装
-`torch==2.3.1+cu121` 和锁定的验证依赖。它随后会记录 Python、包版本、CUDA 和
-GPU 的运行时 provenance，执行 Linux 原子写入竞态测试与完整 pytest，生成不可变的
-8-shard 计划（175 个训练组、4,095 个实验单元），并在 full 模式执行
-1 -> 2 -> 4 -> 8 分阶段放量、严格合并、产物验证和五随机种子汇总。
+## 1. clone 后直接启动
 
-正式 full 运行可能持续数日。日志、`AUDIT_DIR`、分片目录、PID 和 GPU 采样文件
-均是审计证据；失败时保留现场诊断，不要删除、覆盖或拼接结果。
-
-旧的
-`results/validation_v2/server_full-fcf81f8` 仅是历史诊断证据。不得将其复制到新
-campaign，不得作为 merge 输入，也不得与新结果一起 summarize。
-
-## 2. 克隆、固定提交并直接启动正式验证
-
-网络加速只用于短暂的 clone/fetch/依赖安装操作，训练本身不需要网络。
-克隆完成后，必须固定到本次交付的 40 位提交 SHA，且工作树必须干净：
+仓库已经 clone 到服务器后，进入固定路径并先确认当前分支或 detached commit。
+`git status --short --branch` 除分支行外不得显示修改或未跟踪文件；`start` 自身也会
+再次检查 HEAD 和工作树是否干净。
 
 ```bash
-export REPO=/root/autodl-tmp/2025.12.28LNN_Imputation
-cd "$REPO"
-git checkout --detach "<40-HEX-VALIDATED-COMMIT>"
-test -z "$(git status --porcelain)"
-git show -s --format='%H %cI %s' HEAD
+cd /2025.12.28LNN_Imputation
+git status --short --branch
+bash scripts/run_validation_v2_matpool.sh start
+bash scripts/run_validation_v2_matpool.sh status
+bash scripts/run_validation_v2_matpool.sh logs
 ```
 
-对于正常的正式验证，直接运行 full。它自身包含全部 preflight，因此这是唯一
-推荐的生产命令：
+`start` 创建后台 tmux session 后即返回。tmux 中会先执行完整 preflight，成功后才
+开始训练，因此启动命令返回 0 不代表预检或正式验证已经完成。完整运行可能持续数日。
+
+默认最大同时 worker 数为 4，但完整计划仍会运行全部 8 个分片；这个参数只限制并发，
+不会减少覆盖范围。必须先审阅 4-worker 阶段的显存、吞吐、PID、marker 与审计证据，
+确认余量后才能显式选择 8 worker：
 
 ```bash
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full
+bash scripts/run_validation_v2_matpool.sh start --max-workers 8
 ```
 
-不要在训练 shell 中执行 `source /etc/network_turbo`。如需在首次运行前加速下载
-依赖，请只让安装命令处于一个短暂的 Network Turbo 子 shell；运行器本身会在
-`.venv-server` 内完成 pip 安装。
-
-`--skip-dependency-install` 仅可在同一服务器的 `.venv-server` 已创建且可执行的
-`.venv-server/bin/python` 已成功通过运行器运行时校验后使用。若该解释器不存在，
-运行器会以状态码 2 退出。它不会跳过 Git、CUDA、完整测试或计划校验：
+## 2. 状态、日志与证据位置
 
 ```bash
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
-  --skip-dependency-install
+bash scripts/run_validation_v2_matpool.sh status
+bash scripts/run_validation_v2_matpool.sh logs
 ```
 
-## 3. 可选诊断预检
+`status` 报告 tmux 是 active 还是 inactive，并打印 commit、campaign suffix、
+最大 worker 数、审计目录、8-shard 根目录、final 根目录、日志和退出状态文件。
+`logs` 持续跟随当前 campaign 日志。
 
-如需先单独验证环境和计划，可执行：
+启动器的私有状态位于仓库内 `.validation-v2-matpool/`：`current.json` 记录当前
+session 与各证据路径，`run-*.log` 保存合并输出，`run-*.exit` 保存最终退出码。
+commit-qualified 的 `validation-v2-audit-*` 位于仓库同级目录；分片与 final 根目录
+以 `status` 实际输出为准。启动器故意不提供 `stop` 命令。不要手工删除 state、
+campaign seal、日志或分片根目录，也不要向未核验身份的进程发送信号。
+
+## 3. 预检-only 与通用运行器
+
+如果只需检查当前主机、依赖、测试和不可变计划，可用精确当前 commit 运行预检：
 
 ```bash
 bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode preflight
 ```
 
-预检将创建不可变 campaign seal。预检失败时，不得启动 full；先修复环境、提交、
-GPU 或测试问题。预检成功后也不能以同一后缀再次运行 full：每次运行都必须使用不同或新的
-`--campaign-suffix`。因此，预检后的正式运行使用一个新的后缀，例如：
+通用运行器的 full 模式同样固定精确 commit；`--max-workers` 只控制并发，仍执行完整
+8-shard 计划：
 
 ```bash
-bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
-  --campaign-suffix "formal-$(date -u +%Y%m%dT%H%M%SZ)"
+bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full --max-workers 4
 ```
 
-full 模式会再次执行完整 preflight；不应手工跳过 Linux 原子测试、pytest、计划
-生成或 2 -> 4 -> 8 门槛。任一门槛、marker、PID、GPU 采样或 provenance 失败时，
-运行器会停止并保留审计材料。
+单独预检会创建不可变 campaign seal，后续运行必须使用新的 campaign suffix。
+若同一服务器已经成功安装依赖，并且仓库内 `.venv-server/bin/python` 再次通过
+Python、包版本与 CUDA 校验，可让新的 MatPool campaign 重用依赖：
 
-## 4. 结束后的核对
+```bash
+bash scripts/run_validation_v2_matpool.sh start --skip-dependency-install
+```
 
-成功完成后，保留以下内容以支持论文审计：
+该选项只跳过重复安装；精确提交、干净工作树、运行时、完整 pytest、计划、训练、
+合并与验证仍会执行。若 `.venv-server/bin/python` 不存在或不合格，启动会失败关闭。
 
-- 父目录中 commit-qualified 的 preflight 与 audit 目录；
-- 八个独立 shard 根目录和各自的 `shard_execution.json`；
-- 新 final 根目录中的 `validation_report.json`、`summary.csv` 和 `summary.json`；
-- runtime provenance、计划 JSON、GPU 采样、shard 日志以及 merge/validate/summarize 输出。
+## 4. 失败诊断
 
-final 报告必须为 `complete`，summary 必须覆盖随机种子 2026、2027、2028、2029、
-2030。不要手工合并 CSV、重命名分片目录，或用历史结果填充缺失分片。
+先运行 `status`，再用 `logs` 定位第一条 preflight、依赖、测试、GPU 或 runner 错误。
+如果 tmux 已退出，读取 `status` 报告的 `run-*.exit`，并保留 `run-*.log`、
+`current.json`、审计目录、PID/GPU 采样、每个 `shard_execution.json` 和所有已有分片。
+失败 campaign 的 seal 不得复用；修复原因后从干净提交启动一个新 campaign。
+
+不要把启动成功、日志暂时无输出、部分 shard 完成或手工拼接 CSV 当作成功。不得用历史
+结果补齐缺失分片，也不得覆盖已有 final 根目录。
+
+## 5. 完成判据
+
+只有以下条件全部成立，才能判定正式验证完成：
+
+- `status` 显示 tmux 已 inactive，且 `run-*.exit` 内容为 `0`；
+- 八个独立 shard 根目录均有状态为 `completed` 的 `shard_execution.json`；
+- 新 final 根目录中的 `validation_report.json` 状态为 `complete`；
+- `summary.csv` 与 `summary.json` 覆盖随机种子 2026、2027、2028、2029、2030；
+- runtime provenance、计划 JSON、GPU 采样、shard 日志与 merge/validate/summarize
+  输出均保留供审计。
+
+## 历史资料（仅供审计）
+
+旧的单进程结果和英文手册后半部分的手工命令仅用于审计与事故分析，属于
+**Historical only**。它们不是当前入口，不得与上述 MatPool 或通用运行器命令混用。
+英文历史合同见 [validation_v2_server_runbook.md](validation_v2_server_runbook.md)。
