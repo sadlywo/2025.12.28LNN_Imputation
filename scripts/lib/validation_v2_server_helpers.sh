@@ -6,15 +6,44 @@ if [[ -z "${PYTHON_BIN:-}" || ! -x "$PYTHON_BIN" ]]; then
   return 2 2>/dev/null || exit 2
 fi
 
+# This library has pipelines in its audit and sampler paths. Enabling pipefail
+# makes a failed producer or logger visible to the caller instead of allowing a
+# subsequent consumer to mask it.
+set -o pipefail
+
+validation_v2_require_shard() {
+  local shard="${1-}"
+  if ! [[ "$shard" =~ ^[0-7]{3}$ ]]; then
+    echo "invalid zero-padded shard index: $shard" >&2
+    return 2
+  fi
+}
+
+validation_v2_require_label() {
+  local label="${1-}"
+  if ! [[ "$label" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "invalid GPU sampler label: $label" >&2
+    return 2
+  fi
+}
+
 audit_active() {
   local now last=0 stamp="$AUDIT_DIR/.last-60s-audit"
+  local shard
+  for shard in "$@"; do
+    validation_v2_require_shard "$shard" || return $?
+  done
+  if ! command -v pgrep >/dev/null 2>&1; then
+    echo 'pgrep is required for fail-closed shard auditing' >&2
+    return 3
+  fi
   now="$(date +%s)"
   test ! -f "$stamp" || last="$(cat "$stamp")"
   test "$((now - last))" -ge 60 || return 0
   printf '%s\n' "$now" > "$stamp"
   {
     date -Is
-    local shard marker status groups pid alive
+    local marker status groups pid alive
     for shard in "$@"; do
       marker="$SHARDS_ROOT/$shard/shard_execution.json"
       status=missing
@@ -41,10 +70,7 @@ audit_active() {
 
 launch_shard() {
   local shard="${1-}"
-  if ! [[ "$shard" =~ ^[0-7]{3}$ ]]; then
-    echo "invalid zero-padded shard index: $shard" >&2
-    return 2
-  fi
+  validation_v2_require_shard "$shard" || return $?
   local index=$((10#$shard))
   if test "$index" -lt 0 -o "$index" -ge 8; then
     echo "shard index outside formal plan: $shard" >&2
@@ -65,6 +91,7 @@ launch_shard() {
   fi
   local output_root="$SHARDS_ROOT/$shard"
   local pid_file="$AUDIT_DIR/shard-$shard.pid"
+  local reservation="$AUDIT_DIR/shard-$shard.ownership.lock"
   if [[ -e "$output_root" || -L "$output_root" ]]; then
     echo "shard root already exists or is linked: $output_root" >&2
     return 2
@@ -81,9 +108,27 @@ launch_shard() {
     fi
     return 2
   fi
-  if pgrep -af "validation_v2\.cli shard.*--shard-index $index" \
-      | grep -F -- "$PLAN"; then
+  if [[ -e "$reservation" || -L "$reservation" ]] \
+      || ! mkdir "$reservation" 2>/dev/null; then
+    echo "shard ownership is already reserved or linked: $shard" >&2
+    return 2
+  fi
+  if ! command -v pgrep >/dev/null 2>&1; then
+    echo 'pgrep is required for fail-closed shard launch' >&2
+    rmdir "$reservation" 2>/dev/null || true
+    return 3
+  fi
+  local process_listing="" pgrep_rc=0
+  process_listing="$(pgrep -af "validation_v2\.cli shard.*--shard-index $index")" \
+    || pgrep_rc=$?
+  if test "$pgrep_rc" -ne 0 -a "$pgrep_rc" -ne 1; then
+    echo "cannot inspect existing shard processes: rc=$pgrep_rc" >&2
+    rmdir "$reservation" 2>/dev/null || true
+    return 3
+  fi
+  if [[ -n "$process_listing" ]] && grep -F -- "$PLAN" <<< "$process_listing"; then
     echo "duplicate shard process: $shard" >&2
+    rmdir "$reservation" 2>/dev/null || true
     return 2
   fi
   nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
@@ -94,16 +139,19 @@ launch_shard() {
   local pid="$!"
   if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
     echo "nohup did not return a numeric PID: $pid" >&2
+    rmdir "$reservation" 2>/dev/null || true
     return 3
   fi
   if ! printf '%s\n' "$pid" > "$pid_file"; then
     kill "$pid" 2>/dev/null || true
+    rmdir "$reservation" 2>/dev/null || true
     return 3
   fi
 }
 
 wait_shard() {
   local shard="$1"
+  validation_v2_require_shard "$shard" || return $?
   local marker="$SHARDS_ROOT/$shard/shard_execution.json"
   local max_seconds="${SHARD_WAIT_MAX_SECONDS:-604800}"
   local max_idle_seconds="${SHARD_WAIT_MAX_IDLE_SECONDS:-21600}"
@@ -194,6 +242,18 @@ PY
 
 wait_all_shards() {
   local -a shards=("$@")
+  local shard
+  if test "${#shards[@]}" -eq 0; then
+    echo 'wait_all_shards requires at least one shard index' >&2
+    return 2
+  fi
+  for shard in "${shards[@]}"; do
+    validation_v2_require_shard "$shard" || return $?
+  done
+  if ! command -v pgrep >/dev/null 2>&1; then
+    echo 'pgrep is required for fail-closed all-shard waiting' >&2
+    return 3
+  fi
   local max_seconds="${ALL_SHARDS_WAIT_MAX_SECONDS:-1209600}"
   local max_idle_seconds="${ALL_SHARDS_WAIT_MAX_IDLE_SECONDS:-21600}"
   local poll_seconds="${ALL_SHARDS_WAIT_POLL_SECONDS:-60}"
@@ -259,8 +319,15 @@ wait_all_shards() {
           ;;
       esac
     done
-    pgrep -af 'validation_v2\.cli shard' \
-      | tee -a "$AUDIT_DIR/wait-all-shards.log" || true
+    local process_listing="" pgrep_rc=0
+    process_listing="$(pgrep -af 'validation_v2\.cli shard')" || pgrep_rc=$?
+    if test "$pgrep_rc" -ne 0 -a "$pgrep_rc" -ne 1; then
+      echo "cannot inspect shard processes: rc=$pgrep_rc" >&2
+      return 3
+    fi
+    if [[ -n "$process_listing" ]]; then
+      tee -a "$AUDIT_DIR/wait-all-shards.log" <<< "$process_listing" || return 3
+    fi
     if ! nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu \
         --format=csv,noheader,nounits \
         | tee -a "$AUDIT_DIR/wait-all-shards.log"; then
@@ -316,9 +383,13 @@ run_queue() {
   local -a pending=("$@")
   local -a all_shards=("$@")
   local -a active=()
+  local shard
+  for shard in "${all_shards[@]}"; do
+    validation_v2_require_shard "$shard" || return $?
+  done
   while test "${#pending[@]}" -gt 0 -o "${#active[@]}" -gt 0; do
     while test "${#pending[@]}" -gt 0 -a "${#active[@]}" -lt "$max_parallel"; do
-      local shard="${pending[0]}"
+      shard="${pending[0]}"
       pending=("${pending[@]:1}")
       launch_shard "$shard" || return $?
       active+=("$shard")
@@ -402,18 +473,98 @@ run_queue() {
 
 declare -Ag GPU_SAMPLER_JOBS=()
 
+validation_v2_sampler_has_data() {
+  local csv="$1"
+  "$PYTHON_BIN" - "$csv" <<'PY'
+import csv
+import math
+import sys
+
+try:
+    with open(sys.argv[1], newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+except (OSError, UnicodeDecodeError, csv.Error):
+    raise SystemExit(1)
+for row in rows:
+    try:
+        values = [
+            float(row[field])
+            for field in (
+                "memory_used_mib", "memory_total_mib", "utilization_percent"
+            )
+        ]
+    except (KeyError, TypeError, ValueError):
+        continue
+    if all(math.isfinite(value) for value in values) and values[0] >= 0 and values[1] > 0:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+validation_v2_verify_sampler() {
+  local label="${1-}"
+  validation_v2_require_label "$label" || return $?
+  local pid_file="$AUDIT_DIR/gpu-$label.pid"
+  local proc_root="${PROC_ROOT:-/proc}"
+  local identity="validation-v2-gpu-sampler-$label"
+  if ! [[ -f "$pid_file" && -r "$pid_file" ]]; then
+    echo "missing/unreadable GPU sampler PID file: $pid_file" >&2
+    return 3
+  fi
+  local pid expected_start extra=""
+  read -r pid expected_start extra < "$pid_file" || {
+    echo "invalid GPU sampler PID record: $pid_file" >&2
+    return 3
+  }
+  if ! [[ "$pid" =~ ^[0-9]+$ && "$expected_start" =~ ^[0-9]+$ && -z "$extra" ]]; then
+    echo "GPU sampler PID record must contain exactly two numeric fields" >&2
+    return 3
+  fi
+  if test "${GPU_SAMPLER_JOBS[$label]-}" != "$pid"; then
+    echo "GPU sampler is not the current shell job: label=$label pid=$pid" >&2
+    return 3
+  fi
+  if test ! -r "$proc_root/$pid/stat" -o ! -r "$proc_root/$pid/cmdline"; then
+    echo "GPU sampler process identity is unavailable; refusing use: $pid" >&2
+    return 3
+  fi
+  local actual_start cmdline
+  actual_start="$(awk '{print $22}' "$proc_root/$pid/stat")"
+  cmdline="$(tr '\0' ' ' < "$proc_root/$pid/cmdline")"
+  if test "$actual_start" != "$expected_start" \
+      || [[ "$cmdline" != *"$identity"* ]] \
+      || [[ "$cmdline" != *"nvidia-smi"* ]]; then
+    echo "GPU sampler identity mismatch: label=$label pid=$pid" >&2
+    return 3
+  fi
+}
+
+validation_v2_stop_sampler_after_start_failure() {
+  local pid="$1"
+  local csv="$2"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f -- "$csv"
+}
+
 start_gpu_sampler() {
   local label="${1-}"
-  if ! [[ "$label" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-    echo "invalid GPU sampler label: $label" >&2
-    return 2
-  fi
+  validation_v2_require_label "$label" || return $?
   local csv="$AUDIT_DIR/gpu-$label.csv"
   local pid_file="$AUDIT_DIR/gpu-$label.pid"
   local identity="validation-v2-gpu-sampler-$label"
   local proc_root="${PROC_ROOT:-/proc}"
+  local ready_max_seconds="${SAMPLER_READY_MAX_SECONDS:-30}"
+  if ! [[ "$ready_max_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo 'invalid SAMPLER_READY_MAX_SECONDS' >&2
+    return 2
+  fi
   if [[ -e "$pid_file" || -L "$pid_file" ]]; then
     echo "GPU sampler PID file already exists: $pid_file" >&2
+    return 2
+  fi
+  if [[ -e "$csv" || -L "$csv" ]]; then
+    echo "GPU sampler CSV already exists or is linked: $csv" >&2
     return 2
   fi
   printf 'timestamp_utc,memory_used_mib,memory_total_mib,utilization_percent\n' > "$csv" || return 3
@@ -441,8 +592,7 @@ done
       || test ! -r "$proc_root/$pid/stat" \
       || test ! -r "$proc_root/$pid/cmdline"; then
     echo "unable to establish GPU sampler process identity: $pid" >&2
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    validation_v2_stop_sampler_after_start_failure "$pid" "$csv"
     return 3
   fi
   local starttime cmdline
@@ -452,52 +602,34 @@ done
       && "$cmdline" == *"$identity"* \
       && "$cmdline" == *"nvidia-smi"* ]]; then
     echo "GPU sampler identity verification failed immediately: $pid" >&2
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    validation_v2_stop_sampler_after_start_failure "$pid" "$csv"
     return 3
   fi
+  local ready_deadline=$((SECONDS + ready_max_seconds))
+  while ! validation_v2_sampler_has_data "$csv"; do
+    if test ! -r "$proc_root/$pid/stat" -o ! -r "$proc_root/$pid/cmdline"; then
+      echo "GPU sampler exited before a valid data row: $pid" >&2
+      validation_v2_stop_sampler_after_start_failure "$pid" "$csv"
+      return 3
+    fi
+    if test "$SECONDS" -ge "$ready_deadline"; then
+      echo "GPU sampler produced no valid data row within ${ready_max_seconds}s" >&2
+      validation_v2_stop_sampler_after_start_failure "$pid" "$csv"
+      return 3
+    fi
+    sleep 0.1
+  done
   printf '%s %s\n' "$pid" "$starttime" > "$pid_file" || {
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    validation_v2_stop_sampler_after_start_failure "$pid" "$csv"
     return 3
   }
 }
 
 stop_gpu_sampler() {
   local label="${1-}"
-  local pid_file="$AUDIT_DIR/gpu-$label.pid"
-  local proc_root="${PROC_ROOT:-/proc}"
-  local identity="validation-v2-gpu-sampler-$label"
-  if ! [[ -f "$pid_file" && -r "$pid_file" ]]; then
-    echo "missing/unreadable GPU sampler PID file: $pid_file" >&2
-    return 3
-  fi
-  local pid expected_start extra=""
-  read -r pid expected_start extra < "$pid_file" || {
-    echo "invalid GPU sampler PID record: $pid_file" >&2
-    return 3
-  }
-  if ! [[ "$pid" =~ ^[0-9]+$ && "$expected_start" =~ ^[0-9]+$ && -z "$extra" ]]; then
-    echo "GPU sampler PID record must contain exactly two numeric fields" >&2
-    return 3
-  fi
-  if test "${GPU_SAMPLER_JOBS[$label]-}" != "$pid"; then
-    echo "GPU sampler is not the current shell job: label=$label pid=$pid" >&2
-    return 3
-  fi
-  if test ! -r "$proc_root/$pid/stat" -o ! -r "$proc_root/$pid/cmdline"; then
-    echo "GPU sampler process identity is unavailable; refusing kill: $pid" >&2
-    return 3
-  fi
-  local actual_start cmdline
-  actual_start="$(awk '{print $22}' "$proc_root/$pid/stat")"
-  cmdline="$(tr '\0' ' ' < "$proc_root/$pid/cmdline")"
-  if test "$actual_start" != "$expected_start" \
-      || [[ "$cmdline" != *"$identity"* ]] \
-      || [[ "$cmdline" != *"nvidia-smi"* ]]; then
-    echo "GPU sampler identity mismatch; refusing kill: label=$label pid=$pid" >&2
-    return 3
-  fi
+  validation_v2_verify_sampler "$label" || return $?
+  local pid
+  read -r pid _ < "$AUDIT_DIR/gpu-$label.pid"
   kill "$pid" || return 3
   wait "$pid" 2>/dev/null || true
   unset 'GPU_SAMPLER_JOBS[$label]'
@@ -506,6 +638,11 @@ stop_gpu_sampler() {
 wait_until_groups() {
   local shard="$1"
   local required="$2"
+  validation_v2_require_shard "$shard" || return $?
+  if ! [[ "$required" =~ ^[1-9][0-9]*$ ]]; then
+    echo "required group count must be positive: $required" >&2
+    return 2
+  fi
   local marker="$SHARDS_ROOT/$shard/shard_execution.json"
   local pid_file="$AUDIT_DIR/shard-$shard.pid"
   local deadline=$((SECONDS + 14400))
@@ -565,11 +702,25 @@ wait_stage_metrics() {
   local minimum_groups="$5"
   shift 5
   local -a active_indices=("$@")
+  validation_v2_require_label "$label" || return $?
+  if ! [[ "$minimum_groups" =~ ^[1-9][0-9]*$ ]]; then
+    echo "minimum group count must be positive: $minimum_groups" >&2
+    return 2
+  fi
+  if test "${#active_indices[@]}" -eq 0; then
+    echo 'wait_stage_metrics requires at least one active shard index' >&2
+    return 2
+  fi
+  local shard
+  for shard in "${active_indices[@]}"; do
+    validation_v2_require_shard "$shard" || return $?
+  done
   local deadline=$((SECONDS + 14400))
   while :; do
     audit_active "${active_indices[@]}" || return $?
+    validation_v2_verify_sampler "$label" || return $?
     local all_completed=yes
-    local shard marker pid status groups
+    local marker pid status groups
     for shard in "${active_indices[@]}"; do
       marker="$SHARDS_ROOT/$shard/shard_execution.json"
       pid=""
