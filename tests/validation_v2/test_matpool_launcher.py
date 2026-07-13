@@ -18,6 +18,86 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / "scripts" / "run_validation_v2_matpool.sh"
+_CREDENTIAL_LEAK_PATTERNS = (
+    (
+        "SSH command",
+        re.compile(
+            r"\bssh\b[^\r\n]*(?:\s-p(?:\s+|=)\S+|\s-p\d+|"
+            r"[a-z0-9._%+-]+@[a-z0-9.-]+)",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    (
+        "MatPool host",
+        re.compile(
+            r"\b(?:[a-z0-9-]+\.)*matpool\.com\b",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    (
+        "SSH or MatPool access variable",
+        re.compile(
+            r"\b(?:SSH_(?:HOST|PORT)|MATPOOL_(?:SSH_)?(?:HOST|PORT|"
+            r"USER(?:NAME)?|PASSWORD|PASSWD|PWD))\s*(?::=|[=:])",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    (
+        "credential assignment",
+        re.compile(
+            r"\b(?:password|passwd|pwd)\s*(?::=|[=:])",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    (
+        "Chinese credential assignment",
+        re.compile(r"密码\s*(?:：|:=|[=:])", flags=re.IGNORECASE),
+    ),
+)
+
+
+def _credential_leaks(text: str) -> tuple[str, ...]:
+    return tuple(
+        label for label, pattern in _CREDENTIAL_LEAK_PATTERNS if pattern.search(text)
+    )
+
+
+@pytest.mark.parametrize(
+    "fictional_payload",
+    (
+        "ssh -p 65001 operator@example.invalid",
+        "SSH operator@example.invalid -p 65002",
+        "ssh operator@example.invalid",
+        "compute-fictional.matpool.com",
+        "SSH_HOST = gateway.example.invalid",
+        "ssh_port: 65003",
+        "MATPOOL_SSH_HOST=compute.example.invalid",
+        "matpool_ssh_port := 65004",
+        "MATPOOL_SSH_USER: operator",
+        "MATPOOL_SSH_PASSWORD = dummy-value",
+        "password = dummy-value",
+        "PassWd: dummy-value",
+        "pwd := dummy-value",
+        "密码：虚构值",
+    ),
+)
+def test_credential_leak_scanner_recognizes_fictional_payloads(
+    fictional_payload: str,
+) -> None:
+    assert _credential_leaks(fictional_payload)
+
+
+@pytest.mark.parametrize(
+    "narrative",
+    (
+        "Credentials are managed outside the repository.",
+        "Never paste a password into a runbook.",
+        "The launcher does not accept SSH access data.",
+        "A password policy is not an assignment.",
+    ),
+)
+def test_credential_leak_scanner_ignores_ordinary_narrative(narrative: str) -> None:
+    assert not _credential_leaks(narrative)
 
 
 def test_public_runner_material_contains_no_access_credentials() -> None:
@@ -27,18 +107,10 @@ def test_public_runner_material_contains_no_access_credentials() -> None:
         REPO_ROOT / "docs" / "validation_v2_server_runbook.md",
         REPO_ROOT / "docs" / "validation_v2_server_runbook_zh.md",
     )
-    forbidden_patterns = (
-        "ssh -p ",
-        "matpool.com",
-        "MATPOOL_SSH_PASSWORD",
-        "password=",
-        "密码：",
-    )
-
     for path in public_material:
-        text = path.read_text(encoding="utf-8")
-        for pattern in forbidden_patterns:
-            assert pattern.casefold() not in text.casefold(), (path, pattern)
+        text = path.read_bytes().decode("utf-8", errors="strict")
+        leaks = _credential_leaks(text)
+        assert not leaks, (path, leaks)
 
 
 def _bash() -> str:
