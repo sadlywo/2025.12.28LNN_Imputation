@@ -111,9 +111,7 @@ def test_runner_rejects_non_python312_before_installation(tmp_path: Path) -> Non
     assert completed.returncode == 2
     assert "Python 3.12" in completed.stderr
     invocations = log.read_text(encoding="utf-8") if log.exists() else ""
-    assert "<--version>" in invocations
-    assert "-m venv" not in invocations
-    assert "-m pip" not in invocations
+    assert invocations.splitlines() == ["<--version>"]
     assert not (repository / ".venv-server").exists()
 
 
