@@ -232,10 +232,12 @@ def test_runner_ignores_its_venv_but_rejects_other_untracked_files(tmp_path: Pat
     assert valid_log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
 
 
-def test_runner_rejects_an_existing_campaign_reservation_before_venv(tmp_path: Path) -> None:
+def test_runner_rejects_a_preexisting_audit_seal_before_venv_or_other_writes(
+    tmp_path: Path,
+) -> None:
     repository, commit = _make_clean_repository(tmp_path)
-    lock = tmp_path / f".validation-v2-campaign-{commit}-sharded-v2-py312.lock"
-    lock.mkdir()
+    audit_dir = tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py312"
+    audit_dir.mkdir()
     fake_python, log = _make_fake_python(tmp_path, "3.12.3")
     completed = _run_runner(
         "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
@@ -246,18 +248,97 @@ def test_runner_rejects_an_existing_campaign_reservation_before_venv(tmp_path: P
         },
     )
     assert completed.returncode == 2
-    assert "campaign reservation" in completed.stderr
+    assert "AUDIT_DIR" in completed.stderr
     assert log.read_text(encoding="utf-8").splitlines() == ["<--version>"]
-    assert lock.is_dir()
+    assert audit_dir.is_dir()
+    assert not (repository / ".venv-server").exists()
+    assert not (tmp_path / f"validation-v2-preflight-{commit}-sharded-v2-py312").exists()
+    assert not (
+        repository / "results" / "validation_v2" / f"server-full-shards-{commit}-sharded-v2-py312"
+    ).exists()
+
+
+def test_runner_rejects_a_linked_audit_seal_before_venv(tmp_path: Path) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    audit_dir = tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py312"
+    target = tmp_path / "linked-target"
+    target.mkdir()
+    try:
+        audit_dir.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip("symbolic links are unavailable: {}".format(error))
+    fake_python, log = _make_fake_python(tmp_path, "3.12.3")
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+    assert completed.returncode == 2
+    assert "AUDIT_DIR" in completed.stderr
+    assert audit_dir.is_symlink()
     assert not (repository / ".venv-server").exists()
 
 
-def test_runner_releases_only_the_campaign_reservation_it_created() -> None:
-    source = RUNNER.read_text(encoding="utf-8")
+def test_runner_preserves_a_new_audit_seal_and_exit_note_after_a_later_failure(
+    tmp_path: Path,
+) -> None:
+    repository, commit = _make_clean_repository(tmp_path)
+    fake_python, log = _make_fake_python(tmp_path, "3.12.3")
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
 
-    assert "CAMPAIGN_RESERVATION_ID" in source
-    assert "stat -c '%d:%i'" in source
-    assert '"$current_reservation_id" == "$CAMPAIGN_RESERVATION_ID"' in source
+    assert completed.returncode == 2
+    assert "requires Linux" in completed.stderr
+    audit_dir = tmp_path / f"validation-v2-audit-{commit}-sharded-v2-py312"
+    assert audit_dir.is_dir()
+    assert "status=2" in (audit_dir / "runner-exit-note.txt").read_text(encoding="utf-8")
+    assert not (repository / ".venv-server").exists()
+
+
+def test_runner_cleanup_stops_recorded_samplers_and_preserves_campaign_seal(
+    tmp_path: Path,
+) -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    match = re.search(
+        r"cleanup_runner\(\) \{\n(.*?)\n\}\ntrap cleanup_runner EXIT",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    audit_dir = tmp_path / "audit"
+    audit_dir.mkdir()
+    stops = tmp_path / "stops.txt"
+    script = (
+        "set -Eeuo pipefail\n"
+        "stop_gpu_sampler() { printf '%s\\n' \"$1\" >> \"$STOP_LOG\"; }\n"
+        + match.group(0).replace("\ntrap cleanup_runner EXIT", "")
+        + "\nAUDIT_DIR=\"$1\"\nSTOP_LOG=\"$2\"\n"
+        + "GPU_SAMPLER_LABELS=(baseline stage-2worker)\nSHARDS_LAUNCHED=1\n"
+        + "cleanup_runner 17\n"
+    )
+    completed = subprocess.run(
+        [_bash(), "-c", script, "_", _git_bash_path(audit_dir), _git_bash_path(stops)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 17
+    assert stops.read_text(encoding="utf-8").splitlines() == ["baseline", "stage-2worker"]
+    note = (audit_dir / "runner-exit-note.txt").read_text(encoding="utf-8")
+    assert "status=17" in note
+    assert "shards_launched=1" in note
+    assert "preserved" in note
 
 
 def _write_completed_stage(tmp_path: Path) -> tuple[Path, Path, Path, Path]:

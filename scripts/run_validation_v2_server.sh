@@ -93,31 +93,38 @@ AUDIT_DIR="$PARENT_DIR/validation-v2-audit-${COMMIT}-${CAMPAIGN_SUFFIX}"
 PLAN="$AUDIT_DIR/server-full-8-shards-${COMMIT}.json"
 SHARDS_ROOT="$REPO/results/validation_v2/server-full-shards-${COMMIT}-${CAMPAIGN_SUFFIX}"
 FINAL_ROOT="$REPO/results/validation_v2/server-full-final-${COMMIT}-${CAMPAIGN_SUFFIX}"
-CAMPAIGN_RESERVATION="$PARENT_DIR/.validation-v2-campaign-${COMMIT}-${CAMPAIGN_SUFFIX}.lock"
-CAMPAIGN_RESERVED=0
-CAMPAIGN_RESERVATION_ID=""
-release_campaign_reservation() {
-  local status="$?"
-  if (( CAMPAIGN_RESERVED )); then
-    local current_reservation_id=""
-    current_reservation_id="$(stat -c '%d:%i' "$CAMPAIGN_RESERVATION" 2>/dev/null)" || true
-    if [[ "$current_reservation_id" == "$CAMPAIGN_RESERVATION_ID" ]]; then
-      rmdir -- "$CAMPAIGN_RESERVATION" 2>/dev/null || true
+if [[ -e "$AUDIT_DIR" || -L "$AUDIT_DIR" ]] \
+    || ! mkdir "$AUDIT_DIR" 2>/dev/null; then
+  die "AUDIT_DIR campaign seal already exists or is linked: $AUDIT_DIR"
+fi
+
+GPU_SAMPLER_LABELS=()
+SHARDS_LAUNCHED=0
+cleanup_runner() {
+  local status="${1:-$?}"
+  trap - EXIT INT TERM
+  set +e
+  local label
+  for label in "${GPU_SAMPLER_LABELS[@]}"; do
+    if declare -F stop_gpu_sampler >/dev/null 2>&1; then
+      stop_gpu_sampler "$label" || true
     fi
-    CAMPAIGN_RESERVED=0
+  done
+  if [[ -d "$AUDIT_DIR" && ! -L "$AUDIT_DIR" ]]; then
+    {
+      printf 'runner exit status=%s shards_launched=%s\n' "$status" "$SHARDS_LAUNCHED"
+      if (( SHARDS_LAUNCHED )); then
+        printf '%s\n' 'shard processes and the campaign seal were preserved for diagnosis; automatic re-entry is refused.'
+      else
+        printf '%s\n' 'campaign seal was preserved; use a new suffix for any retry.'
+      fi
+    } >> "$AUDIT_DIR/runner-exit-note.txt" || true
   fi
   exit "$status"
 }
-trap release_campaign_reservation EXIT
-if [[ -e "$CAMPAIGN_RESERVATION" || -L "$CAMPAIGN_RESERVATION" ]] \
-    || ! mkdir "$CAMPAIGN_RESERVATION" 2>/dev/null; then
-  die "campaign reservation already exists or is linked: $CAMPAIGN_RESERVATION"
-fi
-CAMPAIGN_RESERVED=1
-CAMPAIGN_RESERVATION_ID="$(stat -c '%d:%i' "$CAMPAIGN_RESERVATION")" || {
-  CAMPAIGN_RESERVED=0
-  die "cannot establish campaign reservation ownership: $CAMPAIGN_RESERVATION"
-}
+trap cleanup_runner EXIT
+trap 'cleanup_runner 130' INT
+trap 'cleanup_runner 143' TERM
 [[ "$(uname -s)" == Linux ]] || die 'this formal runner requires Linux'
 
 PYTHON_BIN="$REPO/.venv-server/bin/python"
@@ -143,11 +150,11 @@ export REPO COMMIT PREFLIGHT_DIR AUDIT_DIR PLAN SHARDS_ROOT FINAL_ROOT CONFIG PY
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 [[ -f "$CONFIG" ]] || die "missing formal configuration: $CONFIG"
-for campaign_path in "$PREFLIGHT_DIR" "$AUDIT_DIR" "$SHARDS_ROOT" "$FINAL_ROOT"; do
+for campaign_path in "$PREFLIGHT_DIR" "$SHARDS_ROOT" "$FINAL_ROOT"; do
   [[ ! -e "$campaign_path" && ! -L "$campaign_path" ]] \
     || die "campaign path already exists or is linked: $campaign_path"
 done
-mkdir -p "$PREFLIGHT_DIR" "$AUDIT_DIR" "$SHARDS_ROOT"
+mkdir "$PREFLIGHT_DIR" "$SHARDS_ROOT"
 printf '%s\n' "$COMMIT" > "$AUDIT_DIR/COMMIT"
 
 verify_runtime() {
@@ -236,31 +243,55 @@ PY
 
 source "$REPO/scripts/lib/validation_v2_server_helpers.sh"
 
+start_managed_sampler() {
+  local label="$1"
+  start_gpu_sampler "$label" || return $?
+  GPU_SAMPLER_LABELS+=("$label")
+}
+
+stop_managed_sampler() {
+  local label="$1"
+  stop_gpu_sampler "$label" || return $?
+  local -a remaining=()
+  local active_label
+  for active_label in "${GPU_SAMPLER_LABELS[@]}"; do
+    if [[ "$active_label" != "$label" ]]; then
+      remaining+=("$active_label")
+    fi
+  done
+  GPU_SAMPLER_LABELS=("${remaining[@]}")
+}
+
+launch_formal_shard() {
+  launch_shard "$1" || return $?
+  SHARDS_LAUNCHED=1
+}
+
 run_formal_campaign() {
   local requested_mode="$1"
   [[ "$requested_mode" == full ]] || return 0
 
-  start_gpu_sampler baseline-1worker
-  launch_shard 000
+  start_managed_sampler baseline-1worker
+  launch_formal_shard 000
   wait_until_groups 000 2
   local baseline_start
   baseline_start="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["started_at"])' "$SHARDS_ROOT/000/shard_execution.json")"
   wait_stage_metrics baseline-1worker "$baseline_start" "" \
     "$AUDIT_DIR/baseline-1worker.json" 2 000
-  stop_gpu_sampler baseline-1worker
+  stop_managed_sampler baseline-1worker
 
   date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-2worker-start.txt"
   local stage2_start stage2_rc
   stage2_start="$(cat "$AUDIT_DIR/stage-2worker-start.txt")"
-  start_gpu_sampler stage-2worker
-  launch_shard 001
+  start_managed_sampler stage-2worker
+  launch_formal_shard 001
   if wait_stage_metrics stage-2worker "$stage2_start" \
       "$AUDIT_DIR/baseline-1worker.json" "$AUDIT_DIR/stage-2worker-metrics.json" 2 000 001; then
     stage2_rc=0
   else
     stage2_rc=$?
   fi
-  stop_gpu_sampler stage-2worker
+  stop_managed_sampler stage-2worker
   case "$stage2_rc" in
     0) ;;
     10) echo 'two-worker performance/resource gate failed' | tee -a "$AUDIT_DIR/rollout.log" ;;
@@ -275,9 +306,9 @@ run_formal_campaign() {
     date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-4worker-start.txt"
     local stage4_start stage4_rc
     stage4_start="$(cat "$AUDIT_DIR/stage-4worker-start.txt")"
-    start_gpu_sampler stage-4worker
-    launch_shard 002
-    launch_shard 003
+    start_managed_sampler stage-4worker
+    launch_formal_shard 002
+    launch_formal_shard 003
     if wait_stage_metrics stage-4worker "$stage4_start" \
         "$AUDIT_DIR/stage-2worker-metrics.json" "$AUDIT_DIR/stage-4worker-metrics.json" \
         2 000 001 002 003; then
@@ -285,7 +316,7 @@ run_formal_campaign() {
     else
       stage4_rc=$?
     fi
-    stop_gpu_sampler stage-4worker
+    stop_managed_sampler stage-4worker
     case "$stage4_rc" in
       0) ;;
       10) echo 'four-worker performance/resource gate failed' | tee -a "$AUDIT_DIR/rollout.log" ;;
@@ -302,11 +333,11 @@ run_formal_campaign() {
       date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-8worker-start.txt"
       local stage8_start stage8_rc
       stage8_start="$(cat "$AUDIT_DIR/stage-8worker-start.txt")"
-      start_gpu_sampler stage-8worker
-      launch_shard 004
-      launch_shard 005
-      launch_shard 006
-      launch_shard 007
+      start_managed_sampler stage-8worker
+      launch_formal_shard 004
+      launch_formal_shard 005
+      launch_formal_shard 006
+      launch_formal_shard 007
       if wait_stage_metrics stage-8worker "$stage8_start" \
           "$AUDIT_DIR/stage-4worker-metrics.json" "$AUDIT_DIR/stage-8worker-metrics.json" \
           2 000 001 002 003 004 005 006 007; then
@@ -314,7 +345,7 @@ run_formal_campaign() {
       else
         stage8_rc=$?
       fi
-      stop_gpu_sampler stage-8worker
+      stop_managed_sampler stage-8worker
       case "$stage8_rc" in
         0) ;;
         10) echo 'eight-worker resource/performance anomaly; retaining diagnostics' | tee -a "$AUDIT_DIR/rollout.log" ;;
