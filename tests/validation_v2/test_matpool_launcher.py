@@ -22,8 +22,17 @@ _CREDENTIAL_LEAK_PATTERNS = (
     (
         "SSH command",
         re.compile(
-            r"\bssh\b[^\r\n]*(?:\s-p(?:\s+|=)\S+|\s-p\d+|"
-            r"[a-z0-9._%+-]+@[a-z0-9.-]+)",
+            r"(?:^|[;&|]\s*)[ \t]*ssh\b[^\r\n]*[ \t]"
+            r"(?:[a-z0-9._%+-]+@)?(?:[a-z0-9-]+\.)+[a-z0-9-]+"
+            r"(?=[ \t]|$)",
+            flags=re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "user-at-host access target",
+        re.compile(
+            r"(?<![a-z0-9._%+-])[a-z0-9._%+-]+@"
+            r"(?:[a-z0-9-]+\.)+[a-z0-9-]+\b",
             flags=re.IGNORECASE,
         ),
     ),
@@ -37,8 +46,9 @@ _CREDENTIAL_LEAK_PATTERNS = (
     (
         "SSH or MatPool access variable",
         re.compile(
-            r"\b(?:SSH_(?:HOST|PORT)|MATPOOL_(?:SSH_)?(?:HOST|PORT|"
-            r"USER(?:NAME)?|PASSWORD|PASSWD|PWD))\s*(?::=|[=:])",
+            r"\b(?:SSH_(?:HOST|PORT|USER(?:NAME)?|PASSWORD|PASSWD|PWD)|"
+            r"MATPOOL_(?:SSH_)?(?:HOST|PORT|USER(?:NAME)?|PASSWORD|PASSWD|PWD))"
+            r"\s*(?::=|[=:])",
             flags=re.IGNORECASE,
         ),
     ),
@@ -68,9 +78,17 @@ def _credential_leaks(text: str) -> tuple[str, ...]:
         "ssh -p 65001 operator@example.invalid",
         "SSH operator@example.invalid -p 65002",
         "ssh operator@example.invalid",
+        "ssh compute.example.invalid",
+        "prepare; ssh compute.example.invalid",
+        "operator@example.invalid",
         "compute-fictional.matpool.com",
         "SSH_HOST = gateway.example.invalid",
         "ssh_port: 65003",
+        "SSH_USER = operator",
+        "ssh_username: operator",
+        "SSH_PASSWORD := dummy-value",
+        "ssh_passwd= dummy-value",
+        "SSH_PWD : dummy-value",
         "MATPOOL_SSH_HOST=compute.example.invalid",
         "matpool_ssh_port := 65004",
         "MATPOOL_SSH_USER: operator",
@@ -93,6 +111,7 @@ def test_credential_leak_scanner_recognizes_fictional_payloads(
         "Credentials are managed outside the repository.",
         "Never paste a password into a runbook.",
         "The launcher does not accept SSH access data.",
+        "SSH access is documented without connection details.",
         "A password policy is not an assignment.",
     ),
 )
