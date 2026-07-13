@@ -44,6 +44,7 @@ REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 COMMIT=""
 MODE=""
 CAMPAIGN_SUFFIX=""
+CAMPAIGN_SUFFIX_EXPLICIT=0
 SKIP_DEPENDENCY_INSTALL=0
 
 while (($#)); do
@@ -70,6 +71,7 @@ while (($#)); do
     --campaign-suffix)
       (($# >= 2)) || die '--campaign-suffix requires NAME'
       CAMPAIGN_SUFFIX="$2"
+      CAMPAIGN_SUFFIX_EXPLICIT=1
       shift 2
       ;;
     --skip-dependency-install)
@@ -101,7 +103,7 @@ PYTHON_MINOR="${BASH_REMATCH[1]}"
 if ! "$PYTHON3_BIN" -m venv --help >/dev/null 2>&1; then
   die "Python venv support is unavailable; install the matching python3.${PYTHON_MINOR}-venv package"
 fi
-if [[ -z "$CAMPAIGN_SUFFIX" ]]; then
+if (( ! CAMPAIGN_SUFFIX_EXPLICIT )); then
   CAMPAIGN_SUFFIX="sharded-v2-py3${PYTHON_MINOR}"
 fi
 [[ "$CAMPAIGN_SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'invalid --campaign-suffix'

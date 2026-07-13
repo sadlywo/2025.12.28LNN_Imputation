@@ -234,6 +234,29 @@ def test_runner_preserves_explicit_campaign_suffix(tmp_path: Path) -> None:
     assert (tmp_path / f"validation-v2-audit-{commit}-{explicit}").is_dir()
 
 
+def test_runner_rejects_an_explicit_empty_campaign_suffix_before_campaign_writes(
+    tmp_path: Path,
+) -> None:
+    fake_python, log = _make_fake_python(tmp_path, "3.11.9")
+    repository, commit = _make_clean_repository(tmp_path)
+
+    completed = _run_runner(
+        "--commit", commit, "--mode", "preflight", "--repo", repository.as_posix(),
+        "--campaign-suffix", "",
+        environment={
+            "MSYS2_ARG_CONV_EXCL": "",
+            "PYTHON3_BIN": fake_python.as_posix(),
+            "FAKE_PYTHON_LOG": log.as_posix(),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "invalid --campaign-suffix" in completed.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
+    assert not (repository / ".venv-server").exists()
+    assert not list(tmp_path.glob("validation-v2-audit-*"))
+
+
 def test_runner_skip_dependency_install_requires_an_existing_venv(tmp_path: Path) -> None:
     repository, commit = _make_clean_repository(tmp_path)
     fake_python, log = _make_fake_python(tmp_path, "3.12.3")
@@ -301,6 +324,11 @@ def _run_fake_runtime(
     *,
     gpu_name: str,
     gpu_memory_bytes: int = 24 * 1024**3,
+    python_implementation: str = "CPython",
+    python_version: tuple[int, int] = (3, 12),
+    torch_version: str = "2.3.1+cu121",
+    torch_cuda: str = "12.1",
+    cuda_available: bool = True,
     output: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess, Path, Path]:
     fake_modules = tmp_path / "fake-modules"
@@ -308,11 +336,11 @@ def _run_fake_runtime(
     (fake_modules / "torch.py").write_text(
         "import os\n"
         "from types import SimpleNamespace\n"
-        "__version__ = '2.3.1+cu121'\n"
-        "version = SimpleNamespace(cuda='12.1')\n"
+        "__version__ = os.environ['FAKE_TORCH_VERSION']\n"
+        "version = SimpleNamespace(cuda=os.environ['FAKE_TORCH_CUDA'])\n"
         "class _Cuda:\n"
         "    @staticmethod\n"
-        "    def is_available(): return True\n"
+        "    def is_available(): return os.environ['FAKE_CUDA_AVAILABLE'] == '1'\n"
         "    @staticmethod\n"
         "    def get_device_name(index): return os.environ['FAKE_GPU_NAME']\n"
         "    @staticmethod\n"
@@ -326,8 +354,17 @@ def _run_fake_runtime(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     nvidia_log = tmp_path / "nvidia-smi.log"
-    nvidia_smi = bin_dir / "nvidia-smi.cmd"
-    nvidia_smi.write_text(
+    posix_nvidia_smi = bin_dir / "nvidia-smi"
+    posix_nvidia_smi.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_NVIDIA_SMI_LOG\"\n"
+        "printf '%s\\n' '555.42'\n",
+        encoding="utf-8",
+    )
+    posix_nvidia_smi.chmod(0o755)
+    windows_nvidia_smi = bin_dir / "nvidia-smi.cmd"
+    windows_nvidia_smi.write_text(
         "@echo off\n"
         "echo %* >>\"%FAKE_NVIDIA_SMI_LOG%\"\n"
         "echo 555.42\n",
@@ -338,6 +375,9 @@ def _run_fake_runtime(
         {
             "FAKE_GPU_NAME": gpu_name,
             "FAKE_GPU_MEMORY": str(gpu_memory_bytes),
+            "FAKE_TORCH_VERSION": torch_version,
+            "FAKE_TORCH_CUDA": torch_cuda,
+            "FAKE_CUDA_AVAILABLE": "1" if cuda_available else "0",
             "FAKE_NVIDIA_SMI_LOG": str(nvidia_log),
             "PATH": str(bin_dir) + os.pathsep + environment.get("PATH", ""),
             "PYTHONPATH": str(fake_modules),
@@ -345,8 +385,9 @@ def _run_fake_runtime(
     )
     output = output or tmp_path / "environment.json"
     prelude = (
-        "import os, sys\n"
-        "sys.version_info = (3, 12, 0, 'final', 0)\n"
+        "import os, platform, sys\n"
+        f"platform.python_implementation = lambda: {python_implementation!r}\n"
+        f"sys.version_info = ({python_version[0]}, {python_version[1]}, 0, 'final', 0)\n"
         "os.sched_getaffinity = lambda pid: set(range(4))\n"
         "os.sysconf = lambda key: "
         "{'SC_PAGE_SIZE': 4096, 'SC_PHYS_PAGES': 8388608}[key]\n"
@@ -360,6 +401,91 @@ def _run_fake_runtime(
         text=True,
     )
     return completed, output, nvidia_log
+
+
+@pytest.mark.parametrize("python_version", [(3, 10), (3, 11), (3, 12)])
+def test_runner_venv_runtime_accepts_supported_cpython_versions_under_optimization(
+    tmp_path: Path, python_version: tuple[int, int]
+) -> None:
+    completed, output, _ = _run_fake_runtime(
+        tmp_path,
+        gpu_name="NVIDIA GeForce RTX 4090",
+        python_version=python_version,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert output.is_file()
+
+
+@pytest.mark.parametrize(
+    "python_implementation,python_version",
+    [("CPython", (3, 9)), ("CPython", (3, 13)), ("PyPy", (3, 11))],
+)
+def test_runner_venv_runtime_rejects_unsupported_python_under_optimization(
+    tmp_path: Path,
+    python_implementation: str,
+    python_version: tuple[int, int],
+) -> None:
+    completed, output, _ = _run_fake_runtime(
+        tmp_path,
+        gpu_name="NVIDIA GeForce RTX 4090",
+        python_implementation=python_implementation,
+        python_version=python_version,
+    )
+
+    assert completed.returncode != 0
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "runtime_overrides",
+    [
+        {"torch_version": "2.3.1"},
+        {"torch_cuda": "12.4"},
+        {"cuda_available": False},
+    ],
+)
+def test_runner_venv_runtime_rejects_incompatible_torch_or_cuda_under_optimization(
+    tmp_path: Path, runtime_overrides: dict[str, object]
+) -> None:
+    completed, output, _ = _run_fake_runtime(
+        tmp_path,
+        gpu_name="NVIDIA GeForce RTX 4090",
+        **runtime_overrides,
+    )
+
+    assert completed.returncode != 0
+    assert not output.exists()
+
+
+def test_fake_nvidia_smi_includes_a_posix_executable_and_never_uses_the_host(
+    tmp_path: Path,
+) -> None:
+    completed, _, nvidia_log = _run_fake_runtime(
+        tmp_path, gpu_name="NVIDIA GeForce RTX 4090"
+    )
+
+    fake_nvidia_smi = tmp_path / "bin" / "nvidia-smi"
+    assert completed.returncode == 0, completed.stderr
+    assert fake_nvidia_smi.is_file()
+    assert os.access(fake_nvidia_smi, os.X_OK)
+    assert "--query-gpu=driver_version" in nvidia_log.read_text(encoding="utf-8")
+    bash_probe = subprocess.run(
+        [
+            _bash(),
+            "-c",
+            'export PATH="$1:$PATH" FAKE_NVIDIA_SMI_LOG="$2"; nvidia-smi --probe',
+            "_",
+            _git_bash_path(fake_nvidia_smi.parent),
+            _git_bash_path(nvidia_log),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert bash_probe.returncode == 0, bash_probe.stderr
+    assert bash_probe.stdout.strip() == "555.42"
+    assert "--probe" in nvidia_log.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
