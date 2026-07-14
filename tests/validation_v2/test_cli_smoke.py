@@ -1747,6 +1747,23 @@ def test_every_server_model_constructs_and_forwards(model_name: str):
     assert torch.isfinite(prediction).all()
 
 
+@pytest.mark.parametrize("model_name", ["linear", "locf"])
+def test_normalized_baseline_uses_training_median_for_fully_missing_channel(
+    model_name: str,
+):
+    model = build_execution_model(model_name, hidden_size=2)
+    features = torch.zeros(1, 6, 25)
+    features[0, :, 1:6] = torch.arange(1.0, 6.0)
+    mask = torch.ones(1, 6, 6)
+    mask[:, :, 0] = 0
+    dt = torch.full((1, 6), 0.01)
+
+    prediction = model.predict(features, mask, dt)
+
+    torch.testing.assert_close(prediction[:, :, 0], torch.zeros(1, 6))
+    torch.testing.assert_close(prediction[mask.bool()], features[:, :, :6][mask.bool()])
+
+
 def test_gate_labels_share_identical_hybrid_branch_predictions():
     from validation_v2.models.hybrid import HybridComponents
 

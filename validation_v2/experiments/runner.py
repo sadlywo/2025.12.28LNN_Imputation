@@ -110,10 +110,13 @@ class ExecutionModel(nn.Module):
     ) -> torch.Tensor:
         selected_model = reported_model or self.name
         observed = features[..., :6]
+        # RobustTrainScaler maps the train-only channel median to zero.  That
+        # leakage-safe statistic is the declared fallback for channel outage,
+        # where interpolation and LOCF have no within-series observation.
         if selected_model == "linear":
-            return linear_interpolation(observed, mask)
+            return linear_interpolation(observed, mask, empty_series_fill=0.0)
         if selected_model == "locf":
-            return locf(observed, mask)
+            return locf(observed, mask, empty_series_fill=0.0)
         reverse_dt = reverse_aligned_dt(dt)
         if selected_model == "bilstm":
             return complete_signal(observed, mask, self.core(features))

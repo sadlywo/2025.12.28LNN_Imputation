@@ -24,21 +24,41 @@ def _validate_observed(observed: torch.Tensor, mask: torch.Tensor) -> None:
         raise ValueError("observed entries must be finite")
 
 
-def _require_each_series_observed(mask: torch.Tensor) -> None:
-    if not mask.bool().any(dim=1).all():
+def _empty_series_fill(
+    observed: torch.Tensor,
+    mask: torch.Tensor,
+    value: float | None,
+) -> torch.Tensor | None:
+    if mask.bool().any(dim=1).all():
+        return None
+    if value is None:
         raise ValueError("a batch/channel series has no observed value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("empty_series_fill must be a finite number")
+    fill = observed.new_tensor(value)
+    if not torch.isfinite(fill):
+        raise ValueError("empty_series_fill must be a finite number")
+    return fill
 
 
-def locf(observed: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Last observation carried forward, with leading gaps backfilled once."""
+def locf(
+    observed: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    empty_series_fill: float | None = None,
+) -> torch.Tensor:
+    """Carry observations forward, optionally filling an all-missing series."""
 
     _validate_observed(observed, mask)
-    _require_each_series_observed(mask)
+    fill = _empty_series_fill(observed, mask, empty_series_fill)
     prediction = torch.empty_like(observed)
     batch_size, time_steps, channels = observed.shape
     for batch in range(batch_size):
         for channel in range(channels):
             valid = torch.where(mask[batch, :, channel].bool())[0]
+            if valid.numel() == 0:
+                prediction[batch, :, channel] = fill
+                continue
             current = observed[batch, valid[0], channel]
             for step in range(time_steps):
                 if mask[batch, step, channel].bool():
@@ -47,17 +67,25 @@ def locf(observed: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return complete_signal(observed, mask, prediction)
 
 
-def linear_interpolation(observed: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Interpolate each batch/channel independently; use nearest edge values."""
+def linear_interpolation(
+    observed: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    empty_series_fill: float | None = None,
+) -> torch.Tensor:
+    """Interpolate each series, optionally filling one with no observations."""
 
     _validate_observed(observed, mask)
-    _require_each_series_observed(mask)
+    fill = _empty_series_fill(observed, mask, empty_series_fill)
     prediction = torch.empty_like(observed)
     batch_size, time_steps, channels = observed.shape
     timeline = torch.arange(time_steps, device=observed.device)
     for batch in range(batch_size):
         for channel in range(channels):
             valid = torch.where(mask[batch, :, channel].bool())[0]
+            if valid.numel() == 0:
+                prediction[batch, :, channel] = fill
+                continue
             values = observed[batch, valid, channel]
             right = torch.searchsorted(valid, timeline).clamp(max=valid.numel() - 1)
             left = (right - 1).clamp(min=0)
