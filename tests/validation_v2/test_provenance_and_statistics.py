@@ -326,6 +326,26 @@ def test_summarize_runs_writes_sorted_deterministic_csv_and_json(tmp_path: Path)
     assert summary.loc[0, "realized_fraction_max"] == pytest.approx(0.20)
 
 
+def test_summarize_runs_pools_strict_file_recordings_across_scenarios(tmp_path: Path):
+    for seed, run_name in ((1, "run-1"), (2, "run-2")):
+        rows = _rows(seed, run_name)
+        for row in rows:
+            row["protocol"] = "strict_file"
+            row["scenario"] = "walk" if row["recording_id"] == "rec-a" else "run"
+        _write_run(tmp_path, run_name, seed, rows)
+
+    summary = summarize_runs(
+        tmp_path,
+        required_seeds=(1, 2),
+        baseline="baseline",
+        bootstrap_seed=11,
+        bootstrap_samples=500,
+    )
+
+    assert set(summary["scenario"]) == {"overall"}
+    assert set(summary["n_recordings"]) == {2}
+
+
 def test_summarize_runs_rejects_extra_seed(tmp_path: Path):
     _write_run(tmp_path, "run-1", 1, _rows(1, "run-1"))
     with pytest.raises(ValueError, match="unexpected seeds: 1"):

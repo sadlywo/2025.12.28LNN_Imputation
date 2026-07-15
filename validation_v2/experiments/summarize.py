@@ -54,6 +54,11 @@ def summarize_runs(
             raise ValueError("CSV seed does not match run manifest")
         frames.append(frame)
     metrics = pd.concat(frames, ignore_index=True)
+    # strict_file estimates overall file-disjoint performance; scenario-specific
+    # inference is supplied by the scenario_holdout protocols.
+    strict_file = metrics["protocol"].eq("strict_file")
+    if strict_file.any():
+        metrics.loc[strict_file, "scenario"] = "overall"
     summary = paired_model_summary(
         metrics,
         baseline=baseline,
