@@ -1,6 +1,8 @@
 """Typed configuration for offline teacher experiments."""
 
 from dataclasses import dataclass
+from math import isfinite
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar
 
@@ -60,15 +62,30 @@ def _required(data: Mapping[str, Any], field: str) -> Any:
         raise ValueError(f"missing required field: {field}") from exc
 
 
-def _convert(value: Any, field: str, converter: Callable[[Any], Number]) -> Number:
+def _integer(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{field} must contain integer values")
+    return int(value)
+
+
+def _finite_float(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field} must contain finite numeric values")
     try:
-        return converter(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be numeric") from exc
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must contain finite numeric values") from exc
+    if not isfinite(converted):
+        raise ValueError(f"{field} must contain finite numeric values")
+    return converted
 
 
-def _positive(value: Any, field: str, converter: Callable[[Any], Number]) -> Number:
-    converted = _convert(value, field, converter)
+def _positive(
+    value: Any,
+    field: str,
+    validator: Callable[[Any, str], Number],
+) -> Number:
+    converted = validator(value, field)
     if converted <= 0:
         raise ValueError(f"{field} must be positive")
     return converted
@@ -77,12 +94,12 @@ def _positive(value: Any, field: str, converter: Callable[[Any], Number]) -> Num
 def _positive_list(
     data: Mapping[str, Any],
     field: str,
-    converter: Callable[[Any], Number],
+    validator: Callable[[Any, str], Number],
 ) -> tuple[Number, ...]:
     values = _required(data, field)
     if not isinstance(values, list) or not values:
         raise ValueError(f"{field} must be a non-empty list")
-    return tuple(_positive(value, field, converter) for value in values)
+    return tuple(_positive(value, field, validator) for value in values)
 
 
 def _string_list(data: Mapping[str, Any], field: str) -> tuple[str, ...]:
@@ -106,10 +123,7 @@ def load_teacher_config(path: Path) -> TeacherConfig:
     raw_seeds = data.get("seeds")
     if not isinstance(raw_seeds, list) or not raw_seeds:
         raise ValueError("seeds must be a non-empty list")
-    try:
-        seeds = tuple(int(seed) for seed in raw_seeds)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("seeds must contain integers") from exc
+    seeds = tuple(_integer(seed, "seeds") for seed in raw_seeds)
 
     models = _string_list(data, "models")
     unsupported = sorted(set(models) - ALLOWED_MODELS)
@@ -121,15 +135,19 @@ def load_teacher_config(path: Path) -> TeacherConfig:
         output_root=Path(str(_required(data, "output_root"))),
         selection_split=selection_split,
         seeds=seeds,
-        window_seconds=_positive_list(data, "window_seconds", float),
-        nominal_dt_s=_positive(_required(data, "nominal_dt_s"), "nominal_dt_s", float),
-        batch_size=_positive(_required(data, "batch_size"), "batch_size", int),
-        epochs=_positive(_required(data, "epochs"), "epochs", int),
-        hidden_size=_positive(_required(data, "hidden_size"), "hidden_size", int),
-        tcn_width=_positive(_required(data, "tcn_width"), "tcn_width", int),
-        tcn_dilations=_positive_list(data, "tcn_dilations", int),
-        learning_rate=_positive(_required(data, "learning_rate"), "learning_rate", float),
-        training_rates=_positive_list(data, "training_rates", float),
+        window_seconds=_positive_list(data, "window_seconds", _finite_float),
+        nominal_dt_s=_positive(
+            _required(data, "nominal_dt_s"), "nominal_dt_s", _finite_float
+        ),
+        batch_size=_positive(_required(data, "batch_size"), "batch_size", _integer),
+        epochs=_positive(_required(data, "epochs"), "epochs", _integer),
+        hidden_size=_positive(_required(data, "hidden_size"), "hidden_size", _integer),
+        tcn_width=_positive(_required(data, "tcn_width"), "tcn_width", _integer),
+        tcn_dilations=_positive_list(data, "tcn_dilations", _integer),
+        learning_rate=_positive(
+            _required(data, "learning_rate"), "learning_rate", _finite_float
+        ),
+        training_rates=_positive_list(data, "training_rates", _finite_float),
         training_topologies=_string_list(data, "training_topologies"),
         models=models,
     )
