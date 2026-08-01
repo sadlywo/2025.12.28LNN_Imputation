@@ -81,6 +81,22 @@ def test_output_parameterization_keeps_baseline_in_fusion(mode):
     assert model.trunk[0].in_features == 2 * 4 + 5 + 6
 
 
+def test_raw_mode_is_direct_output_with_baseline_retained_in_fusion():
+    model = _teacher(residual_mode="raw").eval()
+    inputs = _inputs()
+    captured = []
+    handle = model.trunk[0].register_forward_pre_hook(
+        lambda _module, args: captured.append(args[0])
+    )
+    try:
+        output = model(*inputs)
+    finally:
+        handle.remove()
+
+    torch.testing.assert_close(output.raw, output.residual)
+    torch.testing.assert_close(captured[0][..., -6:], inputs[4])
+
+
 def test_gyro_then_accelerometer_head_order_and_separate_parameters():
     model = _teacher().eval()
     with torch.no_grad():
@@ -188,6 +204,34 @@ def test_forward_does_not_mutate_caller_tensors():
         torch.testing.assert_close(actual, expected, equal_nan=True)
 
 
+def test_completion_preserves_observed_negative_zero_bit_exactly():
+    inputs = list(_inputs())
+    inputs[2] = inputs[2].clone()
+    observed_index = inputs[3].nonzero()[0]
+    index = tuple(observed_index.tolist())
+    inputs[2][index] = -0.0
+
+    output = _teacher().eval()(*inputs)
+
+    assert output.completed[index].item() == 0.0
+    assert torch.signbit(output.completed[index]).item()
+
+
+def test_teacher_output_fields_keep_live_backward_connectivity():
+    model = _teacher().eval()
+    output = model(*_inputs())
+    fields = (output.raw, output.completed, output.residual, output.latent)
+    for field in fields:
+        assert field.grad_fn is not None
+        field.retain_grad()
+
+    sum(field.sum() for field in fields).backward()
+
+    assert all(field.grad is not None for field in fields)
+    assert model.trunk[0].weight.grad is not None
+    assert torch.count_nonzero(model.trunk[0].weight.grad).item() > 0
+
+
 def test_real_teacher_backward_reaches_every_named_branch():
     torch.manual_seed(8)
     model = _teacher().eval()
@@ -202,12 +246,7 @@ def test_real_teacher_backward_reaches_every_named_branch():
     parameter_groups = {
         "forward CfC": tuple(model.cfc_encoder.forward_cfc.parameters()),
         "reverse CfC": tuple(model.cfc_encoder.reverse_cfc.parameters()),
-        "TCN depthwise": tuple(
-            block.depthwise.weight for block in model.tcn_encoder.blocks
-        ),
-        "TCN pointwise": tuple(
-            block.pointwise.weight for block in model.tcn_encoder.blocks
-        ),
+        "TCN projection": tuple(model.tcn_encoder.projection.parameters()),
         "trunk": tuple(model.trunk.parameters()),
         "gyro head": tuple(model.gyro_head.parameters()),
         "accelerometer head": tuple(model.acc_head.parameters()),
@@ -221,3 +260,24 @@ def test_real_teacher_backward_reaches_every_named_branch():
         assert any(
             torch.count_nonzero(gradient).item() > 0 for gradient in gradients
         ), name
+
+    assert all(
+        torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.tcn_encoder.projection.parameters()
+    )
+
+    for block_index, block in enumerate(model.tcn_encoder.blocks):
+        for name, parameters in (
+            ("depthwise", tuple(block.depthwise.parameters())),
+            ("pointwise", tuple(block.pointwise.parameters())),
+            ("normalization", tuple(block.normalization.parameters())),
+        ):
+            gradients = [parameter.grad for parameter in parameters]
+            label = f"TCN block {block_index} {name}"
+            assert all(
+                gradient is not None and torch.isfinite(gradient).all()
+                for gradient in gradients
+            ), label
+            assert all(
+                torch.count_nonzero(gradient).item() > 0 for gradient in gradients
+            ), label

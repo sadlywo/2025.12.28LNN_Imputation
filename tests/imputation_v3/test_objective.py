@@ -22,6 +22,86 @@ def test_channel_means_are_equally_weighted_despite_unequal_missing_counts():
     assert loss.ndim == 0
 
 
+@pytest.mark.parametrize(
+    ("count", "error", "expected"),
+    ((70_000, 1.0, 1.0), (1_000, 100.0, 10_000.0)),
+)
+def test_float16_reduction_stays_finite_when_mean_is_representable(
+    count, error, expected
+):
+    prediction = torch.full((count, 6), error, dtype=torch.float16)
+    target = torch.zeros_like(prediction)
+    mask = torch.ones_like(prediction, dtype=torch.bool)
+    mask[:, 0] = False
+
+    loss = channel_balanced_missing_mse(prediction, target, mask)
+
+    assert loss.dtype == torch.float16
+    assert torch.isfinite(loss)
+    torch.testing.assert_close(loss, torch.tensor(expected, dtype=torch.float16))
+
+
+def test_float32_normalizes_before_summing_large_squared_errors():
+    prediction = torch.full((4_096, 6), 1e18, dtype=torch.float32)
+    target = torch.zeros_like(prediction)
+    mask = torch.ones_like(prediction, dtype=torch.bool)
+    mask[:, 2] = False
+
+    loss = channel_balanced_missing_mse(prediction, target, mask)
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    torch.testing.assert_close(loss, torch.tensor(1e36), rtol=2e-6, atol=0)
+
+
+def test_float32_channel_average_does_not_overflow_before_division():
+    prediction = torch.full((6, 6), 1e19, dtype=torch.float32)
+    target = torch.zeros_like(prediction)
+    mask = torch.zeros_like(prediction, dtype=torch.bool)
+
+    loss = channel_balanced_missing_mse(prediction, target, mask)
+
+    assert torch.isfinite(loss)
+    torch.testing.assert_close(loss, torch.tensor(1e38), rtol=2e-6, atol=0)
+
+
+def test_stable_scaling_has_finite_gradients_and_exact_observed_zeros():
+    prediction = torch.full(
+        (1_000, 6), 100.0, dtype=torch.float16, requires_grad=True
+    )
+    target = torch.zeros_like(prediction)
+    mask = torch.ones_like(prediction, dtype=torch.bool)
+    mask[:, 4] = False
+
+    channel_balanced_missing_mse(prediction, target, mask).backward()
+
+    assert torch.isfinite(prediction.grad).all()
+    assert torch.count_nonzero(prediction.grad[mask]).item() == 0
+    assert torch.all(prediction.grad[~mask] != 0)
+
+
+def test_nonfinite_result_after_original_dtype_cast_is_rejected():
+    prediction = torch.full((32, 6), 300.0, dtype=torch.float16)
+    target = torch.zeros_like(prediction)
+    mask = torch.ones_like(prediction, dtype=torch.bool)
+    mask[:, 0] = False
+
+    with pytest.raises(ValueError, match="finite"):
+        channel_balanced_missing_mse(prediction, target, mask)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.float32, torch.float64))
+def test_loss_scalar_uses_original_floating_dtype(dtype):
+    prediction = torch.zeros(2, 6, dtype=dtype)
+    target = torch.ones_like(prediction)
+    mask = torch.zeros_like(prediction, dtype=torch.bool)
+
+    loss = channel_balanced_missing_mse(prediction, target, mask)
+
+    assert loss.dtype == dtype
+    torch.testing.assert_close(loss, torch.tensor(1.0, dtype=dtype))
+
+
 def test_observed_gradients_are_exactly_zero_and_missing_errors_have_gradients():
     prediction = torch.zeros(1, 2, 6, requires_grad=True)
     target = torch.ones_like(prediction)

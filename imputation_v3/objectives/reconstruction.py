@@ -56,15 +56,26 @@ def channel_balanced_missing_mse(
     ).all().item():
         raise ValueError("prediction and target values used by the loss must be finite")
 
-    zeros = torch.zeros((), dtype=prediction.dtype, device=prediction.device)
-    safe_error = torch.where(missing, prediction - target, zeros)
-    squared_error = safe_error.square()
-    selected_error = torch.where(missing, squared_error, zeros).reshape(-1, 6)
-    channel_sums = selected_error.sum(dim=0)
-    channel_means = channel_sums[represented] / counts[represented].to(
-        prediction.dtype
+    accumulation_dtype = (
+        torch.float32
+        if prediction.dtype in (torch.float16, torch.bfloat16)
+        else prediction.dtype
     )
-    return channel_means.mean()
+    prediction_acc = prediction.to(dtype=accumulation_dtype)
+    target_acc = target.to(dtype=accumulation_dtype)
+    zeros = torch.zeros((), dtype=accumulation_dtype, device=prediction.device)
+    safe_error = torch.where(missing, prediction_acc - target_acc, zeros)
+
+    safe_counts = counts.clamp_min(1).to(dtype=accumulation_dtype)
+    normalized_error = safe_error / safe_counts.sqrt()
+    squared_error = normalized_error.square()
+    selected_error = torch.where(missing, squared_error, zeros).reshape(-1, 6)
+    channel_means = selected_error.sum(dim=0)[represented]
+    valid_channel_count = represented.sum().to(dtype=accumulation_dtype)
+    loss = (channel_means / valid_channel_count).sum().to(dtype=prediction.dtype)
+    if not torch.isfinite(loss).item():
+        raise ValueError("channel-balanced missing MSE must be finite")
+    return loss
 
 
 __all__ = ["channel_balanced_missing_mse"]

@@ -39,7 +39,12 @@ def _validate_mode(name: str, value: object, choices: frozenset[str]) -> str:
 
 
 class OfflineTeacher(nn.Module):
-    """Fuse bidirectional CfC, symmetric TCN, and linear baseline features."""
+    """Fuse bidirectional CfC, symmetric TCN, and linear baseline features.
+
+    In ``residual`` mode, the heads predict an additive baseline correction. In
+    ``raw`` mode, their six-channel value is the direct output, while the
+    baseline remains part of the shared fusion features in both modes.
+    """
 
     def __init__(
         self,
