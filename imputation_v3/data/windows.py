@@ -294,7 +294,8 @@ def _scaled_target(
         scaled32 = scaled.astype(np.float32)
     if not np.all(np.isfinite(scaled32)):
         raise ValueError("scaler transform output must be representable as finite float32")
-    return torch.from_numpy(np.array(scaled32, copy=True))
+    owned_c_order = np.array(scaled32, dtype=np.float32, order="C", copy=True)
+    return torch.from_numpy(owned_c_order)
 
 
 def _local_time_and_dt(raw_time: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
@@ -388,7 +389,7 @@ def iter_teacher_windows(
         for start in range(0, len(raw_time) - window_samples + 1, stride):
             stop = start + window_samples
             local_time, local_dt = _local_time_and_dt(raw_time[start:stop])
-            target = full_target[start:stop]
+            target = full_target[start:stop].contiguous()
             for topology, rate in _conditions(
                 exhaustive=exhaustive,
                 recording_id=recording.id,
@@ -410,7 +411,7 @@ def iter_teacher_windows(
                     or mask_result.seed != condition_seed
                 ):
                     raise ValueError("mask generator result does not match its request")
-                mask = mask_result.mask
+                mask = mask_result.mask.contiguous()
                 realized = float((mask == 0).to(torch.float64).mean().item())
                 if realized == 0.0:
                     raise ValueError(

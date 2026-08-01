@@ -290,6 +290,67 @@ def test_window_ids_bind_recording_content_and_scaler_provenance():
     assert torch.equal(base.mask, scaler_changed.mask)
 
 
+def test_fortran_scaled_source_realizes_all_missingness_topologies_contiguously():
+    values = np.asfortranarray(
+        np.arange(40 * 6, dtype=np.float64).reshape(40, 6) / 10.0
+    )
+    recording = _recording(values=values)
+    original_values = recording.imu_six.copy(order="F")
+    scaler = _scaler()
+    raw_scaled = scaler.transform(recording.imu_six)
+
+    assert raw_scaled.flags.f_contiguous
+    assert not raw_scaled.flags.c_contiguous
+    assert torch.from_numpy(raw_scaled).stride()[-1] != 1
+
+    windows = materialize_teacher_windows(
+        [recording],
+        scaler,
+        window_samples=16,
+        stride=16,
+        seed=2026,
+        topologies=("point", "block", "channel"),
+        rates=(0.25,),
+        exhaustive=True,
+    )
+
+    expected_missing = {"point": 24, "block": 24, "channel": 16}
+    assert len(windows) == 6
+    for window in windows:
+        assert int((window.mask == 0).sum().item()) == expected_missing[window.topology]
+        assert window.realized_fraction > 0.0
+        assert window.target.stride()[-1] == 1
+        assert window.target.is_contiguous()
+        assert window.mask.is_contiguous()
+        assert window.features.shape == (16, 31)
+        assert torch.isfinite(window.features).all()
+        assert torch.isfinite(window.baseline).all()
+    np.testing.assert_array_equal(recording.imu_six, original_values)
+    assert recording.imu_six.flags.f_contiguous
+
+
+def test_c_and_fortran_layouts_have_identical_semantic_ids_and_masks():
+    values = np.arange(16 * 6, dtype=np.float64).reshape(16, 6) / 10.0
+    c_recording = _recording(rows=16, values=np.array(values, order="C"))
+    f_recording = _recording(rows=16, values=np.array(values, order="F"))
+    arguments = dict(
+        stride=16,
+        exhaustive=True,
+        topologies=("point", "block", "channel"),
+        rates=(0.25,),
+    )
+
+    c_windows = _materialize([c_recording], **arguments)
+    f_windows = _materialize([f_recording], **arguments)
+
+    assert [window.window_id for window in c_windows] == [
+        window.window_id for window in f_windows
+    ]
+    for c_window, f_window in zip(c_windows, f_windows):
+        assert torch.equal(c_window.target, f_window.target)
+        assert torch.equal(c_window.mask, f_window.mask)
+
+
 def test_public_topology_mapping_documents_validation_v2_generators():
     assert dict(TOPOLOGY_GENERATOR_NAMES) == {
         "point": "point_missing",
