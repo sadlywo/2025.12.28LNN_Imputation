@@ -31,3 +31,6 @@ Pass only when the paired per-recording teacher-minus-strongest-baseline RMSE 95
 ## External baseline API
 PyPOTS 1.5 documentation: https://docs.pypots.com/
 PyPOTS source: https://github.com/WenjieDu/PyPOTS
+
+## Verification evidence
+The path-normalized CPU smoke, deterministic-resume, artifact-hash, focused-test, full-v3-test, and matrix dry-run evidence is sealed in `docs/imputation_v3_teacher_verification.json`. It explicitly does not claim the combined legacy suite or a formal GPU result.
