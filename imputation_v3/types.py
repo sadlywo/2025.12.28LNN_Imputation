@@ -185,12 +185,13 @@ class PreparedWindow:
             abs_tol=1e-15,
         ):
             raise ValueError("realized_fraction must agree with the mask missing mean")
-        if not torch.equal(features[:, 0:6], observed):
-            raise ValueError("feature columns 0:6 must equal observed")
-        if not torch.equal(features[:, 6:12], mask):
-            raise ValueError("feature columns 6:12 must equal mask")
-        if not torch.equal(features[:, 12], dt):
-            raise ValueError("feature column 12 must equal dt")
+        # The local import keeps ``types`` dependency-safe when ``features``
+        # itself imports FeatureBatch from this module.
+        from imputation_v3.data.features import build_features
+
+        canonical_features = build_features(target, mask, dt).values
+        if not torch.equal(features, canonical_features):
+            raise ValueError("features must exactly equal canonical derived features")
 
         for name, value in tensors.items():
             object.__setattr__(self, f"_{name}", _copy(value))

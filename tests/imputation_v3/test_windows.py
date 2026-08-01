@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+from imputation_v3.types import PreparedBatch, PreparedWindow
 from imputation_v3.data.features import build_features
 from imputation_v3.data.windows import (
     TOPOLOGY_GENERATOR_NAMES,
@@ -14,7 +15,6 @@ from imputation_v3.data.windows import (
     iter_teacher_windows,
     materialize_teacher_windows,
 )
-from imputation_v3.types import PreparedBatch, PreparedWindow
 from validation_v2.data.normalization import RobustTrainScaler
 from validation_v2.types import Recording
 
@@ -725,6 +725,43 @@ def test_prepared_window_rejects_cross_field_inconsistency(mutate):
     arguments = _prepared_arguments()
     mutate(arguments)
     with pytest.raises(ValueError):
+        PreparedWindow(**arguments)
+
+
+def test_direct_prepared_window_import_accepts_canonical_construction():
+    # PreparedWindow is imported before features/windows at module import time.
+    window = PreparedWindow(**_prepared_arguments())
+
+    assert window.features.shape == (4, 31)
+
+
+def test_prepared_window_rejects_hidden_target_injected_into_age_features():
+    arguments = _prepared_arguments()
+    corrupted = arguments["features"].clone()
+    corrupted[1, 13 + 2] = arguments["target"][1, 2]
+    arguments["features"] = corrupted
+
+    with pytest.raises(ValueError, match="canonical|derived features"):
+        PreparedWindow(**arguments)
+
+
+def test_prepared_window_rejects_corrupted_slope_features():
+    arguments = _prepared_arguments()
+    corrupted = arguments["features"].clone()
+    corrupted[2, 19] += 1.0
+    arguments["features"] = corrupted
+
+    with pytest.raises(ValueError, match="canonical|derived features"):
+        PreparedWindow(**arguments)
+
+
+def test_prepared_window_rejects_corrupted_slope_valid_features():
+    arguments = _prepared_arguments()
+    corrupted = arguments["features"].clone()
+    corrupted[2, 25] = 0.5
+    arguments["features"] = corrupted
+
+    with pytest.raises(ValueError, match="canonical|derived features"):
         PreparedWindow(**arguments)
 
 
