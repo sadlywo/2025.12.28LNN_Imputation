@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import hashlib
+from itertools import islice
 import json
 import math
 from pathlib import Path
@@ -13,8 +14,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import DataLoader
 
 from imputation_v3.config import TeacherConfig
+from imputation_v3.data.windows import collate_prepared_windows, iter_teacher_windows
+from imputation_v3.experiments.training import make_teacher_callbacks
+from imputation_v3.models.teacher import OfflineTeacher
 from imputation_v3.experiments.runner import (
     FORMAL_SEEDS,
     formal_mask_seed,
@@ -22,6 +27,8 @@ from imputation_v3.experiments.runner import (
     success_gate_payload,
 )
 from validation_v2.data.masking import channel_outage, contiguous_block, point_missing
+from validation_v2.data.normalization import RobustTrainScaler
+from validation_v2.data.oxiod import load_recording
 from validation_v2.data.splits import MANIFEST_COLUMNS
 from validation_v2.evaluation.statistics import (
     GROUP_COLUMNS,
@@ -35,6 +42,8 @@ from validation_v2.experiments.provenance import (
     canonical_json,
 )
 from validation_v2.experiments.train import select_best_checkpoint
+from validation_v2.experiments.runner import discover_oxiod_pairs
+from validation_v2.data.splits import stratified_file_split
 
 
 _RUN_FILES = frozenset(
@@ -318,6 +327,129 @@ def _validate_smoke_config(
     return train_windows, validation_windows
 
 
+def _replayed_window_evidence(window: Any) -> dict[str, Any]:
+    mask = np.ascontiguousarray(window.mask.numpy(), dtype=np.float32)
+    content = mask.tobytes()
+    return {
+        "window_id": window.window_id,
+        "recording_id": window.recording_id,
+        "topology": window.topology,
+        "requested_fraction": window.requested_fraction,
+        "realized_fraction": window.realized_fraction,
+        "mask_sha256": hashlib.sha256(content).hexdigest(),
+        "mask_bytes_hex": content.hex(),
+        "mask_dtype": "float32-le",
+        "samples": int(mask.shape[0]),
+        "channels": int(mask.shape[1]),
+    }
+
+
+def _replay_smoke_pipeline(
+    run_dir: Path, manifest: Mapping[str, Any]
+) -> tuple[dict[str, list[Any]], dict[str, dict[str, float]]]:
+    config = _mapping(manifest["config"], "smoke replay config")
+    data_root = Path(str(config["data_root"]))
+    discovered = discover_oxiod_pairs(data_root)
+    replayed_split = stratified_file_split(
+        discovered, seed=int(config["split_seed"])
+    )
+    replayed_rows = [
+        {
+            "recording_id": str(row["recording_id"]),
+            "scenario": str(row["scenario"]),
+            "imu_path": str(row["imu_path"]),
+            "vicon_path": str(row["vicon_path"]),
+            "split": str(row["split"]),
+            "imu_sha256": str(row["imu_sha256"]),
+            "vicon_sha256": str(row["vicon_sha256"]),
+        }
+        for row in replayed_split.to_dict(orient="records")
+    ]
+    replayed_rows.sort(key=lambda row: row["recording_id"])
+    if replayed_rows != config["split_manifest"]:
+        raise ValueError("smoke replay split membership/source evidence differs")
+    selected_rows = {
+        split: [row for row in replayed_rows if row["split"] == split][:2]
+        for split in ("train", "validation")
+    }
+    expected_selected = {
+        split: [row["recording_id"] for row in selected_rows[split]]
+        for split in ("train", "validation")
+    }
+    if expected_selected != config["selected_recording_ids"]:
+        raise ValueError("smoke replay selected recording order differs")
+    recordings = {
+        split: [
+            load_recording(Path(row["imu_path"]), Path(row["vicon_path"]))
+            for row in selected_rows[split]
+        ]
+        for split in ("train", "validation")
+    }
+    for split in recordings:
+        if [recording.id for recording in recordings[split]] != expected_selected[split]:
+            raise ValueError("smoke replay loaded recording identities differ")
+    fitted = RobustTrainScaler.fit(
+        recordings["train"], allowed_ids=set(expected_selected["train"])
+    )
+    scaler_state = config["scaler_state"]
+    if (
+        list(fitted.training_ids) != scaler_state["training_ids"]
+        or not np.array_equal(fitted.center_, np.asarray(scaler_state["center"], dtype=np.float64))
+        or not np.array_equal(fitted.scale_, np.asarray(scaler_state["scale"], dtype=np.float64))
+    ):
+        raise ValueError("smoke replay fitted scaler differs from sealed scaler")
+    hyper = _mapping(config["hyperparameters"], "smoke replay hyperparameters")
+    prepared = {
+        split: list(
+            islice(
+                iter_teacher_windows(
+                    recordings[split],
+                    fitted,
+                    window_samples=int(hyper["window_samples"]),
+                    stride=int(hyper["stride"]),
+                    seed=int(config["seed"]),
+                    topologies=tuple(hyper["training_topologies"]),
+                    rates=tuple(hyper["training_rates"]),
+                    exhaustive=False,
+                ),
+                int(config["bounds"]["max_windows_per_split"]),
+            )
+        )
+        for split in ("train", "validation")
+    }
+    replayed_window_evidence = {
+        split: [_replayed_window_evidence(window) for window in prepared[split]]
+        for split in ("train", "validation")
+    }
+    if replayed_window_evidence != config["window_evidence"]:
+        raise ValueError("smoke replay window or mask evidence differs from source regeneration")
+    model = OfflineTeacher(
+        31,
+        int(hyper["hidden_size"]),
+        int(hyper["tcn_width"]),
+        tuple(hyper["tcn_dilations"]),
+        residual_mode=str(hyper["residual_mode"]),
+        time_mode=str(hyper["time_mode"]),
+    )
+    try:
+        state = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=True)
+        model.load_state_dict(state, strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("smoke replay cannot reconstruct the frozen teacher checkpoint") from exc
+    _, evaluate_epoch = make_teacher_callbacks(torch.device("cpu"))
+    final_metrics: dict[str, dict[str, float]] = {}
+    for split in ("train", "validation"):
+        loader = DataLoader(
+            prepared[split],
+            batch_size=int(hyper["batch_size"]),
+            shuffle=False,
+            collate_fn=collate_prepared_windows,
+        )
+        measured = evaluate_epoch(model, loader, 0)
+        final_metrics[split] = {"missing_rmse": float(measured["missing_rmse"])}
+    return prepared, final_metrics
+
+
 def _validate_smoke_run(run_dir: Path) -> dict[str, Any]:
     if run_dir.is_symlink():
         raise ValueError("smoke run directory must not be a symlink")
@@ -362,15 +494,39 @@ def _validate_smoke_run(run_dir: Path) -> dict[str, Any]:
         raise ValueError("best.pt SHA-256 does not match checkpoint.json")
     evidence = _mapping(_strict_canonical_json(run_dir / "evidence.json"), "evidence.json")
     expected_evidence = {
-        "schema": "imputation-v3-smoke-evidence-v1",
+        "schema": "imputation-v3-smoke-evidence-v2",
         "run_id": manifest["run_id"],
         "run_manifest_sha256": _sha256(run_dir / "run.json"),
         "history_sha256": _sha256(run_dir / "history.json"),
         "checkpoint_metadata_sha256": _sha256(run_dir / "checkpoint.json"),
         "checkpoint_sha256": actual_checkpoint_hash,
     }
-    if set(evidence) != set(expected_evidence) or dict(evidence) != expected_evidence:
+    if set(evidence) != {
+        *expected_evidence,
+        "final_checkpoint_metrics",
+        "final_checkpoint_metrics_sha256",
+    } or any(
+        evidence.get(name) != value for name, value in expected_evidence.items()
+    ):
         raise ValueError("smoke evidence does not bind the completed artifact set")
+    _, replayed_metrics = _replay_smoke_pipeline(run_dir, manifest)
+    recorded_metrics = _mapping(
+        evidence["final_checkpoint_metrics"], "final checkpoint metrics"
+    )
+    if evidence["final_checkpoint_metrics_sha256"] != hashlib.sha256(
+        canonical_json(recorded_metrics).encode("utf-8")
+    ).hexdigest():
+        raise ValueError("final checkpoint metric digest is inconsistent")
+    if set(recorded_metrics) != {"train", "validation"}:
+        raise ValueError("final checkpoint metrics must contain train and validation")
+    for split in ("train", "validation"):
+        recorded = _mapping(recorded_metrics[split], f"{split} final checkpoint metrics")
+        if set(recorded) != {"missing_rmse"}:
+            raise ValueError("final checkpoint metrics must use the exact replay schema")
+        value = recorded["missing_rmse"]
+        expected = replayed_metrics[split]["missing_rmse"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not math.isclose(float(value), expected, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError("final checkpoint RMSE differs from independent smoke replay")
     return {
         "run_id": manifest["run_id"],
         "config_sha256": manifest["config_sha256"],
@@ -817,6 +973,7 @@ def validate_artifacts(output: Path | str) -> dict[str, Any]:
                 "mask_hashes": True,
                 "checkpoint_hashes": True,
                 "metrics_hashes": True,
+                "history_integrity": True,
                 "artifact_hashes": True,
             },
             "runs": [run],
@@ -842,6 +999,7 @@ def validate_artifacts(output: Path | str) -> dict[str, Any]:
             "mask_hashes": True,
             "checkpoint_hashes": True,
             "metrics_hashes": True,
+            "history_integrity": True,
             "artifact_hashes": True,
         },
         "runs": runs,

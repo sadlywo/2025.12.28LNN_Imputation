@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import csv
 
 import pytest
 import torch
@@ -21,155 +22,77 @@ from imputation_v3.experiments.runner import (
     write_formal_artifacts,
 )
 from imputation_v3.config import TeacherConfig
+from imputation_v3.experiments.training import run_teacher_smoke
 from validation_v2.data.masking import point_missing
 from validation_v2.data.splits import MANIFEST_COLUMNS
 from validation_v2.evaluation.statistics import PER_RECORD_COLUMNS
-from validation_v2.experiments.provenance import canonical_json, collect_provenance
+from validation_v2.experiments.provenance import (
+    canonical_json,
+    run_id as provenance_run_id,
+)
 
 
 def _write_canonical(path: Path, value: object) -> None:
     path.write_bytes((canonical_json(value) + "\n").encode("utf-8"))
 
 
-def _smoke_config(tmp_path: Path) -> tuple[dict, str, str]:
-    source_root = tmp_path / "smoke-sources"
-    source_root.mkdir(exist_ok=True)
-    split_manifest = []
-    for recording_id, split in (
-        ("train-a", "train"),
-        ("train-b", "train"),
-        ("validation-a", "validation"),
-        ("test-a", "test"),
-    ):
-        paths = []
-        for kind in ("imu", "vicon"):
-            path = source_root / f"{recording_id}-{kind}.csv"
-            path.write_bytes(f"{recording_id}:{kind}\n".encode("ascii"))
-            paths.append(path)
-        split_manifest.append(
-            {
-                "recording_id": recording_id,
-                "scenario": "handheld",
-                "imu_path": str(paths[0].resolve()),
-                "vicon_path": str(paths[1].resolve()),
-                "split": split,
-                "imu_sha256": hashlib.sha256(paths[0].read_bytes()).hexdigest(),
-                "vicon_sha256": hashlib.sha256(paths[1].read_bytes()).hexdigest(),
-            }
-        )
-    split_manifest.sort(key=lambda row: row["recording_id"])
-    split_hash = hashlib.sha256(canonical_json(split_manifest).encode("utf-8")).hexdigest()
-    scaler_state = {
-        "center": [0.0] * 6,
-        "scale": [1.0] * 6,
-        "training_ids": ["train-a", "train-b"],
-        "split_hash": split_hash,
-    }
-    scaler_hash = hashlib.sha256(canonical_json(scaler_state).encode("utf-8")).hexdigest()
-    train_ids = ["teacher-window-sha256-" + "1" * 64]
-    validation_ids = ["teacher-window-sha256-" + "2" * 64]
-
-    def window_evidence(window_id: str, recording_id: str) -> dict:
-        mask = struct.pack("<12f", 0.0, *([1.0] * 11))
-        return {
-            "window_id": window_id,
-            "recording_id": recording_id,
-            "topology": "point",
-            "requested_fraction": 0.2,
-            "realized_fraction": 1.0 / 12.0,
-            "mask_sha256": hashlib.sha256(mask).hexdigest(),
-            "mask_bytes_hex": mask.hex(),
-            "mask_dtype": "float32-le",
-            "samples": 2,
-            "channels": 6,
-        }
-
-    config = {
-        "mode": "imputation_v3_teacher_smoke",
-        "selection_split": "validation",
-        "test_evaluation": False,
-        "model": "teacher",
-        "seed": 2026,
-        "device": "cpu",
-        "data_root": "Oxford Dataset",
-        "source_config": {"selection_split": "validation"},
-        "split_seed": 2026,
-        "split_counts": {"train": 2, "validation": 1, "test": 1},
-        "selected_recording_ids": {
-            "train": ["train-a", "train-b"],
-            "validation": ["validation-a"],
-        },
-        "scaler_training_ids": ["train-a", "train-b"],
-        "selected_window_ids": {
-            "train": train_ids,
-            "validation": validation_ids,
-        },
-        "split_manifest": split_manifest,
-        "scaler_state": scaler_state,
-        "window_evidence": {
-            "train": [window_evidence(train_ids[0], "train-a")],
-            "validation": [window_evidence(validation_ids[0], "validation-a")],
-        },
-        "bounds": {"max_recordings_per_split": 2, "max_windows_per_split": 4},
-        "hyperparameters": {
-            "window_samples": 128,
-            "stride": 64,
-            "batch_size": 2,
-            "epochs": 1,
-            "hidden_size": 16,
-            "tcn_width": 16,
-            "tcn_dilations": [1, 2],
-            "learning_rate": 0.001,
-            "training_rates": [0.2],
-            "training_topologies": ["point", "block"],
-            "residual_mode": "residual",
-            "time_mode": "actual",
-        },
-    }
-    return config, split_hash, scaler_hash
-
-
 def _make_smoke_root(tmp_path: Path) -> tuple[Path, Path, dict]:
     root = tmp_path / "smoke"
-    config, split_hash, scaler_hash = _smoke_config(tmp_path)
-    manifest = collect_provenance(
-        config,
-        2026,
-        split_hash=split_hash,
-        scaler_hash=scaler_hash,
-        git_commit="c" * 40,
-        dirty_digest="",
+    data_root = tmp_path / "dataset"
+    scenario = data_root / "handheld-1"
+    scenario.mkdir(parents=True)
+    base_s = 1_496_760_699.22
+    for recording_index in range(1, 5):
+        with (scenario / f"imu{recording_index}.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.writer(handle)
+            for sample in range(12):
+                value = recording_index + sample / 100.0
+                writer.writerow(
+                    [
+                        base_s + sample * 0.01,
+                        0.1, 0.2, 0.3,
+                        value, value + 1, value + 2,
+                        0.0, 0.0, -1.0,
+                        value + 3, value + 4, value + 5,
+                        10.0, 20.0, 30.0,
+                    ]
+                )
+        with (scenario / f"vi{recording_index}.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.writer(handle)
+            for sample in range(12):
+                writer.writerow(
+                    [
+                        int((base_s + sample * 0.01) * 1e9),
+                        sample, 0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0,
+                    ]
+                )
+    config = TeacherConfig(
+        data_root=data_root,
+        output_root=root,
+        selection_split="validation",
+        seeds=(2026,),
+        window_seconds=(0.08,),
+        nominal_dt_s=0.01,
+        batch_size=2,
+        epochs=1,
+        hidden_size=4,
+        tcn_width=4,
+        tcn_dilations=(1,),
+        learning_rate=0.001,
+        training_rates=(0.2,),
+        training_topologies=("point", "block"),
+        models=("linear", "teacher"),
     )
-    run_dir = root / manifest["run_id"]
-    run_dir.mkdir(parents=True)
-    _write_canonical(run_dir / "run.json", manifest)
-    history = [
-        {
-            "epoch": 1,
-            "train": {"missing_rmse": 1.25},
-            "validation": {"missing_rmse": 1.0},
-        }
-    ]
-    _write_canonical(run_dir / "history.json", history)
-    torch.save({"weight": torch.tensor([1.0])}, run_dir / "best.pt")
-    checkpoint_hash = hashlib.sha256((run_dir / "best.pt").read_bytes()).hexdigest()
-    checkpoint = {
-        "run_id": manifest["run_id"],
-        "best_epoch": 1,
-        "selection_split": "validation",
-        "selection_metric": "missing_rmse",
-        "checkpoint_sha256": checkpoint_hash,
-    }
-    _write_canonical(run_dir / "checkpoint.json", checkpoint)
-    evidence = {
-        "schema": "imputation-v3-smoke-evidence-v1",
-        "run_id": manifest["run_id"],
-        "run_manifest_sha256": hashlib.sha256((run_dir / "run.json").read_bytes()).hexdigest(),
-        "history_sha256": hashlib.sha256((run_dir / "history.json").read_bytes()).hexdigest(),
-        "checkpoint_metadata_sha256": hashlib.sha256((run_dir / "checkpoint.json").read_bytes()).hexdigest(),
-        "checkpoint_sha256": checkpoint_hash,
-    }
-    _write_canonical(run_dir / "evidence.json", evidence)
+    repository_root = Path(__file__).resolve().parents[2]
+    report = run_teacher_smoke(
+        config, repository_root=repository_root, requested_device="cpu"
+    )
+    run_dir = Path(report["run_dir"])
+    manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     return root, run_dir, manifest
 
 
@@ -188,6 +111,8 @@ def test_validate_smoke_root_and_direct_run_are_read_only(tmp_path):
     assert root_report["run_ids"] == [manifest["run_id"]]
     assert root_report["checks"]["checkpoint_hashes"] is True
     assert root_report["checks"]["window_identities"] is True
+    assert root_report["checks"]["metrics_hashes"] is True
+    assert root_report["checks"]["history_integrity"] is True
     assert run_report["kind"] == "smoke_run"
     assert run_report["run_ids"] == [manifest["run_id"]]
     after = {
@@ -568,6 +493,73 @@ def _reseal_formal_hash(root: Path, name: str) -> None:
     hashes = json.loads(hashes_path.read_text(encoding="utf-8"))
     hashes[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
     _write_canonical(hashes_path, hashes)
+
+
+def _reseal_smoke_after_config_change(run_dir: Path, config: dict) -> Path:
+    manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    manifest["config"] = config
+    manifest["config_sha256"] = hashlib.sha256(
+        canonical_json(config).encode("utf-8")
+    ).hexdigest()
+    manifest["run_id"] = provenance_run_id(
+        config,
+        manifest["seed"],
+        manifest["split_hash"],
+        manifest["scaler_hash"],
+        manifest["git_commit"],
+        manifest["dirty_state_digest"],
+    )
+    new_dir = run_dir.parent / manifest["run_id"]
+    run_dir.rename(new_dir)
+    _write_canonical(new_dir / "run.json", manifest)
+    checkpoint = json.loads((new_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    checkpoint["run_id"] = manifest["run_id"]
+    _write_canonical(new_dir / "checkpoint.json", checkpoint)
+    evidence = json.loads((new_dir / "evidence.json").read_text(encoding="utf-8"))
+    evidence.update(
+        run_id=manifest["run_id"],
+        run_manifest_sha256=hashlib.sha256((new_dir / "run.json").read_bytes()).hexdigest(),
+        checkpoint_metadata_sha256=hashlib.sha256(
+            (new_dir / "checkpoint.json").read_bytes()
+        ).hexdigest(),
+    )
+    _write_canonical(new_dir / "evidence.json", evidence)
+    return new_dir
+
+
+def test_smoke_mask_cannot_be_forged_with_all_internal_hashes_updated(tmp_path):
+    root, run_dir, _ = _make_smoke_root(tmp_path)
+    manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    config = manifest["config"]
+    row = config["window_evidence"]["train"][0]
+    count = row["samples"] * row["channels"]
+    values = list(
+        struct.unpack(f"<{count}f", bytes.fromhex(row["mask_bytes_hex"]))
+    )
+    missing = values.index(0.0)
+    observed = values.index(1.0)
+    values[missing], values[observed] = values[observed], values[missing]
+    forged = struct.pack(f"<{count}f", *values)
+    row["mask_bytes_hex"] = forged.hex()
+    row["mask_sha256"] = hashlib.sha256(forged).hexdigest()
+    _reseal_smoke_after_config_change(run_dir, config)
+
+    with pytest.raises(ValueError, match="replay|window|mask"):
+        validate_artifacts(root)
+
+
+def test_smoke_rmse_cannot_be_forged_with_all_internal_hashes_updated(tmp_path):
+    root, run_dir, _ = _make_smoke_root(tmp_path)
+    evidence_path = run_dir / "evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["final_checkpoint_metrics"]["validation"]["missing_rmse"] += 1.0
+    evidence["final_checkpoint_metrics_sha256"] = hashlib.sha256(
+        canonical_json(evidence["final_checkpoint_metrics"]).encode("utf-8")
+    ).hexdigest()
+    _write_canonical(evidence_path, evidence)
+
+    with pytest.raises(ValueError, match="RMSE|metric|replay"):
+        validate_artifacts(root)
 
 
 def test_formal_primary_checkpoint_cannot_be_forged_with_internal_rehash(tmp_path):

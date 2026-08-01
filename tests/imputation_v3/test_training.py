@@ -141,7 +141,16 @@ def _write_fake_core_artifacts(run_dir: Path, manifest: dict) -> dict:
     (run_dir / "history.json").write_bytes(
         (canonical_json(history) + "\n").encode("utf-8")
     )
-    (run_dir / "best.pt").write_bytes(b"fake-checkpoint")
+    hyperparameters = manifest["config"]["hyperparameters"]
+    model = OfflineTeacher(
+        31,
+        hyperparameters["hidden_size"],
+        hyperparameters["tcn_width"],
+        tuple(hyperparameters["tcn_dilations"]),
+        residual_mode="residual",
+        time_mode="actual",
+    )
+    torch.save(model.state_dict(), run_dir / "best.pt")
     digest = hashlib.sha256((run_dir / "best.pt").read_bytes()).hexdigest()
     metadata = {
         "run_id": manifest["run_id"],

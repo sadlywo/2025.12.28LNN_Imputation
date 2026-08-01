@@ -20,7 +20,9 @@ Run the same command again; it must validate and resume the same run ID.
 ## Artifact validation
 `.venv-v3\Scripts\python -m imputation_v3.cli validate-artifacts --output results/imputation_v3/formal`
 
-The same command accepts the smoke root at `results/imputation_v3/smoke` or one completed smoke run directory. Validation is read-only and independently recomputes config, split/source, scaler, window, mask, checkpoint, and metric identities from sealed evidence. It fails on incomplete, unexpected, noncanonical, hash-mismatched, symlinked, path-escaping, or provenance-inconsistent artifacts.
+The same command accepts the smoke root at `results/imputation_v3/smoke` or one completed smoke run directory. Smoke validation is read-only and replays the bounded pipeline from the frozen source paths: rediscovery and strict split, source hashes, record loading, train-only scaler fitting, deterministic windows/masks, checkpoint reconstruction, and whole-loader final-checkpoint train/validation RMSE. In a smoke report, `metrics_hashes` means those final-checkpoint metrics were reproduced; `history_integrity` means the non-reproducible training-time history bytes remained sealed. Validation fails on incomplete, unexpected, noncanonical, hash-mismatched, symlinked, path-escaping, replay-divergent, or provenance-inconsistent artifacts.
+
+Source SHA-256 and Git identity bind the validated scope, but they are not an external signature. An actor able to replace all source files, artifacts, and provenance together can construct a new internally consistent run; archive or sign the verification report externally when adversarial authenticity matters.
 
 ## Expected output
 Each smoke run contains `run.json`, `history.json`, `best.pt`, `checkpoint.json`, and `evidence.json`. The formal root additionally seals `resolved_config.json`, `window_identity_ledger.json`, `frozen_models.json`, one content-addressed split manifest and scaler, `per_record_metrics.csv`, `summary.csv`, `mask_ledger.csv`, `coverage_ledger.csv`, `artifact_hashes.json`, and `success_gate.json`.

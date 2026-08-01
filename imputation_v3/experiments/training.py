@@ -87,6 +87,36 @@ def _window_evidence(window: Any) -> dict[str, Any]:
     }
 
 
+def _replayed_checkpoint_metrics(
+    checkpoint_path: Path,
+    config: TeacherConfig,
+    prepared: dict[str, list[Any]],
+) -> dict[str, dict[str, float]]:
+    device = torch.device("cpu")
+    model = OfflineTeacher(
+        31,
+        config.hidden_size,
+        config.tcn_width,
+        config.tcn_dilations,
+        residual_mode="residual",
+        time_mode="actual",
+    ).to(device)
+    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(state, strict=True)
+    _, evaluate_epoch = make_teacher_callbacks(device)
+    metrics: dict[str, dict[str, float]] = {}
+    for split in ("train", "validation"):
+        loader = DataLoader(
+            prepared[split],
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=collate_prepared_windows,
+        )
+        measured = evaluate_epoch(model, loader, 0)
+        metrics[split] = {"missing_rmse": float(measured["missing_rmse"])}
+    return metrics
+
+
 def _device_batch(batch: Any, device: torch.device) -> dict[str, torch.Tensor]:
     values: dict[str, torch.Tensor] = {}
     for name in _BATCH_TENSORS:
@@ -455,13 +485,20 @@ def run_teacher_smoke(
         optimizer=optimizer,
         expected_checkpoint_sha256=expected_checkpoint_sha256,
     )
+    replayed_metrics = _replayed_checkpoint_metrics(
+        run_dir / "best.pt", config, prepared
+    )
     evidence = {
-        "schema": "imputation-v3-smoke-evidence-v1",
+        "schema": "imputation-v3-smoke-evidence-v2",
         "run_id": manifest["run_id"],
         "run_manifest_sha256": _sha256_path(run_dir / "run.json"),
         "history_sha256": _sha256_path(run_dir / "history.json"),
         "checkpoint_metadata_sha256": _sha256_path(run_dir / "checkpoint.json"),
         "checkpoint_sha256": _sha256_path(run_dir / "best.pt"),
+        "final_checkpoint_metrics": replayed_metrics,
+        "final_checkpoint_metrics_sha256": hashlib.sha256(
+            canonical_json(replayed_metrics).encode("utf-8")
+        ).hexdigest(),
     }
     _write_stable(
         run_dir / "evidence.json",
