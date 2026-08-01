@@ -10,6 +10,10 @@ import sys
 import yaml
 
 from imputation_v3.config import load_teacher_config
+from imputation_v3.experiments.runner import (
+    FORMAL_SEEDS,
+    formal_matrix_plan,
+)
 from imputation_v3.experiments.training import run_teacher_smoke
 from validation_v2.experiments.provenance import canonical_json
 
@@ -33,6 +37,11 @@ def _parser() -> argparse.ArgumentParser:
     teacher.add_argument("--smoke", action="store_true")
     teacher.add_argument("--device", choices=("auto", "cpu", "cuda"), required=True)
     teacher.add_argument("--output-root", type=Path)
+    matrix = subcommands.add_parser("teacher-matrix")
+    matrix.add_argument("--config", required=True)
+    matrix.add_argument("--dry-run", action="store_true")
+    matrix.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    matrix.add_argument("--output-root", type=Path)
     return parser
 
 
@@ -53,7 +62,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(canonical_json(report))
             return 0
-    except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
+        if arguments.command == "teacher-matrix":
+            config = load_teacher_config(_config_path(arguments.config))
+            plan = formal_matrix_plan(config)
+            if arguments.dry_run:
+                print(canonical_json(plan))
+                return 0
+            if config.seeds != FORMAL_SEEDS:
+                raise ValueError(
+                    "formal teacher-matrix execution requires seeds 2026 through 2030"
+                )
+            if any(name in config.models for name in ("brits", "saits", "csdi")):
+                try:
+                    __import__("pypots.imputation")
+                except ModuleNotFoundError as exc:
+                    raise ModuleNotFoundError(
+                        "formal PyPOTS baselines require pypots==1.5.0 from "
+                        "requirements-imputation-v3-baselines.txt"
+                    ) from exc
+            raise RuntimeError(
+                "formal matrix prerequisites passed, but no concrete FormalBackend "
+                "was supplied; no training, test access, or result artifacts occurred"
+            )
+    except (ModuleNotFoundError, OSError, RuntimeError, TypeError, ValueError, yaml.YAMLError) as error:
         print(f"imputation-v3: {error}", file=sys.stderr)
         return 2
     raise AssertionError(f"unhandled command: {arguments.command}")
