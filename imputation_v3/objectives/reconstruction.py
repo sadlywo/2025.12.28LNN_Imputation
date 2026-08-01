@@ -66,13 +66,14 @@ def channel_balanced_missing_mse(
     zeros = torch.zeros((), dtype=accumulation_dtype, device=prediction.device)
     safe_error = torch.where(missing, prediction_acc - target_acc, zeros)
 
-    safe_counts = counts.clamp_min(1).to(dtype=accumulation_dtype)
-    normalized_error = safe_error / safe_counts.sqrt()
+    valid_channel_count = represented.sum()
+    safe_normalizers = (counts.clamp_min(1) * valid_channel_count).to(
+        dtype=accumulation_dtype
+    )
+    normalized_error = safe_error / safe_normalizers.sqrt()
     squared_error = normalized_error.square()
-    selected_error = torch.where(missing, squared_error, zeros).reshape(-1, 6)
-    channel_means = selected_error.sum(dim=0)[represented]
-    valid_channel_count = represented.sum().to(dtype=accumulation_dtype)
-    loss = (channel_means / valid_channel_count).sum().to(dtype=prediction.dtype)
+    selected_error = torch.where(missing, squared_error, zeros)
+    loss = selected_error.sum().to(dtype=prediction.dtype)
     if not torch.isfinite(loss).item():
         raise ValueError("channel-balanced missing MSE must be finite")
     return loss

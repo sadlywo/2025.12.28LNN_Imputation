@@ -65,6 +65,24 @@ def test_float32_channel_average_does_not_overflow_before_division():
     torch.testing.assert_close(loss, torch.tensor(1e38), rtol=2e-6, atol=0)
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    ((2e19, 4e38 / 6), (4e19, 16e38 / 6)),
+)
+def test_float32_scales_by_valid_channels_before_squaring(error, expected):
+    prediction = torch.zeros(1, 6, dtype=torch.float32)
+    prediction[0, 0] = error
+    target = torch.zeros_like(prediction)
+    mask = torch.zeros_like(prediction, dtype=torch.bool)
+
+    loss = channel_balanced_missing_mse(prediction, target, mask)
+
+    assert torch.isfinite(loss)
+    torch.testing.assert_close(
+        loss, torch.tensor(expected, dtype=torch.float32), rtol=3e-6, atol=0
+    )
+
+
 def test_stable_scaling_has_finite_gradients_and_exact_observed_zeros():
     prediction = torch.full(
         (1_000, 6), 100.0, dtype=torch.float16, requires_grad=True
