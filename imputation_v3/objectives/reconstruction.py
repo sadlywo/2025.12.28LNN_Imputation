@@ -1,0 +1,70 @@
+"""Primary missing-only reconstruction objective."""
+
+from __future__ import annotations
+
+import torch
+
+
+def channel_balanced_missing_mse(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Average missing-only MSE equally across represented sensor channels."""
+    for name, value in (
+        ("prediction", prediction),
+        ("target", target),
+        ("mask", mask),
+    ):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a torch tensor")
+
+    if not prediction.is_floating_point() or not target.is_floating_point():
+        raise TypeError("prediction and target must be floating point")
+    if prediction.ndim == 0 or prediction.shape[-1] != 6:
+        raise ValueError("prediction final dimension must be 6")
+    if prediction.numel() == 0:
+        raise ValueError("prediction, target, and mask must be nonempty")
+    if target.shape != prediction.shape:
+        raise ValueError("target shape must match prediction shape")
+    if mask.shape != prediction.shape:
+        raise ValueError("mask shape must match prediction shape")
+    if target.dtype != prediction.dtype:
+        raise TypeError("target must have the same dtype as prediction")
+    if target.device != prediction.device:
+        raise ValueError("target must be on the same device as prediction")
+    if mask.device != prediction.device:
+        raise ValueError("mask must be on the same device as prediction")
+    if mask.dtype != torch.bool and (
+        not mask.is_floating_point() or mask.dtype != prediction.dtype
+    ):
+        raise TypeError(
+            "mask must be bool or have the same floating dtype as prediction"
+        )
+    if not torch.all((mask == 0) | (mask == 1)).item():
+        raise ValueError("mask must contain exact binary 0 or 1 values")
+
+    missing = mask == 0
+    flat_missing = missing.reshape(-1, 6)
+    counts = flat_missing.sum(dim=0)
+    represented = counts > 0
+    if not represented.any().item():
+        raise ValueError("loss requires at least one missing value")
+
+    if not torch.isfinite(prediction[missing]).all().item() or not torch.isfinite(
+        target[missing]
+    ).all().item():
+        raise ValueError("prediction and target values used by the loss must be finite")
+
+    zeros = torch.zeros((), dtype=prediction.dtype, device=prediction.device)
+    safe_error = torch.where(missing, prediction - target, zeros)
+    squared_error = safe_error.square()
+    selected_error = torch.where(missing, squared_error, zeros).reshape(-1, 6)
+    channel_sums = selected_error.sum(dim=0)
+    channel_means = channel_sums[represented] / counts[represented].to(
+        prediction.dtype
+    )
+    return channel_means.mean()
+
+
+__all__ = ["channel_balanced_missing_mse"]
