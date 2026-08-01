@@ -116,7 +116,7 @@ class BidirectionalCfCEncoder(nn.Module):
             raise TypeError("cfc_factory must be callable or None")
 
         self._uses_default_cfc = cfc_factory is None
-        factory = cfc_factory or _default_cfc_factory
+        factory = _default_cfc_factory if cfc_factory is None else cfc_factory
         options = {"batch_first": True, "return_sequences": True}
         forward_cfc = factory(self.input_size, self.hidden_size, **options)
         if not isinstance(forward_cfc, nn.Module):

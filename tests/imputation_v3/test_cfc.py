@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch import nn
 
+import imputation_v3.models.cfc as cfc_module
 from imputation_v3.models.cfc import BidirectionalCfCEncoder, reverse_aligned_dt
 from validation_v2.experiments.runner import reverse_aligned_dt as reverse_aligned_dt_v2
 
@@ -34,6 +35,11 @@ class SpyFactory:
         module = SpyCfC(hidden_size, len(self.modules), self.output_factory)
         self.modules.append(module)
         return module
+
+
+class FalseySpyFactory(SpyFactory):
+    def __bool__(self):
+        return False
 
 
 def make_inputs(batch=2, time=4, input_size=31):
@@ -194,6 +200,17 @@ def test_constructor_rejects_invalid_hidden_size(hidden_size):
 def test_constructor_rejects_noncallable_factory(factory):
     with pytest.raises(TypeError, match="cfc_factory"):
         BidirectionalCfCEncoder(31, 4, cfc_factory=factory)
+
+
+def test_constructor_uses_a_callable_factory_even_when_it_is_falsey(monkeypatch):
+    supplied_factory = FalseySpyFactory()
+    default_factory = SpyFactory()
+    monkeypatch.setattr(cfc_module, "_default_cfc_factory", default_factory)
+
+    model = BidirectionalCfCEncoder(31, 4, cfc_factory=supplied_factory)
+
+    assert supplied_factory.modules == [model.forward_cfc, model.reverse_cfc]
+    assert len(default_factory.modules) == 0
 
 
 @pytest.mark.parametrize("bad_direction", (0, 1))
