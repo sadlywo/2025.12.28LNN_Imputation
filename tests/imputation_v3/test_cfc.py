@@ -68,9 +68,11 @@ def test_actual_mode_passes_direction_aligned_elapsed_time_and_bidirectional_sha
     ]
     forward_features, forward_timespans = factory.modules[0].calls[0]
     reverse_features, reverse_timespans = factory.modules[1].calls[0]
-    torch.testing.assert_close(forward_features, features)
+    expected_features = features.clone()
+    expected_features[..., 12] = dt
+    torch.testing.assert_close(forward_features, expected_features)
     torch.testing.assert_close(forward_timespans, dt)
-    torch.testing.assert_close(reverse_features, features.flip(1))
+    torch.testing.assert_close(reverse_features, expected_features.flip(1))
     torch.testing.assert_close(reverse_timespans, reverse_aligned_dt(dt))
 
 
@@ -96,7 +98,9 @@ def test_time_modes_control_only_direct_dt_feature_and_cfc_timespans(
     model(features, dt, mode=mode, nominal_dt_s=nominal)
 
     expected_features = features.clone()
-    if dt_feature == "nominal":
+    if dt_feature == "actual":
+        expected_features[..., 12] = dt
+    elif dt_feature == "nominal":
         expected_features[..., 12] = nominal
     elif dt_feature == "zero":
         expected_features[..., 12] = 0
@@ -163,6 +167,22 @@ def test_reverse_alignment_matches_declared_exact_values_and_validation_v2():
     torch.testing.assert_close(actual, reverse_aligned_dt_v2(dt))
 
 
+def test_forward_uses_internal_reverse_alignment_after_validating_dt(monkeypatch):
+    def fail_if_called(dt):
+        del dt
+        raise AssertionError("forward must not repeat public-helper validation")
+
+    monkeypatch.setattr(cfc_module, "reverse_aligned_dt", fail_if_called)
+    factory = SpyFactory()
+    model = BidirectionalCfCEncoder(31, 3, cfc_factory=factory)
+    features, dt = make_inputs(batch=1)
+
+    model(features, dt, mode="actual")
+
+    expected = torch.cat((dt[:, -1:], dt[:, 1:].flip(1)), dim=1)
+    torch.testing.assert_close(factory.modules[1].calls[0][1], expected)
+
+
 @pytest.mark.parametrize(
     ("dt", "error", "message"),
     (
@@ -196,6 +216,27 @@ def test_constructor_rejects_invalid_hidden_size(hidden_size):
         BidirectionalCfCEncoder(31, hidden_size, cfc_factory=SpyFactory())
 
 
+def test_default_ncps_rejects_hidden_size_one_before_construction(monkeypatch):
+    default_factory = SpyFactory()
+    monkeypatch.setattr(cfc_module, "_default_cfc_factory", default_factory)
+
+    with pytest.raises(ValueError, match="ncps 1.0.1.*hidden_size.*at least 2"):
+        BidirectionalCfCEncoder(31, 1)
+
+    assert len(default_factory.modules) == 0
+
+
+def test_custom_factory_supports_hidden_size_one_for_nontrivial_batches():
+    factory = SpyFactory()
+    model = BidirectionalCfCEncoder(31, 1, cfc_factory=factory)
+    features, dt = make_inputs(batch=2, time=4)
+
+    output = model(features, dt, mode="actual")
+
+    assert output.shape == (2, 4, 2)
+    assert factory.modules == [model.forward_cfc, model.reverse_cfc]
+
+
 @pytest.mark.parametrize("factory", (False, 1, "factory", object()))
 def test_constructor_rejects_noncallable_factory(factory):
     with pytest.raises(TypeError, match="cfc_factory"):
@@ -221,6 +262,15 @@ def test_constructor_rejects_non_module_factory_results(bad_direction):
 
     with pytest.raises(TypeError, match="nn.Module"):
         BidirectionalCfCEncoder(31, 4, cfc_factory=lambda *args, **kwargs: next(calls))
+
+
+def test_constructor_rejects_a_factory_that_ties_directional_modules():
+    shared_module = SpyCfC(4, 0)
+
+    with pytest.raises(ValueError, match="distinct nn.Module instances"):
+        BidirectionalCfCEncoder(
+            31, 4, cfc_factory=lambda *args, **kwargs: shared_module
+        )
 
 
 @pytest.mark.parametrize(
@@ -311,6 +361,9 @@ def test_all_modes_validate_nominal_dt(nominal_dt_s, mode):
         (("not a tensor", None), TypeError, "tensor"),
         ("not a tensor", TypeError, "tensor"),
         (torch.ones(1, 3, 3), ValueError, "shape"),
+        (torch.ones(1, 4, 3, dtype=torch.int64), TypeError, "floating"),
+        (torch.ones(1, 4, 3, dtype=torch.bool), TypeError, "floating"),
+        (torch.ones(1, 4, 3, dtype=torch.float64), TypeError, "dtype"),
         (torch.full((1, 4, 3), math.nan), ValueError, "finite"),
         (torch.full((1, 4, 3), math.inf), ValueError, "finite"),
     ),
@@ -324,6 +377,27 @@ def test_malformed_cfc_outputs_raise_deterministic_errors(bad_result, error, mes
     features, dt = make_inputs(batch=1)
 
     with pytest.raises(error, match=message):
+        model(features, dt, mode="actual")
+
+
+def test_cfc_output_must_be_on_the_input_device_when_cuda_is_available():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+
+    def wrong_device_factory(module, features, timespans):
+        del timespans
+        return torch.ones(
+            (*features.shape[:2], module.hidden_size),
+            dtype=features.dtype,
+            device="cuda",
+        )
+
+    model = BidirectionalCfCEncoder(
+        31, 3, cfc_factory=SpyFactory(wrong_device_factory)
+    )
+    features, dt = make_inputs(batch=1)
+
+    with pytest.raises(ValueError, match="device"):
         model(features, dt, mode="actual")
 
 
@@ -375,9 +449,12 @@ def test_default_ncps_cfc_smoke_has_finite_nonzero_input_and_parameter_gradients
     assert features.grad is not None
     assert torch.isfinite(features.grad).all()
     assert features.grad.abs().sum() > 0
-    parameter_gradients = [
-        parameter.grad for parameter in model.parameters() if parameter.grad is not None
-    ]
-    assert parameter_gradients
-    assert all(torch.isfinite(gradient).all() for gradient in parameter_gradients)
-    assert sum(gradient.abs().sum() for gradient in parameter_gradients) > 0
+    for direction in (model.forward_cfc, model.reverse_cfc):
+        parameter_gradients = [
+            parameter.grad
+            for parameter in direction.parameters()
+            if parameter.grad is not None
+        ]
+        assert parameter_gradients
+        assert all(torch.isfinite(gradient).all() for gradient in parameter_gradients)
+        assert sum(gradient.abs().sum() for gradient in parameter_gradients) > 0

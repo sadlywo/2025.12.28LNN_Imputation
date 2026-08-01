@@ -46,9 +46,13 @@ def _validate_nominal_dt(value: object) -> float:
 def reverse_aligned_dt(dt: torch.Tensor) -> torch.Tensor:
     """Align positive elapsed intervals with a reversed ``(B, T)`` sequence.
 
-    The first reversed sample reuses the final forward interval because there is
-    no interval beyond the original sequence endpoint. For ``T >= 2`` this is
-    ``cat(dt[:, -1:], dt[:, 1:].flip(1))``; a singleton sequence is unchanged.
+    ``dt[:, 0]`` is the forward sequence's initial placeholder rather than an
+    elapsed interval between two in-window samples, so it is discarded when a
+    multi-step sequence is reversed. The reversed initial placeholder reuses
+    the final forward interval because no interval exists beyond the original
+    endpoint. For ``T >= 2`` this is
+    ``cat(dt[:, -1:], dt[:, 1:].flip(1))``. For ``T == 1``, the sole initial
+    placeholder is retained because there is no in-window interval to realign.
     """
 
     if not isinstance(dt, torch.Tensor):
@@ -61,10 +65,14 @@ def reverse_aligned_dt(dt: torch.Tensor) -> torch.Tensor:
         raise ValueError("dt time axis must be nonempty")
     if not dt.is_floating_point():
         raise TypeError("dt must be floating point")
-    if not torch.isfinite(dt).all():
-        raise ValueError("dt must be finite")
-    if not torch.all(dt > 0):
-        raise ValueError("dt must be strictly positive")
+    if not torch.all(torch.isfinite(dt) & (dt > 0)):
+        raise ValueError("dt must be finite and strictly positive")
+    return _reverse_aligned_dt_unchecked(dt)
+
+
+def _reverse_aligned_dt_unchecked(dt: torch.Tensor) -> torch.Tensor:
+    """Realign an already validated, nonempty ``(B, T)`` interval tensor."""
+
     if dt.shape[1] == 1:
         return dt.clone()
     return torch.cat((dt[:, -1:], dt[:, 1:].flip(1)), dim=1)
@@ -76,6 +84,8 @@ def _sequence_output(
     batch_size: int,
     time_steps: int,
     hidden_size: int,
+    expected_dtype: torch.dtype,
+    expected_device: torch.device,
 ) -> torch.Tensor:
     if isinstance(result, tuple):
         if len(result) != 2:
@@ -83,9 +93,15 @@ def _sequence_output(
         result = result[0]
     if not isinstance(result, torch.Tensor):
         raise TypeError("CfC must return a tensor or (tensor, hidden_state)")
+    if not result.is_floating_point():
+        raise TypeError("CfC output must be floating point")
     expected_shape = (batch_size, time_steps, hidden_size)
     if result.shape != expected_shape:
         raise ValueError(f"CfC output must have shape {expected_shape}")
+    if result.dtype != expected_dtype:
+        raise TypeError(f"CfC output must have input dtype {expected_dtype}")
+    if result.device != expected_device:
+        raise ValueError(f"CfC output must be on input device {expected_device}")
     if not torch.isfinite(result).all():
         raise ValueError("CfC output must be finite")
     return result
@@ -114,6 +130,11 @@ class BidirectionalCfCEncoder(nn.Module):
         self.hidden_size = _validate_positive_integer("hidden_size", hidden_size)
         if cfc_factory is not None and not callable(cfc_factory):
             raise TypeError("cfc_factory must be callable or None")
+        if cfc_factory is None and self.hidden_size < 2:
+            raise ValueError(
+                "ncps 1.0.1 squeeze limitation requires default CfC hidden_size "
+                "to be at least 2"
+            )
 
         self._uses_default_cfc = cfc_factory is None
         factory = _default_cfc_factory if cfc_factory is None else cfc_factory
@@ -124,6 +145,8 @@ class BidirectionalCfCEncoder(nn.Module):
         reverse_cfc = factory(self.input_size, self.hidden_size, **options)
         if not isinstance(reverse_cfc, nn.Module):
             raise TypeError("cfc_factory must construct an nn.Module")
+        if reverse_cfc is forward_cfc:
+            raise ValueError("cfc_factory must return distinct nn.Module instances")
         self.forward_cfc = forward_cfc
         self.reverse_cfc = reverse_cfc
 
@@ -144,6 +167,8 @@ class BidirectionalCfCEncoder(nn.Module):
             batch_size=features.shape[0],
             time_steps=features.shape[1],
             hidden_size=self.hidden_size,
+            expected_dtype=features.dtype,
+            expected_device=features.device,
         )
 
     def forward(
@@ -179,10 +204,8 @@ class BidirectionalCfCEncoder(nn.Module):
             raise TypeError("dt must have the same dtype as features")
         if dt.device != features.device:
             raise ValueError("dt must be on the same device as features")
-        if not torch.isfinite(dt).all():
-            raise ValueError("dt must be finite")
-        if not torch.all(dt > 0):
-            raise ValueError("dt must be strictly positive")
+        if not torch.all(torch.isfinite(dt) & (dt > 0)):
+            raise ValueError("dt must be finite and strictly positive")
 
         if not isinstance(mode, str) or mode not in _TIME_MODES:
             declared = ", ".join(sorted(_TIME_MODES))
@@ -191,19 +214,20 @@ class BidirectionalCfCEncoder(nn.Module):
 
         encoded_features = features.clone()
         actual_dt = dt.clone()
-        constant_dt = torch.full_like(actual_dt, nominal)
-        if not torch.isfinite(constant_dt).all() or not torch.all(constant_dt > 0):
-            raise ValueError("nominal_dt_s is not representable in the input dtype")
-
-        if mode == "constant":
+        if mode in {"actual", "dt_feature_only"}:
+            encoded_features[..., _DT_FEATURE_INDEX] = actual_dt
+        elif mode == "constant":
             encoded_features[..., _DT_FEATURE_INDEX] = nominal
-        elif mode == "no_dt":
+        else:
             encoded_features[..., _DT_FEATURE_INDEX] = 0
 
         if mode == "actual":
             forward_dt = actual_dt
-            reverse_dt = reverse_aligned_dt(actual_dt)
+            reverse_dt = _reverse_aligned_dt_unchecked(actual_dt)
         else:
+            constant_dt = torch.full_like(actual_dt, nominal)
+            if not torch.all(torch.isfinite(constant_dt) & (constant_dt > 0)):
+                raise ValueError("nominal_dt_s is not representable in the input dtype")
             forward_dt = constant_dt
             reverse_dt = constant_dt.clone()
 
