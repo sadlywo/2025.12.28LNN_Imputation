@@ -591,6 +591,110 @@ def test_rts_full_record_prediction_uses_frozen_selected_variances(monkeypatch):
         assert kwargs["empty_fill"] == 0.0
 
 
+def test_classical_loader_reconstructs_rts_parameters_from_frozen_checkpoint(tmp_path):
+    descriptor = {
+        "kind": "classical",
+        "condition": "rts",
+        "seed": 2026,
+        "context_samples": 128,
+        "capacity": {"process_var": 1e-4},
+        "process_var": 1e-4,
+        "observation_var": 0.321,
+    }
+    frozen = (runner_module.canonical_json(descriptor) + "\n").encode("utf-8")
+    checkpoint = tmp_path / "rts.json"
+    checkpoint.write_bytes(frozen)
+    candidate = runner_module._Candidate(
+        seed=2026,
+        model_alias="rts",
+        condition="rts",
+        context_samples=128,
+        validation_rmse=1.0,
+        checkpoint_sha256=hashlib.sha256(frozen).hexdigest(),
+        checkpoint_path=checkpoint,
+        capacity={"process_var": 1e-4},
+        inference_config={"process_var": 999.0, "observation_var": 888.0},
+    )
+    backend = object.__new__(OXIODFormalBackend)
+
+    predictor = backend._load_candidate_predictor(candidate)
+
+    assert predictor == {"process_var": 1e-4, "observation_var": 0.321}
+
+
+@pytest.mark.parametrize("condition", ("locf", "linear", "pchip"))
+def test_classical_loader_reconstructs_parameter_free_predictors_from_checkpoint(
+    condition, tmp_path
+):
+    descriptor = {
+        "kind": "classical",
+        "condition": condition,
+        "seed": 2026,
+        "context_samples": 128,
+        "capacity": {"capacity": "fixed"},
+    }
+    frozen = (runner_module.canonical_json(descriptor) + "\n").encode("utf-8")
+    checkpoint = tmp_path / f"{condition}.json"
+    checkpoint.write_bytes(frozen)
+    candidate = runner_module._Candidate(
+        seed=2026,
+        model_alias=condition,
+        condition=condition,
+        context_samples=128,
+        validation_rmse=1.0,
+        checkpoint_sha256=hashlib.sha256(frozen).hexdigest(),
+        checkpoint_path=checkpoint,
+        capacity={"capacity": "fixed"},
+        inference_config={"mutable": "must-not-survive"},
+    )
+    backend = object.__new__(OXIODFormalBackend)
+
+    assert backend._load_candidate_predictor(candidate) == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "changed", "message"),
+    (
+        ("kind", "native", "kind"),
+        ("condition", "linear", "condition"),
+        ("seed", 2027, "seed"),
+        ("context_samples", 256, "context"),
+        ("capacity", {"process_var": 1e-3}, "capacity"),
+    ),
+)
+def test_classical_loader_rejects_descriptor_identity_mismatch(
+    field, changed, message, tmp_path
+):
+    descriptor = {
+        "kind": "classical",
+        "condition": "rts",
+        "seed": 2026,
+        "context_samples": 128,
+        "capacity": {"process_var": 1e-4},
+        "process_var": 1e-4,
+        "observation_var": 0.321,
+    }
+    descriptor[field] = changed
+    frozen = (runner_module.canonical_json(descriptor) + "\n").encode("utf-8")
+    checkpoint = tmp_path / f"mismatch-{field}.json"
+    checkpoint.write_bytes(frozen)
+    candidate = runner_module._Candidate(
+        seed=2026,
+        model_alias="rts",
+        condition="rts",
+        context_samples=128,
+        validation_rmse=1.0,
+        checkpoint_sha256=hashlib.sha256(frozen).hexdigest(),
+        checkpoint_path=checkpoint,
+        capacity={"process_var": 1e-4},
+        inference_config={"process_var": 999.0, "observation_var": 888.0},
+    )
+    backend = object.__new__(OXIODFormalBackend)
+
+    with pytest.raises(ValueError, match=message):
+        backend._load_candidate_predictor(candidate)
+
+
 def test_capacity_candidates_are_inner_selection_not_matrix_multiplication():
     config = load_teacher_config(ROOT / "configs/imputation_v3/teacher_full.yaml")
     candidates = capacity_candidates("teacher_actual_residual", config)
@@ -1125,6 +1229,16 @@ def test_concrete_backend_rehashes_deferred_test_sources_before_parsing(tmp_path
     assert rts["validation_rmse"] == min(
         item["validation_rmse"] for item in rts["validation_scores"]
     )
+    selected_rts = selected[(2026, "rts")]
+    selected_rts.inference_config = {
+        "process_var": 999.0,
+        "observation_var": 888.0,
+    }
+    predictor = backend._load_candidate_predictor(selected_rts)
+    assert predictor == {
+        "process_var": selected_rts.capacity["process_var"],
+        "observation_var": assets.rts_observation_var,
+    }
     Path(manifest.loc[manifest.split == "test", "imu_path"].item()).write_text(
         "tampered", encoding="utf-8"
     )

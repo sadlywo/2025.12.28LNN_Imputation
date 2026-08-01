@@ -1458,11 +1458,13 @@ class OXIODFormalBackend:
             )
             if candidate.condition == "rts":
                 selected_descriptor = {
-                    "kind": "rts_selected",
+                    "kind": "classical",
+                    "condition": candidate.condition,
                     "seed": candidate.seed,
+                    "context_samples": candidate.context_samples,
+                    "capacity": dict(candidate.capacity or {}),
                     "selection_split": "validation",
-                    "selected_context_samples": candidate.context_samples,
-                    "selected_process_var": candidate.capacity["process_var"],
+                    "process_var": candidate.capacity["process_var"],
                     "observation_var": windows.assets.rts_observation_var,
                     "validation_scores": list(candidate.validation_scores),
                     "split_hash": windows.assets.split_hash,
@@ -1628,8 +1630,42 @@ class OXIODFormalBackend:
             label=f"{candidate.condition} checkpoint",
         )
         if candidate.condition in _CLASSICAL_MODELS:
-            json.loads(frozen_bytes.decode("utf-8"))
-            return dict(candidate.inference_config or {})
+            descriptor = json.loads(frozen_bytes.decode("utf-8"))
+            if not isinstance(descriptor, dict) or descriptor.get("kind") != "classical":
+                raise ValueError("frozen classical checkpoint kind changed")
+            if descriptor.get("condition") != candidate.condition:
+                raise ValueError("frozen classical checkpoint condition changed")
+            if (
+                type(descriptor.get("seed")) is not int
+                or descriptor["seed"] != candidate.seed
+            ):
+                raise ValueError("frozen classical checkpoint seed changed")
+            if (
+                type(descriptor.get("context_samples")) is not int
+                or descriptor["context_samples"] != candidate.context_samples
+            ):
+                raise ValueError("frozen classical checkpoint context changed")
+            if (
+                not isinstance(descriptor.get("capacity"), dict)
+                or descriptor["capacity"] != candidate.capacity
+            ):
+                raise ValueError("frozen classical checkpoint capacity changed")
+            if candidate.condition != "rts":
+                return {}
+            predictor = {}
+            for name in ("process_var", "observation_var"):
+                value = descriptor.get(name)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, Real)
+                    or not math.isfinite(float(value))
+                    or float(value) <= 0
+                ):
+                    raise ValueError(f"frozen RTS {name} must be finite and positive")
+                predictor[name] = float(value)
+            if predictor["process_var"] != descriptor["capacity"].get("process_var"):
+                raise ValueError("frozen RTS process variance does not match capacity")
+            return predictor
         if candidate.condition in _PYPOTS_MODELS:
             actual_version = installed_pypots_version()
             if (
