@@ -1,0 +1,15 @@
+data_root: Oxford Dataset
+output_root: results/imputation_v3/formal
+selection_split: validation
+seeds: [2026, 2027, 2028, 2029, 2030]
+window_seconds: [1.28, 2.56, 5.12]
+nominal_dt_s: 0.01
+batch_size: 64
+epochs: 100
+hidden_size: 64
+tcn_width: 48
+tcn_dilations: [1, 2, 4, 8, 16]
+learning_rate: 0.001
+training_rates: [0.1, 0.2, 0.3, 0.4]
+training_topologies: [point, block, channel]
+models: [locf, linear, pchip, rts, bilstm, bilnn, tcn, feature_mlp, teacher, brits, saits, csdi]

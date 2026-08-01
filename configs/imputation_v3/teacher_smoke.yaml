@@ -1,0 +1,15 @@
+data_root: Oxford Dataset
+output_root: results/imputation_v3/smoke
+selection_split: validation
+seeds: [2026]
+window_seconds: [1.28]
+nominal_dt_s: 0.01
+batch_size: 2
+epochs: 1
+hidden_size: 16
+tcn_width: 16
+tcn_dilations: [1, 2]
+learning_rate: 0.001
+training_rates: [0.2]
+training_topologies: [point, block]
+models: [linear, teacher]
