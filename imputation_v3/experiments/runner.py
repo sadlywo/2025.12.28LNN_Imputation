@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import random
+import tempfile
 from types import SimpleNamespace
 from typing import Any, Final, Protocol
 
@@ -48,6 +49,7 @@ from validation_v2.data.normalization import RobustTrainScaler
 from validation_v2.data.oxiod import load_recording
 from validation_v2.data.splits import MANIFEST_COLUMNS, stratified_file_split
 from validation_v2.evaluation.statistics import (
+    GROUP_COLUMNS,
     PER_RECORD_COLUMNS,
     paired_model_summary,
     validate_per_record_metrics,
@@ -59,6 +61,7 @@ from validation_v2.experiments.train import train_one_run
 
 
 FORMAL_SEEDS: Final[tuple[int, ...]] = (2026, 2027, 2028, 2029, 2030)
+RTS_PROCESS_VARIANCES: Final[tuple[float, ...]] = (1e-4, 1e-3, 1e-2, 1e-1, 1.0)
 _CLASSICAL_MODELS = ("locf", "linear", "pchip", "rts")
 _PYPOTS_MODELS = ("brits", "saits", "csdi")
 _FEATURE_MLP_WIDTHS = (32, 48, 64, 96, 128, 192)
@@ -72,6 +75,147 @@ _GATE_KEYS = (
 )
 
 
+def capacity_candidates(condition: str, config: TeacherConfig) -> list[dict[str, Any]]:
+    """Return condition-appropriate inner validation-selection capacities."""
+    config = _require_config(config)
+    if condition in _CLASSICAL_MODELS or condition in _PYPOTS_MODELS:
+        if condition == "rts":
+            return [{"process_var": value} for value in RTS_PROCESS_VARIANCES]
+        return [{"capacity": "fixed"}]
+    if condition in {"bilstm", "bilnn"}:
+        values = sorted({max(4, config.hidden_size // 2), config.hidden_size})
+        return [{"hidden_size": value} for value in values]
+    if condition == "tcn":
+        values = sorted({max(4, config.tcn_width // 2), config.tcn_width})
+        return [{"tcn_width": value} for value in values]
+    if condition == "feature_mlp":
+        return [{"mlp_width": value} for value in _FEATURE_MLP_WIDTHS]
+    if condition in TEACHER_CONDITION_MODES:
+        pairs = {
+            (max(4, config.hidden_size // 2), max(4, config.tcn_width // 2)),
+            (config.hidden_size, config.tcn_width),
+        }
+        return [
+            {"hidden_size": hidden, "tcn_width": width}
+            for hidden, width in sorted(pairs)
+        ]
+    raise ValueError(f"unsupported capacity condition: {condition}")
+
+
+def estimate_rts_observation_variance(
+    train_recordings: Sequence[Any], scaler: RobustTrainScaler | None = None
+) -> float:
+    """Estimate normalized observation noise from training residuals only."""
+    if not train_recordings:
+        raise ValueError("RTS observation variance requires training recordings")
+    residuals = []
+    for recording in train_recordings:
+        values = np.asarray(recording.imu_six, dtype=np.float64)
+        if scaler is not None:
+            values = scaler.transform(values)
+        if values.ndim != 2 or values.shape[0] < 3 or values.shape[1] != 6:
+            raise ValueError("RTS training recordings require at least three six-axis rows")
+        if not np.isfinite(values).all():
+            raise ValueError("RTS training values must be finite")
+        residuals.append(np.diff(values, n=2, axis=0) / math.sqrt(6.0))
+    joined = np.concatenate(residuals, axis=0)
+    estimate = max(float(np.mean(np.square(joined))), 1e-8)
+    if not math.isfinite(estimate):
+        raise ValueError("RTS observation variance must be finite")
+    return estimate
+
+
+def _pypots_state_target(adapter: Any) -> torch.nn.Module:
+    outer = getattr(adapter, "model", None)
+    inner = getattr(outer, "model", None)
+    target = inner if isinstance(inner, torch.nn.Module) else outer
+    if not isinstance(target, torch.nn.Module):
+        raise TypeError("PyPOTS predictor must expose its actual inner nn.Module")
+    return target
+
+
+def _cpu_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: value.detach().to(device="cpu").clone()
+        for name, value in module.state_dict().items()
+    }
+
+
+def _state_equal(first: Mapping[str, torch.Tensor], second: Mapping[str, torch.Tensor]) -> bool:
+    return set(first) == set(second) and all(
+        first[name].dtype == second[name].dtype
+        and first[name].shape == second[name].shape
+        and torch.equal(first[name], second[name])
+        for name in first
+    )
+
+
+def reload_pypots_predictor(
+    adapter: Any,
+    checkpoint_path: Path,
+    *,
+    expected_sha256: str,
+    constructor_identity: Mapping[str, Any],
+) -> None:
+    """Hash-verify and load exact frozen inner PyPOTS predictor bytes."""
+    path = Path(checkpoint_path)
+    if not path.is_file() or _sha256_path(path) != expected_sha256:
+        raise ValueError("PyPOTS checkpoint hash does not match frozen identity")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    expected_identity = canonical_json(dict(constructor_identity))
+    if not isinstance(payload, dict) or payload.get("constructor_identity") != expected_identity:
+        raise ValueError("PyPOTS constructor identity does not match checkpoint")
+    state = payload.get("state_dict")
+    if not isinstance(state, dict):
+        raise ValueError("PyPOTS checkpoint state_dict is malformed")
+    _pypots_state_target(adapter).load_state_dict(state, strict=True)
+
+
+def freeze_pypots_predictor(
+    adapter: Any,
+    checkpoint_path: Path,
+    *,
+    constructor_identity: Mapping[str, Any],
+) -> str:
+    """Freeze the fitted inner predictor, compare prior state, then reload it."""
+    path = Path(checkpoint_path)
+    identity_json = canonical_json(dict(constructor_identity))
+    fitted_state = _cpu_state_dict(_pypots_state_target(adapter))
+    if path.exists():
+        existing = torch.load(path, map_location="cpu", weights_only=True)
+        if (
+            not isinstance(existing, dict)
+            or existing.get("constructor_identity") != identity_json
+            or not isinstance(existing.get("state_dict"), dict)
+            or not _state_equal(fitted_state, existing["state_dict"])
+        ):
+            raise FileExistsError("existing PyPOTS checkpoint differs from fitted predictor")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, prefix=".pypots-", suffix=".pt", delete=False
+            ) as handle:
+                temporary = Path(handle.name)
+            torch.save(
+                {"constructor_identity": identity_json, "state_dict": fitted_state},
+                temporary,
+            )
+            _write_stable(path, temporary.read_bytes())
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+    digest = _sha256_path(path)
+    reload_pypots_predictor(
+        adapter,
+        path,
+        expected_sha256=digest,
+        constructor_identity=constructor_identity,
+    )
+    return digest
+
+
 def _require_config(config: object) -> TeacherConfig:
     if not isinstance(config, TeacherConfig):
         raise TypeError("config must be TeacherConfig")
@@ -80,18 +224,28 @@ def _require_config(config: object) -> TeacherConfig:
     return config
 
 
-def build_native_model(condition: str, config: TeacherConfig):
+def build_native_model(
+    condition: str,
+    config: TeacherConfig,
+    *,
+    capacity: Mapping[str, Any] | None = None,
+):
     """Build one native control from Task 9's frozen explicit condition names."""
     config = _require_config(config)
     if not isinstance(condition, str):
         raise TypeError("native condition must be a string")
+    selected_capacity = dict(capacity or {})
+    hidden_size = int(selected_capacity.get("hidden_size", config.hidden_size))
+    tcn_width = int(selected_capacity.get("tcn_width", config.tcn_width))
     if condition == "bilstm":
-        return BiLSTMControl(31, config.hidden_size)
+        return BiLSTMControl(31, hidden_size)
     if condition == "bilnn":
-        return BiCfCControl(31, config.hidden_size)
+        return BiCfCControl(31, hidden_size)
     if condition == "tcn":
-        return TCNControl(31, config.tcn_width, config.tcn_dilations)
+        return TCNControl(31, tcn_width, config.tcn_dilations)
     if condition == "feature_mlp":
+        if "mlp_width" in selected_capacity:
+            return FeatureMLPControl(31, int(selected_capacity["mlp_width"]))
         teacher = OfflineTeacher(
             31, config.hidden_size, config.tcn_width, config.tcn_dilations
         )
@@ -109,8 +263,8 @@ def build_native_model(condition: str, config: TeacherConfig):
         raise ValueError(f"unsupported native condition: {condition}") from exc
     return OfflineTeacher(
         31,
-        config.hidden_size,
-        config.tcn_width,
+        hidden_size,
+        tcn_width,
         config.tcn_dilations,
         time_mode=time_mode,
         residual_mode=residual_mode,
@@ -149,6 +303,9 @@ def formal_matrix_plan(config: TeacherConfig) -> dict[str, Any]:
                             "context_samples": samples,
                             "model": model,
                             "condition": condition,
+                            "capacity_candidates": capacity_candidates(
+                                condition, config
+                            ),
                         }
                     )
     return {
@@ -441,7 +598,7 @@ def paired_formal_summaries(
     required_scenarios: Sequence[str],
     required_seeds: Sequence[int],
     bootstrap_samples: int = 10_000,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return appended primary and diagnostic paired summaries."""
     checked = validate_per_record_metrics(metrics)
     primary = make_primary_rows(
@@ -460,14 +617,65 @@ def paired_formal_summaries(
     )
     secondary = checked.copy()
     secondary.loc[secondary["model"] == candidate_model, "model"] = "teacher"
+    expected_seeds = set(int(value) for value in required_seeds)
+    expected_models = set(secondary.loc[secondary["protocol"] == "overall", "model"])
+    included_groups: list[pd.DataFrame] = []
+    coverage_rows: list[dict[str, Any]] = []
+    for group_key, group in secondary.groupby(GROUP_COLUMNS, sort=True, dropna=False):
+        group_values = dict(zip(GROUP_COLUMNS, group_key))
+        seeds = set(int(value) for value in group["seed"])
+        models = set(group["model"])
+        cell_recordings = {
+            (int(seed), str(model)): set(values["recording_id"].astype(str))
+            for (seed, model), values in group.groupby(["seed", "model"])
+        }
+        expected_cells = {(seed, model) for seed in expected_seeds for model in expected_models}
+        recording_sets = list(cell_recordings.values())
+        common = set.intersection(*recording_sets) if recording_sets else set()
+        union = set.union(*recording_sets) if recording_sets else set()
+        complete = (
+            seeds == expected_seeds
+            and models == expected_models
+            and set(cell_recordings) == expected_cells
+            and len(common) >= 2
+            and all(value == common for value in recording_sets)
+        )
+        reasons = []
+        if seeds != expected_seeds:
+            reasons.append("incomplete_seeds")
+        if models != expected_models or set(cell_recordings) != expected_cells:
+            reasons.append("incomplete_models")
+        if len(common) < 2:
+            reasons.append("incomplete_recordings")
+        if recording_sets and any(value != common for value in recording_sets):
+            reasons.append("incomplete_pair_coverage")
+        coverage_rows.append(
+            {
+                **group_values,
+                "included": complete,
+                "reason": "complete" if complete else "+".join(reasons),
+                "present_seeds": len(seeds),
+                "required_seeds": len(expected_seeds),
+                "present_models": len(models),
+                "required_models": len(expected_models),
+                "common_recordings": len(common),
+                "union_recordings": len(union),
+            }
+        )
+        if complete:
+            included_groups.append(group)
+    if not included_groups:
+        raise ValueError("no secondary strata have complete paired coverage")
+    complete_secondary = pd.concat(included_groups, ignore_index=True)
     secondary_summary = paired_model_summary(
-        secondary,
+        complete_secondary,
         baseline=strongest_baseline,
         required_seeds=required_seeds,
         bootstrap_samples=bootstrap_samples,
     )
     summary = pd.concat((primary_summary, secondary_summary), ignore_index=True)
-    return summary, primary
+    coverage = pd.DataFrame(coverage_rows)
+    return summary, primary, coverage
 
 
 def _dataframe_bytes(frame: pd.DataFrame, name: str) -> bytes:
@@ -513,6 +721,7 @@ def write_formal_artifacts(
     summary: pd.DataFrame,
     gate: Mapping[str, Any],
     mask_ledger: pd.DataFrame,
+    coverage_ledger: pd.DataFrame | None = None,
 ) -> dict[str, str]:
     """Seal formal outputs without replacing inconsistent existing content."""
     root = Path(output_root)
@@ -522,12 +731,18 @@ def write_formal_artifacts(
     _validate_gate(gate)
     _require_finite_numeric_columns(summary, "summary")
     _require_finite_numeric_columns(mask_ledger, "mask_ledger")
+    if coverage_ledger is not None:
+        _require_finite_numeric_columns(coverage_ledger, "coverage_ledger")
     payloads = {
         "per_record_metrics.csv": _dataframe_bytes(checked_metrics, "per_record_metrics"),
         "summary.csv": _dataframe_bytes(summary, "summary"),
         "success_gate.json": (canonical_json(dict(gate)) + "\n").encode("utf-8"),
         "mask_ledger.csv": _dataframe_bytes(mask_ledger, "mask_ledger"),
     }
+    if coverage_ledger is not None:
+        payloads["coverage_ledger.csv"] = _dataframe_bytes(
+            coverage_ledger, "coverage_ledger"
+        )
     hashes = {
         name: hashlib.sha256(content).hexdigest() for name, content in payloads.items()
     }
@@ -566,6 +781,7 @@ class _FormalAssets:
     scaler_hash: str
     git_commit: str
     dirty_digest: str
+    rts_observation_var: float
 
 
 class _SharedWindowRepository:
@@ -603,6 +819,8 @@ class _Candidate:
     predictor: Any
     checkpoint_sha256: str
     checkpoint_path: Path
+    capacity: dict[str, Any] | None = None
+    validation_scores: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -621,6 +839,11 @@ def _sha256_path(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_source_sha(path: Path, expected_sha256: str) -> None:
+    if not path.is_file() or _sha256_path(path) != expected_sha256:
+        raise ValueError(f"frozen source SHA256 mismatch: {path}")
 
 
 def _write_stable(path: Path, content: bytes) -> None:
@@ -667,13 +890,16 @@ def _window_raw_predictions(
             elif condition == "pchip":
                 raw = timestamp_pchip(window.observed, window.mask, window.time, **kwargs)
             else:
+                rts_parameters = predictor if isinstance(predictor, Mapping) else {}
                 raw = constant_velocity_rts(
                     window.observed,
                     window.mask,
                     window.time,
                     empty_fill=0.0,
-                    process_var=1.0,
-                    observation_var=1e-2,
+                    process_var=float(rts_parameters.get("process_var", 1.0)),
+                    observation_var=float(
+                        rts_parameters.get("observation_var", 1e-2)
+                    ),
                 )
             values.append(raw.detach().cpu().numpy())
         return values
@@ -746,6 +972,7 @@ class OXIODFormalBackend:
         discover_pairs=discover_oxiod_pairs,
         splitter=stratified_file_split,
         recording_loader=load_recording,
+        source_verifier=_verify_source_sha,
     ) -> None:
         self.config = _require_config(config)
         self.repository_root = Path(repository_root).resolve()
@@ -766,10 +993,17 @@ class OXIODFormalBackend:
         self._discover_pairs = discover_pairs
         self._splitter = splitter
         self._recording_loader = recording_loader
+        self._source_verifier = source_verifier
         self._assets: _FormalAssets | None = None
         self._frozen: _SelectedModels | None = None
         self._test_loaded = False
         self._evaluated_cells: set[tuple[int, str, str]] = set()
+
+    def _verify_split_sources(self, manifest: pd.DataFrame, split: str) -> None:
+        rows = manifest.loc[manifest["split"] == split]
+        for row in rows.itertuples(index=False):
+            self._source_verifier(Path(row.imu_path), str(row.imu_sha256))
+            self._source_verifier(Path(row.vicon_path), str(row.vicon_sha256))
 
     def load_frozen_manifest_and_scaler(self) -> _FormalAssets:
         if self._assets is not None:
@@ -792,6 +1026,7 @@ class OXIODFormalBackend:
         loaded: dict[str, tuple[Any, ...]] = {}
         for split in ("train", "validation"):
             rows = manifest.loc[manifest["split"] == split]
+            self._verify_split_sources(manifest, split)
             recordings = tuple(
                 self._recording_loader(Path(row.imu_path), Path(row.vicon_path))
                 for row in rows.itertuples(index=False)
@@ -819,6 +1054,9 @@ class OXIODFormalBackend:
             scaler_hash=scaler_hash,
             git_commit=identity["git_commit"],
             dirty_digest=identity["dirty_state_digest"],
+            rts_observation_var=estimate_rts_observation_variance(
+                loaded["train"], scaler
+            ),
         )
         return self._assets
 
@@ -827,6 +1065,8 @@ class OXIODFormalBackend:
     ) -> _SharedWindowRepository:
         if assets is not self._assets or plan.get("selection_split") != "validation":
             raise ValueError("formal assets or selection plan identity changed")
+        self._verify_split_sources(assets.manifest, "train")
+        self._verify_split_sources(assets.manifest, "validation")
         return _SharedWindowRepository(assets, self.config)
 
     def _classical_checkpoint(self, candidate_config: Mapping[str, Any]) -> tuple[Path, str]:
@@ -844,9 +1084,12 @@ class OXIODFormalBackend:
         train_windows: Sequence[PreparedWindow],
         validation_windows: Sequence[PreparedWindow],
         assets: _FormalAssets,
+        capacity: Mapping[str, Any],
     ) -> _Candidate:
         _seed_everything(seed)
-        model = build_native_model(condition, self.config).to(self.device)
+        model = build_native_model(
+            condition, self.config, capacity=capacity
+        ).to(self.device)
         generator = torch.Generator().manual_seed(seed)
         train_loader = DataLoader(
             list(train_windows), batch_size=self.config.batch_size, shuffle=True,
@@ -863,6 +1106,7 @@ class OXIODFormalBackend:
             "seed": seed,
             "context_samples": samples,
             "device": str(self.device),
+            "capacity": dict(capacity),
             "hyperparameters": {
                 "batch_size": self.config.batch_size,
                 "epochs": self.config.epochs,
@@ -903,8 +1147,11 @@ class OXIODFormalBackend:
         state = torch.load(run_dir / "best.pt", map_location=self.device, weights_only=True)
         model.load_state_dict(state)
         score = float(eval_epoch(model, validation_loader, 0)["missing_rmse"])
-        return _Candidate(seed, condition, condition, samples, score, model,
-                          metadata["checkpoint_sha256"], run_dir / "best.pt")
+        return _Candidate(
+            seed, condition, condition, samples, score, model,
+            metadata["checkpoint_sha256"], run_dir / "best.pt",
+            capacity=dict(capacity),
+        )
 
     def _pypots_candidate(
         self,
@@ -935,62 +1182,149 @@ class OXIODFormalBackend:
         score = _missing_rmse(
             [completed[index] for index in range(len(completed))], validation_windows
         )
-        state_dict = getattr(adapter.model, "state_dict", None)
-        if not callable(state_dict):
-            raise TypeError("PyPOTS model must expose state_dict for frozen identity")
         checkpoint = saving_path / "formal-best.pt"
-        checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        if not checkpoint.exists():
-            torch.save(state_dict(), checkpoint)
-        digest = _sha256_path(checkpoint)
-        return _Candidate(seed, condition, condition, samples, score, adapter, digest, checkpoint)
+        outer = adapter.model
+        inner = _pypots_state_target(adapter)
+        constructor_identity = {
+            "pypots_version": "1.5.0",
+            "condition": condition,
+            "n_steps": samples,
+            "epochs": self.config.epochs,
+            "batch_size": self.config.batch_size,
+            "outer_class": f"{type(outer).__module__}.{type(outer).__qualname__}",
+            "inner_class": f"{type(inner).__module__}.{type(inner).__qualname__}",
+        }
+        digest = freeze_pypots_predictor(
+            adapter,
+            checkpoint,
+            constructor_identity=constructor_identity,
+        )
+        return _Candidate(
+            seed, condition, condition, samples, score, adapter, digest, checkpoint,
+            capacity={"capacity": "fixed"},
+        )
 
     def train_select_validation(
         self, windows: _SharedWindowRepository, plan: Mapping
     ) -> dict[tuple[int, str], _Candidate]:
         if not isinstance(windows, _SharedWindowRepository):
             raise TypeError("formal training requires the shared Task7 window repository")
+        # Re-hash the immutable training inputs at the last boundary before any
+        # candidate is fitted or selected.  This catches edits made after window
+        # materialisation instead of silently training against stale provenance.
+        self._verify_split_sources(windows.assets.manifest, "train")
+        self._verify_split_sources(windows.assets.manifest, "validation")
         best: dict[tuple[int, str], _Candidate] = {}
-        seen: set[tuple[int, str, int]] = set()
+        score_ledger: dict[tuple[int, str], list[dict[str, Any]]] = {}
+        seen: set[tuple[int, str, int, str]] = set()
         for cell in plan["cells"]:
             seed = int(cell["seed"])
             condition = str(cell["condition"])
             alias = str(cell["model"])
             samples = int(cell["context_samples"])
-            identity = (seed, condition, samples)
-            if identity in seen:
-                raise ValueError("formal candidate matrix contains duplicates")
-            seen.add(identity)
             train_windows = windows.get("train", seed, samples)
             validation_windows = windows.get("validation", seed, samples)
-            if condition in _CLASSICAL_MODELS:
-                predictor = None
-                score = _missing_rmse(
-                    _window_raw_predictions(condition, predictor, validation_windows, self.device),
-                    validation_windows,
+            for raw_capacity in cell["capacity_candidates"]:
+                capacity = dict(raw_capacity)
+                capacity_json = canonical_json(capacity)
+                identity = (seed, condition, samples, capacity_json)
+                if identity in seen:
+                    raise ValueError("formal candidate matrix contains duplicates")
+                seen.add(identity)
+                if condition in _CLASSICAL_MODELS:
+                    predictor = (
+                        {
+                            "process_var": float(capacity["process_var"]),
+                            "observation_var": windows.assets.rts_observation_var,
+                        }
+                        if condition == "rts"
+                        else None
+                    )
+                    score = _missing_rmse(
+                        _window_raw_predictions(
+                            condition, predictor, validation_windows, self.device
+                        ),
+                        validation_windows,
+                    )
+                    descriptor = {
+                        "kind": "classical", "condition": condition, "seed": seed,
+                        "context_samples": samples, "capacity": capacity,
+                        "selection_split": "validation", "validation_rmse": score,
+                        "split_hash": windows.assets.split_hash,
+                        "scaler_hash": windows.assets.scaler_hash,
+                        "train_window_ids_sha256": _sha256_bytes(
+                            canonical_json([item.window_id for item in train_windows]).encode("utf-8")
+                        ),
+                        "validation_window_ids_sha256": _sha256_bytes(
+                            canonical_json([item.window_id for item in validation_windows]).encode("utf-8")
+                        ),
+                    }
+                    if condition == "rts":
+                        descriptor.update(
+                            observation_var=windows.assets.rts_observation_var,
+                            process_var=float(capacity["process_var"]),
+                        )
+                    path, digest = self._classical_checkpoint(descriptor)
+                    candidate = _Candidate(
+                        seed, alias, condition, samples, score, predictor, digest, path,
+                        capacity=capacity,
+                    )
+                elif condition in _PYPOTS_MODELS:
+                    candidate = self._pypots_candidate(
+                        condition, seed, samples, train_windows, validation_windows
+                    )
+                    candidate.model_alias = alias
+                else:
+                    candidate = self._native_candidate(
+                        condition, seed, samples, train_windows, validation_windows,
+                        windows.assets, capacity,
+                    )
+                    candidate.model_alias = alias
+                key = (seed, condition)
+                score_ledger.setdefault(key, []).append(
+                    {
+                        "context_samples": samples,
+                        "capacity": capacity,
+                        "validation_rmse": candidate.validation_rmse,
+                    }
                 )
-                descriptor = {
-                    "kind": "classical", "condition": condition, "seed": seed,
-                    "context_samples": samples, "selection_split": "validation",
+                current = best.get(key)
+                candidate_key = (
+                    candidate.validation_rmse,
+                    samples,
+                    capacity_json,
+                )
+                current_key = (
+                    current.validation_rmse,
+                    current.context_samples,
+                    canonical_json(current.capacity or {}),
+                ) if current is not None else None
+                if current is None or candidate_key < current_key:
+                    best[key] = candidate
+        for key, candidate in best.items():
+            candidate.validation_scores = tuple(
+                sorted(
+                    score_ledger[key],
+                    key=lambda item: (
+                        item["context_samples"], canonical_json(item["capacity"])
+                    ),
+                )
+            )
+            if candidate.condition == "rts":
+                selected_descriptor = {
+                    "kind": "rts_selected",
+                    "seed": candidate.seed,
+                    "selection_split": "validation",
+                    "selected_context_samples": candidate.context_samples,
+                    "selected_process_var": candidate.capacity["process_var"],
+                    "observation_var": windows.assets.rts_observation_var,
+                    "validation_scores": list(candidate.validation_scores),
+                    "split_hash": windows.assets.split_hash,
+                    "scaler_hash": windows.assets.scaler_hash,
                 }
-                path, digest = self._classical_checkpoint(descriptor)
-                candidate = _Candidate(seed, alias, condition, samples, score, None, digest, path)
-            elif condition in _PYPOTS_MODELS:
-                candidate = self._pypots_candidate(
-                    condition, seed, samples, train_windows, validation_windows
-                )
-                candidate.model_alias = alias
-            else:
-                candidate = self._native_candidate(
-                    condition, seed, samples, train_windows, validation_windows, windows.assets
-                )
-                candidate.model_alias = alias
-            key = (seed, condition)
-            current = best.get(key)
-            if current is None or (candidate.validation_rmse, samples) < (
-                current.validation_rmse, current.context_samples
-            ):
-                best[key] = candidate
+                path, digest = self._classical_checkpoint(selected_descriptor)
+                candidate.checkpoint_path = path
+                candidate.checkpoint_sha256 = digest
         return best
 
     def freeze_checkpoints(
@@ -1028,7 +1362,9 @@ class OXIODFormalBackend:
                     "seed": seed,
                     "condition": condition,
                     "context_samples": candidate.context_samples,
+                    "capacity": candidate.capacity,
                     "validation_rmse": candidate.validation_rmse,
+                    "validation_scores": list(candidate.validation_scores),
                     "checkpoint_sha256": candidate.checkpoint_sha256,
                 }
                 for (seed, condition), candidate in sorted(selected.items())
@@ -1055,6 +1391,7 @@ class OXIODFormalBackend:
                 raise ValueError("frozen checkpoint identity changed before test load")
         if self._test_loaded:
             raise RuntimeError("formal test data may be loaded exactly once")
+        self._verify_split_sources(assets.manifest, "test")
         self._test_loaded = True
         rows = assets.manifest.loc[assets.manifest["split"] == "test"]
         recordings = tuple(
@@ -1250,7 +1587,7 @@ def run_formal_protocol(
     )
     if not isinstance(candidate_model, str):
         raise TypeError("primary_candidate_model must be a string")
-    summary, primary = paired_formal_summaries(
+    summary, primary, coverage = paired_formal_summaries(
         condition_metrics,
         candidate_model=candidate_model,
         strongest_baseline=strongest,
@@ -1272,6 +1609,7 @@ def run_formal_protocol(
         summary,
         gate,
         evaluation["mask_ledger"],
+        coverage,
     )
     return {
         "status": "completed",
@@ -1284,14 +1622,19 @@ def run_formal_protocol(
 
 __all__ = [
     "FORMAL_SEEDS",
+    "RTS_PROCESS_VARIANCES",
     "FormalBackend",
     "OXIODFormalBackend",
     "build_native_model",
+    "capacity_candidates",
+    "estimate_rts_observation_variance",
     "evaluate_record_rows",
     "formal_matrix_plan",
+    "freeze_pypots_predictor",
     "make_primary_rows",
     "paired_formal_summaries",
     "run_formal_protocol",
+    "reload_pypots_predictor",
     "success_gate_payload",
     "teacher_success",
     "write_formal_artifacts",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -23,11 +24,16 @@ from imputation_v3.experiments.evaluate import (
 from imputation_v3.experiments.runner import (
     FORMAL_SEEDS,
     OXIODFormalBackend,
+    RTS_PROCESS_VARIANCES,
     build_native_model,
+    capacity_candidates,
+    estimate_rts_observation_variance,
     evaluate_record_rows,
     formal_matrix_plan,
     make_primary_rows,
     paired_formal_summaries,
+    freeze_pypots_predictor,
+    reload_pypots_predictor,
     run_formal_protocol,
     success_gate_payload,
     teacher_success,
@@ -467,7 +473,7 @@ def test_formal_summaries_append_secondary_diagnostics_but_gate_only_primary(mon
                 rows.append(_metric_row(seed=seed, recording_id=recording, protocol=protocol, model="saits", value=2.0))
                 rows.append(_metric_row(seed=seed, recording_id=recording, protocol=protocol, model="teacher_constant_residual", value=1.5))
     metrics = pd.DataFrame(rows, columns=PER_RECORD_COLUMNS)
-    summary, primary = paired_formal_summaries(
+    summary, primary, coverage = paired_formal_summaries(
         metrics,
         candidate_model="teacher_actual_residual",
         strongest_baseline="saits",
@@ -482,6 +488,81 @@ def test_formal_summaries_append_secondary_diagnostics_but_gate_only_primary(mon
     assert "teacher_constant_residual" in set(summary["model"])
     assert set(primary["protocol"]) == {"teacher_primary"}
     assert "teacher_constant_residual" not in set(primary["model"])
+    assert coverage["included"].all()
+
+
+def test_sparse_diagnostic_pairs_are_excluded_with_explicit_coverage_not_fabricated():
+    rows = []
+    for seed in FORMAL_SEEDS:
+        for recording in ("r1", "r2"):
+            for model, value in (("teacher_actual_residual", 1.0), ("saits", 2.0)):
+                rows.append(_metric_row(seed=seed, recording_id=recording, model=model, value=value))
+                if (seed + (recording == "r2")) % 2 == 0:
+                    rows.append(_metric_row(seed=seed, recording_id=recording, model=model, protocol="axis/gx", value=value))
+                if seed != 2028:
+                    rows.append(_metric_row(seed=seed, recording_id=recording, model=model, protocol="gap/50-200ms", value=value))
+    metrics = pd.DataFrame(rows, columns=PER_RECORD_COLUMNS)
+    summary, primary, coverage = paired_formal_summaries(
+        metrics, candidate_model="teacher_actual_residual", strongest_baseline="saits",
+        required_topologies=("block",), required_rates=(0.2,),
+        required_scenarios=("handheld",), required_seeds=FORMAL_SEEDS,
+        bootstrap_samples=50,
+    )
+    assert set(summary["protocol"]) == {"teacher_primary", "overall"}
+    excluded = coverage.loc[~coverage["included"]]
+    assert set(excluded["protocol"]) == {"axis/gx", "gap/50-200ms"}
+    assert excluded["reason"].str.contains("incomplete").all()
+    assert {"axis/gx", "gap/50-200ms"} <= set(metrics["protocol"])
+    assert not ({"axis/gx", "gap/50-200ms"} & set(summary["protocol"]))
+    assert len(primary) == 20
+
+
+def test_nested_pypots_predictor_freezes_inner_module_reloads_and_rejects_drift(tmp_path):
+    class Outer:
+        def __init__(self, weight):
+            self.model = torch.nn.Linear(1, 1, bias=False)
+            with torch.no_grad():
+                self.model.weight.fill_(weight)
+
+    class Adapter:
+        def __init__(self, weight):
+            self.model = Outer(weight)
+
+        def predict(self, value):
+            return self.model.model(torch.tensor([[value]])).item()
+
+    adapter = Adapter(3.0)
+    checkpoint = tmp_path / "pypots.pt"
+    identity = {"name": "brits", "n_steps": 8, "pypots": "1.5.0"}
+    digest = freeze_pypots_predictor(adapter, checkpoint, constructor_identity=identity)
+    expected = adapter.predict(2.0)
+    with torch.no_grad():
+        adapter.model.model.weight.fill_(99.0)
+    reload_pypots_predictor(adapter, checkpoint, expected_sha256=digest, constructor_identity=identity)
+    assert adapter.predict(2.0) == pytest.approx(expected)
+    with pytest.raises(FileExistsError, match="fitted predictor"):
+        freeze_pypots_predictor(Adapter(4.0), checkpoint, constructor_identity=identity)
+
+
+def test_rts_train_only_variance_and_frozen_process_grid():
+    train = (_recording("train-a"), _recording("train-b"))
+    first = estimate_rts_observation_variance(train)
+    changed_test = _recording("test")
+    changed_test.imu_six[:] = 1e9
+    assert estimate_rts_observation_variance(train) == first
+    assert first > 0 and math.isfinite(first)
+    assert RTS_PROCESS_VARIANCES == (1e-4, 1e-3, 1e-2, 1e-1, 1.0)
+
+
+def test_capacity_candidates_are_inner_selection_not_matrix_multiplication():
+    config = load_teacher_config(ROOT / "configs/imputation_v3/teacher_full.yaml")
+    candidates = capacity_candidates("teacher_actual_residual", config)
+    assert len(candidates) >= 2
+    assert {item["hidden_size"] for item in candidates} >= {config.hidden_size}
+    plan = formal_matrix_plan(config)
+    assert plan["counts"]["matrix_cells"] == 240
+    cell = next(item for item in plan["cells"] if item["condition"] == "teacher_actual_residual")
+    assert cell["capacity_candidates"] == candidates
 
 
 class _SpyBackend:
@@ -703,6 +784,7 @@ def test_concrete_backend_loads_only_train_validation_before_freeze(tmp_path):
         discover_pairs=lambda root: [{"unused": str(root)}],
         splitter=lambda pairs, seed: manifest.copy(),
         recording_loader=loader,
+        source_verifier=lambda path, digest: None,
     )
     assets = backend.load_frozen_manifest_and_scaler()
     assert calls == ["train", "validation"]
@@ -753,7 +835,7 @@ def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
     config = replace(
         load_teacher_config(ROOT / "configs/imputation_v3/teacher_smoke.yaml"),
         seeds=(2026,), window_seconds=(0.04,), batch_size=2, epochs=1,
-        hidden_size=4, tcn_width=4, tcn_dilations=(1,),
+        hidden_size=8, tcn_width=8, tcn_dilations=(1,),
         training_topologies=("point",), training_rates=(0.2,),
         models=("linear", "teacher"),
     )
@@ -762,6 +844,7 @@ def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
             ["train", "s", "train-imu", "train-vi", "train", "a" * 64, "b" * 64],
             ["validation", "s", "validation-imu", "validation-vi", "validation", "c" * 64, "d" * 64],
             ["test", "s", "test-imu", "test-vi", "test", "e" * 64, "f" * 64],
+            ["test2", "s", "test2-imu", "test2-vi", "test", "1" * 64, "2" * 64],
         ],
         columns=("recording_id", "scenario", "imu_path", "vicon_path", "split", "imu_sha256", "vicon_sha256"),
     )
@@ -770,6 +853,7 @@ def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
         discover_pairs=lambda root: [{"root": str(root)}],
         splitter=lambda pairs, seed: manifest.copy(),
         recording_loader=lambda imu, vicon: _recording(str(imu).removesuffix("-imu")),
+        source_verifier=lambda path, digest: None,
     )
     plan = formal_matrix_plan(config)
     assets = backend.load_frozen_manifest_and_scaler()
@@ -780,7 +864,7 @@ def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
         json.loads(path.read_text(encoding="utf-8"))
         for path in (tmp_path / "candidates").glob("*/run.json")
     )
-    assert native_manifest["config"]["hyperparameters"]["hidden_size"] == 4
+    assert native_manifest["config"]["hyperparameters"]["hidden_size"] == 8
     assert len(native_manifest["config"]["train_window_ids_sha256"]) == 64
     assert len(native_manifest["config"]["validation_window_ids_sha256"]) == 64
     candidate = next(iter(selected.values()))
@@ -790,6 +874,13 @@ def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
         backend.freeze_checkpoints(selected, plan)
     candidate.checkpoint_path.write_bytes(original_checkpoint)
     frozen = backend.freeze_checkpoints(selected, plan)
+    frozen_manifest = json.loads((tmp_path / "frozen_models.json").read_text(encoding="utf-8"))
+    for item in frozen_manifest["checkpoints"]:
+        assert item["validation_rmse"] == min(
+            score["validation_rmse"] for score in item["validation_scores"]
+        )
+        if item["condition"].startswith("teacher_"):
+            assert len(item["validation_scores"]) == 2
     candidate.checkpoint_path.write_bytes(b"tampered-after-freeze")
     with pytest.raises(ValueError, match="checkpoint.*identity"):
         backend.load_test_data(assets)
@@ -800,5 +891,73 @@ def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
         "linear", "teacher_actual_residual", "teacher_constant_residual",
         "teacher_dt_feature_only_residual", "teacher_no_dt_residual", "teacher_actual_raw",
     }
-    assert len(evaluation["mask_ledger"]) == 1
+    assert len(evaluation["mask_ledger"]) == 2
     assert (tmp_path / "frozen_models.json").is_file()
+    summary, primary, coverage = paired_formal_summaries(
+        evaluation["per_record_metrics"],
+        candidate_model="teacher_actual_residual", strongest_baseline="linear",
+        required_topologies=("point",), required_rates=(0.2,),
+        required_scenarios=("s",), required_seeds=(2026,), bootstrap_samples=50,
+    )
+    gate = success_gate_payload(summary, strongest_baseline="linear")
+    hashes = write_formal_artifacts(
+        tmp_path / "published",
+        pd.concat((evaluation["per_record_metrics"], primary), ignore_index=True),
+        summary, gate, evaluation["mask_ledger"], coverage,
+    )
+    assert "coverage_ledger.csv" in hashes
+
+
+def test_concrete_backend_rehashes_deferred_test_sources_before_parsing(tmp_path):
+    config = replace(
+        load_teacher_config(ROOT / "configs/imputation_v3/teacher_smoke.yaml"),
+        seeds=(2026,), window_seconds=(0.04,), training_topologies=("point",),
+        training_rates=(0.2,), models=("rts",),
+    )
+    rows = []
+    for split in ("train", "validation", "test"):
+        paths = []
+        digests = []
+        for kind in ("imu", "vi"):
+            path = tmp_path / f"{split}-{kind}.csv"
+            path.write_text(f"{split}-{kind}", encoding="utf-8")
+            paths.append(path)
+            digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
+        rows.append([split, "s", str(paths[0]), str(paths[1]), split, *digests])
+    manifest = pd.DataFrame(rows, columns=(
+        "recording_id", "scenario", "imu_path", "vicon_path", "split",
+        "imu_sha256", "vicon_sha256",
+    ))
+    calls = []
+
+    def loader(imu, vicon):
+        del vicon
+        recording_id = Path(imu).stem.removesuffix("-imu")
+        calls.append(recording_id)
+        return _recording(recording_id)
+
+    backend = OXIODFormalBackend(
+        config, repository_root=ROOT, output_root=tmp_path / "out", requested_device="cpu",
+        discover_pairs=lambda root: [], splitter=lambda pairs, seed: manifest.copy(),
+        recording_loader=loader,
+    )
+    plan = formal_matrix_plan(config)
+    assets = backend.load_frozen_manifest_and_scaler()
+    repository = backend.materialize_train_validation(assets, plan)
+    selected = backend.train_select_validation(repository, plan)
+    backend.freeze_checkpoints(selected, plan)
+    frozen_manifest = json.loads(
+        (tmp_path / "out" / "frozen_models.json").read_text(encoding="utf-8")
+    )
+    rts = frozen_manifest["checkpoints"][0]
+    assert len(rts["validation_scores"]) == len(RTS_PROCESS_VARIANCES)
+    assert rts["capacity"]["process_var"] in RTS_PROCESS_VARIANCES
+    assert rts["validation_rmse"] == min(
+        item["validation_rmse"] for item in rts["validation_scores"]
+    )
+    Path(manifest.loc[manifest.split == "test", "imu_path"].item()).write_text(
+        "tampered", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="source SHA256"):
+        backend.load_test_data(assets)
+    assert calls == ["train", "validation"]
