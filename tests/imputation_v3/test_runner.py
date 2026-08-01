@@ -4,7 +4,8 @@ from dataclasses import replace
 import json
 import math
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -21,10 +22,12 @@ from imputation_v3.experiments.evaluate import (
 )
 from imputation_v3.experiments.runner import (
     FORMAL_SEEDS,
+    OXIODFormalBackend,
     build_native_model,
     evaluate_record_rows,
     formal_matrix_plan,
     make_primary_rows,
+    paired_formal_summaries,
     run_formal_protocol,
     success_gate_payload,
     teacher_success,
@@ -39,6 +42,7 @@ from imputation_v3.models.native_controls import (
 )
 from imputation_v3.models.teacher import OfflineTeacher
 from validation_v2.evaluation.statistics import PER_RECORD_COLUMNS
+from validation_v2.types import Recording
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -287,7 +291,7 @@ def test_teacher_success_requires_exact_finite_preregistered_primary_row():
 
 def test_success_gate_payload_is_exact_and_boolean():
     summary = pd.DataFrame(
-        [{"model": "teacher", "baseline": "saits", "metric": "rmse_physical", "ci95_low": -1.0, "ci95_high": -0.1}]
+        [{"scenario": "all", "protocol": "teacher_primary", "topology": "all", "model": "teacher", "baseline": "saits", "metric": "rmse_physical", "ci95_low": -1.0, "ci95_high": -0.1}]
     )
     assert success_gate_payload(summary, strongest_baseline="saits") == {
         "candidate": "teacher",
@@ -297,6 +301,9 @@ def test_success_gate_payload_is_exact_and_boolean():
         "passed": True,
         "next_stage": "plan_fixed_lag_students",
     }
+    bare = summary.drop(columns=["scenario"])
+    with pytest.raises(ValueError, match="scenario"):
+        teacher_success(bare, strongest_baseline="saits")
 
 
 @pytest.mark.parametrize(
@@ -378,16 +385,22 @@ def test_matrix_rejects_duplicate_aliases_and_contexts():
 def test_primary_rows_root_mean_condition_squared_errors_and_exact_schema():
     frame = pd.DataFrame(
         [
-            _metric_row(value=3.0),
-            _metric_row(model="teacher_constant_residual", value=4.0),
-            _metric_row(model="saits", value=2.0),
+            _metric_row(value=3.0, topology="point", requested_fraction=0.1),
+            _metric_row(value=4.0, topology="block", requested_fraction=0.1),
+            _metric_row(model="teacher_constant_residual", value=1000.0),
+            _metric_row(model="saits", value=2.0, topology="point", requested_fraction=0.1),
+            _metric_row(model="saits", value=2.0, topology="block", requested_fraction=0.1),
+            _metric_row(protocol="axis/gx", value=2000.0),
         ],
         columns=PER_RECORD_COLUMNS,
     )
     primary = make_primary_rows(
         frame,
-        teacher_conditions=("teacher_actual_residual", "teacher_constant_residual"),
+        candidate_model="teacher_actual_residual",
         strongest_baseline="saits",
+        required_topologies=("point", "block"),
+        required_rates=(0.1,),
+        required_scenarios=("handheld",),
     )
     assert list(primary.columns) == list(PER_RECORD_COLUMNS)
     assert primary["model"].tolist() == ["saits", "teacher"]
@@ -403,18 +416,72 @@ def test_primary_rows_use_overflow_stable_condition_rms():
     frame = pd.DataFrame(
         [
             _metric_row(value=1e308),
-            _metric_row(model="teacher_constant_residual", value=1e308),
             _metric_row(model="saits", value=1e308),
         ],
         columns=PER_RECORD_COLUMNS,
     )
     primary = make_primary_rows(
         frame,
-        teacher_conditions=("teacher_actual_residual", "teacher_constant_residual"),
+        candidate_model="teacher_actual_residual",
         strongest_baseline="saits",
+        required_topologies=("block",),
+        required_rates=(0.2,),
+        required_scenarios=("handheld",),
     )
     assert np.isfinite(primary["value"]).all()
     np.testing.assert_allclose(primary["value"].to_numpy(), 1e308)
+
+
+def test_primary_rows_reject_missing_or_duplicate_preregistered_cells():
+    rows = [
+        _metric_row(topology="point", requested_fraction=0.1),
+        _metric_row(topology="block", requested_fraction=0.1),
+        _metric_row(model="saits", topology="point", requested_fraction=0.1),
+        _metric_row(model="saits", topology="block", requested_fraction=0.1),
+    ]
+    kwargs = dict(
+        candidate_model="teacher_actual_residual",
+        strongest_baseline="saits",
+        required_topologies=("point", "block"),
+        required_rates=(0.1,),
+        required_scenarios=("handheld",),
+    )
+    with pytest.raises(ValueError, match="complete"):
+        make_primary_rows(pd.DataFrame(rows[:-1], columns=PER_RECORD_COLUMNS), **kwargs)
+    duplicate = pd.DataFrame([*rows, rows[0]], columns=PER_RECORD_COLUMNS)
+    with pytest.raises(ValueError, match="duplicate"):
+        make_primary_rows(duplicate, **kwargs)
+    with pytest.raises(ValueError, match="scenario"):
+        make_primary_rows(
+            pd.DataFrame(rows, columns=PER_RECORD_COLUMNS),
+            **{**kwargs, "required_scenarios": ("handheld", "running")},
+        )
+
+
+def test_formal_summaries_append_secondary_diagnostics_but_gate_only_primary(monkeypatch):
+    rows = []
+    for seed in FORMAL_SEEDS:
+        for recording in ("r1", "r2"):
+            for protocol in ("overall", "sensor/gyro", "axis/gx", "gap/50-200ms"):
+                rows.append(_metric_row(seed=seed, recording_id=recording, protocol=protocol, value=1.0))
+                rows.append(_metric_row(seed=seed, recording_id=recording, protocol=protocol, model="saits", value=2.0))
+                rows.append(_metric_row(seed=seed, recording_id=recording, protocol=protocol, model="teacher_constant_residual", value=1.5))
+    metrics = pd.DataFrame(rows, columns=PER_RECORD_COLUMNS)
+    summary, primary = paired_formal_summaries(
+        metrics,
+        candidate_model="teacher_actual_residual",
+        strongest_baseline="saits",
+        required_topologies=("block",),
+        required_rates=(0.2,),
+        required_scenarios=("handheld",),
+        required_seeds=FORMAL_SEEDS,
+        bootstrap_samples=50,
+    )
+    assert set(summary["protocol"]) >= {"teacher_primary", "sensor/gyro", "axis/gx", "gap/50-200ms"}
+    assert len(summary.loc[(summary.model == "teacher") & (summary.protocol == "teacher_primary")]) == 1
+    assert "teacher_constant_residual" in set(summary["model"])
+    assert set(primary["protocol"]) == {"teacher_primary"}
+    assert "teacher_constant_residual" not in set(primary["model"])
 
 
 class _SpyBackend:
@@ -461,12 +528,14 @@ def test_formal_protocol_order_never_loads_test_before_freeze(tmp_path, monkeypa
     rows = []
     for seed in FORMAL_SEEDS:
         for recording, teacher_value, baseline_value in (("r1", 1.0, 2.0), ("r2", 1.5, 2.5)):
-            rows.extend(
-                [
-                    _metric_row(seed=seed, recording_id=recording, value=teacher_value),
-                    _metric_row(seed=seed, recording_id=recording, model="saits", value=baseline_value),
-                ]
-            )
+            for topology in ("point", "block", "channel"):
+                for rate in (0.1, 0.2, 0.3, 0.4):
+                    rows.extend(
+                        [
+                            _metric_row(seed=seed, recording_id=recording, topology=topology, requested_fraction=rate, value=teacher_value),
+                            _metric_row(seed=seed, recording_id=recording, topology=topology, requested_fraction=rate, model="saits", value=baseline_value),
+                        ]
+                    )
     backend = _SpyBackend(pd.DataFrame(rows, columns=PER_RECORD_COLUMNS))
 
     import imputation_v3.experiments.runner as runner
@@ -476,6 +545,7 @@ def test_formal_protocol_order_never_loads_test_before_freeze(tmp_path, monkeypa
     def summary_spy(metrics, **kwargs):
         backend.events.append("statistics")
         assert kwargs["required_seeds"] == FORMAL_SEEDS
+        kwargs.pop("bootstrap_samples", None)
         return real_summary(metrics, bootstrap_samples=50, **kwargs)
 
     monkeypatch.setattr(runner, "paired_model_summary", summary_spy)
@@ -487,6 +557,7 @@ def test_formal_protocol_order_never_loads_test_before_freeze(tmp_path, monkeypa
         "freeze_checkpoints",
         "load_test_data",
         "evaluate_test_once",
+        "statistics",
         "statistics",
     ]
     assert report["gate"]["passed"] is True
@@ -535,7 +606,7 @@ def test_formal_artifacts_are_immutable_and_hash_bound(tmp_path):
         columns=PER_RECORD_COLUMNS,
     )
     summary = pd.DataFrame(
-        [{"model": "teacher", "baseline": "saits", "metric": "rmse_physical", "ci95_low": -1.0, "ci95_high": -0.1}]
+        [{"scenario": "all", "protocol": "teacher_primary", "topology": "all", "model": "teacher", "baseline": "saits", "metric": "rmse_physical", "ci95_low": -1.0, "ci95_high": -0.1}]
     )
     gate = success_gate_payload(summary, strongest_baseline="saits")
     ledger = pd.DataFrame([{"mask_id": "m1", "sha256": "b" * 64}])
@@ -584,3 +655,150 @@ def test_teacher_matrix_cli_dry_run_is_canonical_and_does_not_discover_data(monk
     payload = json.loads(capsys.readouterr().out)
     assert payload["counts"]["matrix_cells"] == 6
     assert payload["test_data_accessed"] is False
+
+
+def _recording(recording_id):
+    time = np.arange(8, dtype=np.float64) * 0.01
+    return Recording(
+        id=recording_id,
+        imu_time_s=time,
+        imu_six=np.arange(48, dtype=np.float64).reshape(8, 6),
+        vicon_time_s=time,
+        vicon_position_m=np.zeros((8, 3)),
+        vicon_quaternion_xyzw=np.tile([0.0, 0.0, 0.0, 1.0], (8, 1)),
+        overlap_s=(0.0, 0.07),
+        metadata={},
+    )
+
+
+def test_concrete_backend_loads_only_train_validation_before_freeze(tmp_path):
+    config = replace(
+        load_teacher_config(ROOT / "configs/imputation_v3/teacher_full.yaml"),
+        window_seconds=(0.04,),
+        training_topologies=("point",),
+        training_rates=(0.2,),
+        models=("linear", "teacher"),
+    )
+    manifest = pd.DataFrame(
+        [
+            ["train", "s", "train-imu", "train-vi", "train", "a" * 64, "b" * 64],
+            ["validation", "s", "validation-imu", "validation-vi", "validation", "c" * 64, "d" * 64],
+            ["test", "s", "test-imu", "test-vi", "test", "e" * 64, "f" * 64],
+        ],
+        columns=("recording_id", "scenario", "imu_path", "vicon_path", "split", "imu_sha256", "vicon_sha256"),
+    )
+    calls = []
+
+    def loader(imu, vicon):
+        del vicon
+        recording_id = str(imu).removesuffix("-imu")
+        calls.append(recording_id)
+        return _recording(recording_id)
+
+    backend = OXIODFormalBackend(
+        config,
+        repository_root=ROOT,
+        output_root=tmp_path,
+        requested_device="cpu",
+        discover_pairs=lambda root: [{"unused": str(root)}],
+        splitter=lambda pairs, seed: manifest.copy(),
+        recording_loader=loader,
+    )
+    assets = backend.load_frozen_manifest_and_scaler()
+    assert calls == ["train", "validation"]
+    assert assets.scaler.training_ids == ("train",)
+    assert list(tmp_path.glob("split_manifest-*.csv"))
+    assert list(tmp_path.glob("scaler-*.json"))
+    repository = backend.materialize_train_validation(assets, formal_matrix_plan(config))
+    first = repository.get("train", 2026, 4)
+    second = repository.get("train", 2026, 4)
+    assert first is second
+    assert first and [window.window_id for window in first] == [window.window_id for window in second]
+    with pytest.raises(RuntimeError, match="freeze"):
+        backend.load_test_data(assets)
+    assert calls == ["train", "validation"]
+
+
+def test_teacher_matrix_cli_non_dry_builds_real_backend_and_runs_protocol(monkeypatch, tmp_path, capsys):
+    import imputation_v3.cli as cli
+
+    captured = {}
+    sentinel = object()
+
+    def backend_factory(config, **kwargs):
+        captured["backend"] = (config, kwargs)
+        return sentinel
+
+    def protocol(config, *, backend, output_root):
+        captured["protocol"] = (config, backend, output_root)
+        return {"status": "completed", "matrix_cells": 240}
+
+    monkeypatch.setattr(cli, "OXIODFormalBackend", backend_factory)
+    monkeypatch.setattr(cli, "run_formal_protocol", protocol)
+    package = ModuleType("pypots")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "pypots", package)
+    monkeypatch.setitem(sys.modules, "pypots.imputation", ModuleType("pypots.imputation"))
+    assert cli.main([
+        "teacher-matrix", "--config", "configs/imputation_v3/teacher_full.yaml",
+        "--device", "cpu", "--output-root", str(tmp_path),
+    ]) == 0
+    assert captured["backend"][1]["requested_device"] == "cpu"
+    assert captured["protocol"][1] is sentinel
+    assert captured["protocol"][2] == tmp_path.resolve()
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+
+
+def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
+    config = replace(
+        load_teacher_config(ROOT / "configs/imputation_v3/teacher_smoke.yaml"),
+        seeds=(2026,), window_seconds=(0.04,), batch_size=2, epochs=1,
+        hidden_size=4, tcn_width=4, tcn_dilations=(1,),
+        training_topologies=("point",), training_rates=(0.2,),
+        models=("linear", "teacher"),
+    )
+    manifest = pd.DataFrame(
+        [
+            ["train", "s", "train-imu", "train-vi", "train", "a" * 64, "b" * 64],
+            ["validation", "s", "validation-imu", "validation-vi", "validation", "c" * 64, "d" * 64],
+            ["test", "s", "test-imu", "test-vi", "test", "e" * 64, "f" * 64],
+        ],
+        columns=("recording_id", "scenario", "imu_path", "vicon_path", "split", "imu_sha256", "vicon_sha256"),
+    )
+    backend = OXIODFormalBackend(
+        config, repository_root=ROOT, output_root=tmp_path, requested_device="cpu",
+        discover_pairs=lambda root: [{"root": str(root)}],
+        splitter=lambda pairs, seed: manifest.copy(),
+        recording_loader=lambda imu, vicon: _recording(str(imu).removesuffix("-imu")),
+    )
+    plan = formal_matrix_plan(config)
+    assets = backend.load_frozen_manifest_and_scaler()
+    windows = backend.materialize_train_validation(assets, plan)
+    selected = backend.train_select_validation(windows, plan)
+    assert len(selected) == 6
+    native_manifest = next(
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "candidates").glob("*/run.json")
+    )
+    assert native_manifest["config"]["hyperparameters"]["hidden_size"] == 4
+    assert len(native_manifest["config"]["train_window_ids_sha256"]) == 64
+    assert len(native_manifest["config"]["validation_window_ids_sha256"]) == 64
+    candidate = next(iter(selected.values()))
+    original_checkpoint = candidate.checkpoint_path.read_bytes()
+    candidate.checkpoint_path.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="checkpoint.*identity"):
+        backend.freeze_checkpoints(selected, plan)
+    candidate.checkpoint_path.write_bytes(original_checkpoint)
+    frozen = backend.freeze_checkpoints(selected, plan)
+    candidate.checkpoint_path.write_bytes(b"tampered-after-freeze")
+    with pytest.raises(ValueError, match="checkpoint.*identity"):
+        backend.load_test_data(assets)
+    candidate.checkpoint_path.write_bytes(original_checkpoint)
+    test_data = backend.load_test_data(assets)
+    evaluation = backend.evaluate_test_once(frozen, test_data, plan)
+    assert set(evaluation["per_record_metrics"]["model"]) == {
+        "linear", "teacher_actual_residual", "teacher_constant_residual",
+        "teacher_dt_feature_only_residual", "teacher_no_dt_residual", "teacher_actual_raw",
+    }
+    assert len(evaluation["mask_ledger"]) == 1
+    assert (tmp_path / "frozen_models.json").is_file()

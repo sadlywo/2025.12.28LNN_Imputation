@@ -12,7 +12,9 @@ import yaml
 from imputation_v3.config import load_teacher_config
 from imputation_v3.experiments.runner import (
     FORMAL_SEEDS,
+    OXIODFormalBackend,
     formal_matrix_plan,
+    run_formal_protocol,
 )
 from imputation_v3.experiments.training import run_teacher_smoke
 from validation_v2.experiments.provenance import canonical_json
@@ -80,10 +82,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "formal PyPOTS baselines require pypots==1.5.0 from "
                         "requirements-imputation-v3-baselines.txt"
                     ) from exc
-            raise RuntimeError(
-                "formal matrix prerequisites passed, but no concrete FormalBackend "
-                "was supplied; no training, test access, or result artifacts occurred"
+            selected_output = arguments.output_root or config.output_root
+            effective_output = (
+                selected_output
+                if selected_output.is_absolute()
+                else _REPOSITORY_ROOT / selected_output
             )
+            effective_output = effective_output.resolve()
+            backend = OXIODFormalBackend(
+                config,
+                repository_root=_REPOSITORY_ROOT,
+                output_root=effective_output,
+                requested_device=arguments.device,
+            )
+            report = run_formal_protocol(
+                config, backend=backend, output_root=effective_output
+            )
+            print(canonical_json(report))
+            return 0
     except (ModuleNotFoundError, OSError, RuntimeError, TypeError, ValueError, yaml.YAMLError) as error:
         print(f"imputation-v3: {error}", file=sys.stderr)
         return 2

@@ -3,19 +3,35 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
+import json
 import math
 from numbers import Real
 import os
 from pathlib import Path
 import re
+import random
+from types import SimpleNamespace
 from typing import Any, Final, Protocol
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import DataLoader
 
 from imputation_v3.config import TeacherConfig
+from imputation_v3.data.features import build_features
+from imputation_v3.data.windows import collate_prepared_windows, materialize_teacher_windows
 from imputation_v3.experiments.evaluate import evaluate_record_diagnostics
+from imputation_v3.experiments.pypots import build_pypots_model, to_pypots_sets
+from imputation_v3.experiments.training import make_teacher_callbacks
+from imputation_v3.models.baselines import (
+    constant_velocity_rts,
+    timestamp_linear,
+    timestamp_locf,
+    timestamp_pchip,
+)
 from imputation_v3.models.native_controls import (
     CONTROL_CONDITIONS,
     TEACHER_CONDITION_MODES,
@@ -26,12 +42,20 @@ from imputation_v3.models.native_controls import (
     count_parameters,
 )
 from imputation_v3.models.teacher import OfflineTeacher
+from imputation_v3.types import PreparedWindow
+from validation_v2.data.masking import channel_outage, contiguous_block, point_missing
+from validation_v2.data.normalization import RobustTrainScaler
+from validation_v2.data.oxiod import load_recording
+from validation_v2.data.splits import MANIFEST_COLUMNS, stratified_file_split
 from validation_v2.evaluation.statistics import (
     PER_RECORD_COLUMNS,
     paired_model_summary,
     validate_per_record_metrics,
 )
 from validation_v2.experiments.provenance import canonical_json
+from validation_v2.experiments.provenance import collect_provenance, git_worktree_identity
+from validation_v2.experiments.runner import discover_oxiod_pairs
+from validation_v2.experiments.train import train_one_run
 
 
 FORMAL_SEEDS: Final[tuple[int, ...]] = (2026, 2027, 2028, 2029, 2030)
@@ -155,7 +179,16 @@ def teacher_success(summary: pd.DataFrame, *, strongest_baseline: str) -> bool:
         raise TypeError("summary must be a pandas DataFrame")
     if not isinstance(strongest_baseline, str) or not strongest_baseline:
         raise ValueError("strongest_baseline must be a non-empty string")
-    required = {"model", "baseline", "metric", "ci95_low", "ci95_high"}
+    required = {
+        "scenario",
+        "protocol",
+        "topology",
+        "model",
+        "baseline",
+        "metric",
+        "ci95_low",
+        "ci95_high",
+    }
     missing = sorted(required - set(summary.columns))
     if missing:
         raise ValueError("summary is missing required columns: " + ", ".join(missing))
@@ -164,14 +197,11 @@ def teacher_success(summary: pd.DataFrame, *, strongest_baseline: str) -> bool:
         & (summary["baseline"] == strongest_baseline)
         & (summary["metric"] == "rmse_physical")
     ]
-    preregistered = {
-        "scenario": "all",
-        "protocol": "teacher_primary",
-        "topology": "all",
-    }
-    for column, expected in preregistered.items():
-        if column in selected.columns:
-            selected = selected.loc[selected[column] == expected]
+    selected = selected.loc[
+        (selected["scenario"] == "all")
+        & (selected["protocol"] == "teacher_primary")
+        & (selected["topology"] == "all")
+    ]
     if len(selected) != 1:
         raise ValueError(
             "teacher success requires exactly one preregistered strongest-baseline row"
@@ -305,34 +335,67 @@ def _stable_rms(values: np.ndarray) -> float:
 def make_primary_rows(
     metrics: pd.DataFrame,
     *,
-    teacher_conditions: Sequence[str],
+    candidate_model: str,
     strongest_baseline: str,
+    required_topologies: Sequence[str],
+    required_rates: Sequence[float],
+    required_scenarios: Sequence[str],
 ) -> pd.DataFrame:
-    """Collapse condition RMSE squared errors into the preregistered stratum."""
+    """Macro-average only the exact preregistered overall condition matrix."""
     checked = validate_per_record_metrics(metrics)
-    conditions = tuple(teacher_conditions)
-    if not conditions or any(not isinstance(value, str) or not value for value in conditions):
-        raise ValueError("teacher_conditions must contain non-empty strings")
-    if len(set(conditions)) != len(conditions):
-        raise ValueError("teacher_conditions must be unique")
+    if not isinstance(candidate_model, str) or not candidate_model:
+        raise ValueError("candidate_model must be a non-empty explicit condition")
+    if candidate_model == "teacher":
+        raise ValueError("candidate_model must be explicit, not the teacher alias")
     if not isinstance(strongest_baseline, str) or not strongest_baseline:
         raise ValueError("strongest_baseline must be a non-empty string")
+    topologies = tuple(required_topologies)
+    rates = tuple(float(value) for value in required_rates)
+    scenarios = tuple(required_scenarios)
+    if not topologies or len(set(topologies)) != len(topologies):
+        raise ValueError("required_topologies must be non-empty and unique")
+    if not rates or len(set(rates)) != len(rates):
+        raise ValueError("required_rates must be non-empty and unique")
+    if not scenarios or len(set(scenarios)) != len(scenarios):
+        raise ValueError("required_scenarios must be non-empty and unique")
     selected = checked.loc[
         (checked["metric"] == "rmse_physical")
-        & checked["model"].isin((*conditions, strongest_baseline))
+        & (checked["protocol"] == "overall")
+        & checked["model"].isin((candidate_model, strongest_baseline))
     ].copy()
     if selected.empty:
         raise ValueError("no primary RMSE rows match teacher and strongest baseline")
+
+    unexpected_topologies = sorted(set(selected["topology"]) - set(topologies))
+    unexpected_rates = sorted(
+        set(selected["requested_fraction"].astype(float)) - set(rates)
+    )
+    if unexpected_topologies or unexpected_rates:
+        raise ValueError("primary rows contain conditions outside preregistration")
+    for (seed, model), model_rows in selected.groupby(["seed", "model"]):
+        if set(model_rows["scenario"]) != set(scenarios):
+            raise ValueError(
+                f"primary scenario matrix is incomplete for seed={seed}, model={model}"
+            )
 
     rows: list[dict[str, Any]] = []
     for (seed, recording_id), group in selected.groupby(
         ["seed", "recording_id"], sort=True, dropna=False
     ):
-        teacher = group.loc[group["model"].isin(conditions)]
+        teacher = group.loc[group["model"] == candidate_model]
         baseline = group.loc[group["model"] == strongest_baseline]
-        present = set(teacher["model"])
-        if present != set(conditions) or baseline.empty:
-            raise ValueError("primary matrix has missing teacher condition or baseline cells")
+        expected_cells = {(topology, rate) for topology in topologies for rate in rates}
+        for model_rows in (teacher, baseline):
+            cells = list(
+                zip(
+                    model_rows["topology"],
+                    model_rows["requested_fraction"].astype(float),
+                )
+            )
+            if len(cells) != len(set(cells)):
+                raise ValueError("primary matrix contains duplicate condition cells")
+            if set(cells) != expected_cells:
+                raise ValueError("primary matrix must be an exact complete condition matrix")
         for model_name, model_rows in (
             (strongest_baseline, baseline),
             ("teacher", teacher),
@@ -366,6 +429,45 @@ def make_primary_rows(
         ["seed", "recording_id", "model"], ignore_index=True
     )
     return validate_per_record_metrics(result)
+
+
+def paired_formal_summaries(
+    metrics: pd.DataFrame,
+    *,
+    candidate_model: str,
+    strongest_baseline: str,
+    required_topologies: Sequence[str],
+    required_rates: Sequence[float],
+    required_scenarios: Sequence[str],
+    required_seeds: Sequence[int],
+    bootstrap_samples: int = 10_000,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return appended primary and diagnostic paired summaries."""
+    checked = validate_per_record_metrics(metrics)
+    primary = make_primary_rows(
+        checked,
+        candidate_model=candidate_model,
+        strongest_baseline=strongest_baseline,
+        required_topologies=required_topologies,
+        required_rates=required_rates,
+        required_scenarios=required_scenarios,
+    )
+    primary_summary = paired_model_summary(
+        primary,
+        baseline=strongest_baseline,
+        required_seeds=required_seeds,
+        bootstrap_samples=bootstrap_samples,
+    )
+    secondary = checked.copy()
+    secondary.loc[secondary["model"] == candidate_model, "model"] = "teacher"
+    secondary_summary = paired_model_summary(
+        secondary,
+        baseline=strongest_baseline,
+        required_seeds=required_seeds,
+        bootstrap_samples=bootstrap_samples,
+    )
+    summary = pd.concat((primary_summary, secondary_summary), ignore_index=True)
+    return summary, primary
 
 
 def _dataframe_bytes(frame: pd.DataFrame, name: str) -> bytes:
@@ -455,6 +557,631 @@ def write_formal_artifacts(
     return hashes
 
 
+@dataclass
+class _FormalAssets:
+    manifest: pd.DataFrame
+    recordings: dict[str, tuple[Any, ...]]
+    scaler: RobustTrainScaler
+    split_hash: str
+    scaler_hash: str
+    git_commit: str
+    dirty_digest: str
+
+
+class _SharedWindowRepository:
+    def __init__(self, assets: _FormalAssets, config: TeacherConfig) -> None:
+        self.assets = assets
+        self.config = config
+        self._cache: dict[tuple[str, int, int], tuple[PreparedWindow, ...]] = {}
+
+    def get(self, split: str, seed: int, samples: int) -> tuple[PreparedWindow, ...]:
+        if split not in {"train", "validation"}:
+            raise ValueError("shared training windows may only use train or validation")
+        key = (split, seed, samples)
+        if key not in self._cache:
+            windows = materialize_teacher_windows(
+                self.assets.recordings[split],
+                self.assets.scaler,
+                window_samples=samples,
+                stride=max(1, samples // 2),
+                seed=seed,
+                topologies=self.config.training_topologies,
+                rates=self.config.training_rates,
+                exhaustive=True,
+            )
+            self._cache[key] = tuple(windows)
+        return self._cache[key]
+
+
+@dataclass
+class _Candidate:
+    seed: int
+    model_alias: str
+    condition: str
+    context_samples: int
+    validation_rmse: float
+    predictor: Any
+    checkpoint_sha256: str
+    checkpoint_path: Path
+
+
+@dataclass
+class _SelectedModels:
+    candidates: dict[tuple[int, str], _Candidate]
+    strongest_baseline: str
+
+
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_stable(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if not path.is_file() or path.read_bytes() != content:
+            raise FileExistsError(f"inconsistent frozen asset: {path.name}")
+        return
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        if path.read_bytes() != content:
+            raise FileExistsError(f"inconsistent frozen asset: {path.name}")
+        return
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+
+
+def _window_raw_predictions(
+    condition: str,
+    predictor: Any,
+    windows: Sequence[PreparedWindow],
+    device: torch.device,
+) -> list[np.ndarray]:
+    if condition in _CLASSICAL_MODELS:
+        values = []
+        for window in windows:
+            kwargs = {"empty_fill": 0.0}
+            if condition == "locf":
+                raw = timestamp_locf(window.observed, window.mask, window.time, **kwargs)
+            elif condition == "linear":
+                raw = timestamp_linear(window.observed, window.mask, window.time, **kwargs)
+            elif condition == "pchip":
+                raw = timestamp_pchip(window.observed, window.mask, window.time, **kwargs)
+            else:
+                raw = constant_velocity_rts(
+                    window.observed,
+                    window.mask,
+                    window.time,
+                    empty_fill=0.0,
+                    process_var=1.0,
+                    observation_var=1e-2,
+                )
+            values.append(raw.detach().cpu().numpy())
+        return values
+    if condition in _PYPOTS_MODELS:
+        target = np.stack([window.target.numpy() for window in windows])
+        mask = np.stack([window.mask.numpy() for window in windows])
+        completed = predictor.impute({"X": np.where(mask.astype(bool), target, np.nan)})
+        return [completed[index] for index in range(len(completed))]
+
+    loader = DataLoader(
+        list(windows),
+        batch_size=min(64, max(1, len(windows))),
+        shuffle=False,
+        collate_fn=collate_prepared_windows,
+    )
+    values: list[np.ndarray] = []
+    predictor.eval()
+    with torch.inference_mode():
+        for batch in loader:
+            output = predictor(
+                batch.features.to(device),
+                batch.dt.to(device),
+                batch.observed.to(device),
+                batch.mask.to(device),
+                batch.baseline.to(device),
+            )
+            values.extend(output.raw.detach().cpu().numpy())
+    return values
+
+
+def _missing_rmse(
+    predictions: Sequence[np.ndarray], windows: Sequence[PreparedWindow]
+) -> float:
+    if len(predictions) != len(windows) or not windows:
+        raise ValueError("validation predictions must align with non-empty windows")
+    squared = np.zeros(6, dtype=np.float64)
+    counts = np.zeros(6, dtype=np.int64)
+    for prediction, window in zip(predictions, windows):
+        target = window.target.numpy()
+        missing = window.mask.numpy() == 0
+        error = np.asarray(prediction, dtype=np.float64) - target
+        if not np.isfinite(error[missing]).all():
+            raise ValueError("validation predictions must be finite at missing values")
+        squared += np.where(missing, error * error, 0.0).sum(axis=0)
+        counts += missing.sum(axis=0)
+    represented = counts > 0
+    if not represented.any():
+        raise ValueError("validation windows must contain missing values")
+    result = float(np.sqrt(np.mean(squared[represented] / counts[represented])))
+    if not math.isfinite(result):
+        raise ValueError("validation RMSE must be finite")
+    return result
+
+
+class OXIODFormalBackend:
+    """Concrete OXIOD implementation of the frozen formal protocol.
+
+    Train/validation recordings are loaded and scaled before selection. Test
+    file contents are not loaded until :meth:`load_test_data`, which the outer
+    protocol calls only after all selected checkpoint identities are frozen.
+    """
+
+    def __init__(
+        self,
+        config: TeacherConfig,
+        *,
+        repository_root: Path,
+        output_root: Path | None,
+        requested_device: str,
+        discover_pairs=discover_oxiod_pairs,
+        splitter=stratified_file_split,
+        recording_loader=load_recording,
+    ) -> None:
+        self.config = _require_config(config)
+        self.repository_root = Path(repository_root).resolve()
+        selected_output = output_root or config.output_root
+        self.output_root = (
+            selected_output
+            if Path(selected_output).is_absolute()
+            else self.repository_root / selected_output
+        ).resolve()
+        if requested_device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("device must be auto, cpu, or cuda")
+        if requested_device == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA was requested but is unavailable")
+        resolved = "cuda" if requested_device == "cuda" or (
+            requested_device == "auto" and torch.cuda.is_available()
+        ) else "cpu"
+        self.device = torch.device(resolved)
+        self._discover_pairs = discover_pairs
+        self._splitter = splitter
+        self._recording_loader = recording_loader
+        self._assets: _FormalAssets | None = None
+        self._frozen: _SelectedModels | None = None
+        self._test_loaded = False
+        self._evaluated_cells: set[tuple[int, str, str]] = set()
+
+    def load_frozen_manifest_and_scaler(self) -> _FormalAssets:
+        if self._assets is not None:
+            return self._assets
+        data_root = self.config.data_root
+        if not data_root.is_absolute():
+            data_root = self.repository_root / data_root
+        manifest = self._splitter(self._discover_pairs(data_root), seed=2026)
+        if list(manifest.columns) != list(MANIFEST_COLUMNS):
+            raise ValueError("formal split manifest must use the frozen v2 schema")
+        if set(manifest["split"]) != {"train", "validation", "test"}:
+            raise ValueError("formal split requires non-empty train, validation, and test")
+        manifest = manifest.sort_values("recording_id", ignore_index=True)
+        split_content = manifest.to_csv(index=False, lineterminator="\n").encode("utf-8")
+        split_hash = _sha256_bytes(split_content)
+        _write_stable(
+            self.output_root / f"split_manifest-{split_hash}.csv", split_content
+        )
+
+        loaded: dict[str, tuple[Any, ...]] = {}
+        for split in ("train", "validation"):
+            rows = manifest.loc[manifest["split"] == split]
+            recordings = tuple(
+                self._recording_loader(Path(row.imu_path), Path(row.vicon_path))
+                for row in rows.itertuples(index=False)
+            )
+            if tuple(recording.id for recording in recordings) != tuple(rows["recording_id"]):
+                raise ValueError(f"loaded {split} recording identities do not match manifest")
+            loaded[split] = recordings
+        train_ids = {recording.id for recording in loaded["train"]}
+        scaler = RobustTrainScaler.fit(loaded["train"], allowed_ids=train_ids)
+        scaler_payload = {
+            "center": scaler.center_.tolist(),
+            "scale": scaler.scale_.tolist(),
+            "training_ids": list(scaler.training_ids),
+            "split_hash": split_hash,
+        }
+        scaler_content = (canonical_json(scaler_payload) + "\n").encode("utf-8")
+        scaler_hash = _sha256_bytes(scaler_content)
+        _write_stable(self.output_root / f"scaler-{scaler_hash}.json", scaler_content)
+        identity = git_worktree_identity(self.repository_root)
+        self._assets = _FormalAssets(
+            manifest=manifest,
+            recordings=loaded,
+            scaler=scaler,
+            split_hash=split_hash,
+            scaler_hash=scaler_hash,
+            git_commit=identity["git_commit"],
+            dirty_digest=identity["dirty_state_digest"],
+        )
+        return self._assets
+
+    def materialize_train_validation(
+        self, assets: _FormalAssets, plan: Mapping
+    ) -> _SharedWindowRepository:
+        if assets is not self._assets or plan.get("selection_split") != "validation":
+            raise ValueError("formal assets or selection plan identity changed")
+        return _SharedWindowRepository(assets, self.config)
+
+    def _classical_checkpoint(self, candidate_config: Mapping[str, Any]) -> tuple[Path, str]:
+        content = (canonical_json(candidate_config) + "\n").encode("utf-8")
+        digest = _sha256_bytes(content)
+        path = self.output_root / "candidates" / f"classical-{digest}.json"
+        _write_stable(path, content)
+        return path, digest
+
+    def _native_candidate(
+        self,
+        condition: str,
+        seed: int,
+        samples: int,
+        train_windows: Sequence[PreparedWindow],
+        validation_windows: Sequence[PreparedWindow],
+        assets: _FormalAssets,
+    ) -> _Candidate:
+        _seed_everything(seed)
+        model = build_native_model(condition, self.config).to(self.device)
+        generator = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(
+            list(train_windows), batch_size=self.config.batch_size, shuffle=True,
+            generator=generator, collate_fn=collate_prepared_windows,
+        )
+        validation_loader = DataLoader(
+            list(validation_windows), batch_size=self.config.batch_size, shuffle=False,
+            collate_fn=collate_prepared_windows,
+        )
+        resolved = {
+            "mode": "imputation_v3_formal_candidate",
+            "selection_split": "validation",
+            "condition": condition,
+            "seed": seed,
+            "context_samples": samples,
+            "device": str(self.device),
+            "hyperparameters": {
+                "batch_size": self.config.batch_size,
+                "epochs": self.config.epochs,
+                "hidden_size": self.config.hidden_size,
+                "tcn_width": self.config.tcn_width,
+                "tcn_dilations": list(self.config.tcn_dilations),
+                "learning_rate": self.config.learning_rate,
+                "training_topologies": list(self.config.training_topologies),
+                "training_rates": list(self.config.training_rates),
+            },
+            "train_window_ids_sha256": _sha256_bytes(
+                canonical_json([window.window_id for window in train_windows]).encode("utf-8")
+            ),
+            "validation_window_ids_sha256": _sha256_bytes(
+                canonical_json([window.window_id for window in validation_windows]).encode("utf-8")
+            ),
+        }
+        provenance = collect_provenance(
+            resolved, seed, split_hash=assets.split_hash,
+            scaler_hash=assets.scaler_hash, git_commit=assets.git_commit,
+            dirty_digest=assets.dirty_digest,
+        )
+        run_dir = self.output_root / "candidates" / provenance["run_id"]
+        metadata_path = run_dir / "checkpoint.json"
+        expected = None
+        if metadata_path.is_file():
+            expected = json.loads(metadata_path.read_text(encoding="utf-8")).get(
+                "checkpoint_sha256"
+            )
+        train_epoch, eval_epoch = make_teacher_callbacks(self.device)
+        metadata = train_one_run(
+            run_dir, provenance, train_loader=train_loader,
+            validation_loader=validation_loader, epochs=self.config.epochs,
+            train_epoch=train_epoch, evaluate_epoch=eval_epoch, model=model,
+            optimizer=torch.optim.Adam(model.parameters(), lr=self.config.learning_rate),
+            expected_checkpoint_sha256=expected,
+        )
+        state = torch.load(run_dir / "best.pt", map_location=self.device, weights_only=True)
+        model.load_state_dict(state)
+        score = float(eval_epoch(model, validation_loader, 0)["missing_rmse"])
+        return _Candidate(seed, condition, condition, samples, score, model,
+                          metadata["checkpoint_sha256"], run_dir / "best.pt")
+
+    def _pypots_candidate(
+        self,
+        condition: str,
+        seed: int,
+        samples: int,
+        train_windows: Sequence[PreparedWindow],
+        validation_windows: Sequence[PreparedWindow],
+    ) -> _Candidate:
+        _seed_everything(seed)
+        train_data = SimpleNamespace(
+            target=np.stack([window.target.numpy() for window in train_windows]),
+            mask=np.stack([window.mask.numpy() for window in train_windows]),
+        )
+        validation_data = SimpleNamespace(
+            target=np.stack([window.target.numpy() for window in validation_windows]),
+            mask=np.stack([window.mask.numpy() for window in validation_windows]),
+        )
+        train_set, validation_set = to_pypots_sets(train_data, validation_data)
+        saving_path = self.output_root / "candidates" / f"{condition}-{seed}-{samples}"
+        adapter = build_pypots_model(
+            condition, n_steps=samples, epochs=self.config.epochs,
+            batch_size=self.config.batch_size, device=str(self.device),
+            saving_path=saving_path,
+        )
+        adapter.fit(train_set, validation_set)
+        completed = adapter.impute({"X": validation_set["X"]})
+        score = _missing_rmse(
+            [completed[index] for index in range(len(completed))], validation_windows
+        )
+        state_dict = getattr(adapter.model, "state_dict", None)
+        if not callable(state_dict):
+            raise TypeError("PyPOTS model must expose state_dict for frozen identity")
+        checkpoint = saving_path / "formal-best.pt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        if not checkpoint.exists():
+            torch.save(state_dict(), checkpoint)
+        digest = _sha256_path(checkpoint)
+        return _Candidate(seed, condition, condition, samples, score, adapter, digest, checkpoint)
+
+    def train_select_validation(
+        self, windows: _SharedWindowRepository, plan: Mapping
+    ) -> dict[tuple[int, str], _Candidate]:
+        if not isinstance(windows, _SharedWindowRepository):
+            raise TypeError("formal training requires the shared Task7 window repository")
+        best: dict[tuple[int, str], _Candidate] = {}
+        seen: set[tuple[int, str, int]] = set()
+        for cell in plan["cells"]:
+            seed = int(cell["seed"])
+            condition = str(cell["condition"])
+            alias = str(cell["model"])
+            samples = int(cell["context_samples"])
+            identity = (seed, condition, samples)
+            if identity in seen:
+                raise ValueError("formal candidate matrix contains duplicates")
+            seen.add(identity)
+            train_windows = windows.get("train", seed, samples)
+            validation_windows = windows.get("validation", seed, samples)
+            if condition in _CLASSICAL_MODELS:
+                predictor = None
+                score = _missing_rmse(
+                    _window_raw_predictions(condition, predictor, validation_windows, self.device),
+                    validation_windows,
+                )
+                descriptor = {
+                    "kind": "classical", "condition": condition, "seed": seed,
+                    "context_samples": samples, "selection_split": "validation",
+                }
+                path, digest = self._classical_checkpoint(descriptor)
+                candidate = _Candidate(seed, alias, condition, samples, score, None, digest, path)
+            elif condition in _PYPOTS_MODELS:
+                candidate = self._pypots_candidate(
+                    condition, seed, samples, train_windows, validation_windows
+                )
+                candidate.model_alias = alias
+            else:
+                candidate = self._native_candidate(
+                    condition, seed, samples, train_windows, validation_windows, windows.assets
+                )
+                candidate.model_alias = alias
+            key = (seed, condition)
+            current = best.get(key)
+            if current is None or (candidate.validation_rmse, samples) < (
+                current.validation_rmse, current.context_samples
+            ):
+                best[key] = candidate
+        return best
+
+    def freeze_checkpoints(
+        self, selected: dict[tuple[int, str], _Candidate], plan: Mapping
+    ) -> _SelectedModels:
+        expected = {(int(cell["seed"]), str(cell["condition"])) for cell in plan["cells"]}
+        if set(selected) != expected:
+            raise ValueError("selected checkpoint matrix is incomplete")
+        for candidate in selected.values():
+            if (
+                not candidate.checkpoint_path.is_file()
+                or _sha256_path(candidate.checkpoint_path)
+                != candidate.checkpoint_sha256
+            ):
+                raise ValueError("selected checkpoint identity does not match frozen bytes")
+        baselines = [
+            candidate for candidate in selected.values()
+            if candidate.condition not in TEACHER_CONDITION_MODES
+        ]
+        if not baselines:
+            raise ValueError("formal gate requires at least one eligible baseline")
+        means: dict[str, list[float]] = {}
+        for candidate in baselines:
+            means.setdefault(candidate.condition, []).append(candidate.validation_rmse)
+        strongest = min(means, key=lambda name: (float(np.mean(means[name])), name))
+        manifest = {
+            "selection_split": "validation",
+            "split_hash": self._assets.split_hash,
+            "scaler_hash": self._assets.scaler_hash,
+            "git_commit": self._assets.git_commit,
+            "dirty_state_digest": self._assets.dirty_digest,
+            "strongest_baseline": strongest,
+            "checkpoints": [
+                {
+                    "seed": seed,
+                    "condition": condition,
+                    "context_samples": candidate.context_samples,
+                    "validation_rmse": candidate.validation_rmse,
+                    "checkpoint_sha256": candidate.checkpoint_sha256,
+                }
+                for (seed, condition), candidate in sorted(selected.items())
+            ],
+        }
+        _write_stable(
+            self.output_root / "frozen_models.json",
+            (canonical_json(manifest) + "\n").encode("utf-8"),
+        )
+        self._frozen = _SelectedModels(selected, strongest)
+        return self._frozen
+
+    def load_test_data(self, assets: _FormalAssets) -> tuple[Any, ...]:
+        if assets is not self._assets:
+            raise ValueError("test loader received different frozen assets")
+        if self._frozen is None:
+            raise RuntimeError("test data cannot be loaded before checkpoint freeze")
+        for candidate in self._frozen.candidates.values():
+            if (
+                not candidate.checkpoint_path.is_file()
+                or _sha256_path(candidate.checkpoint_path)
+                != candidate.checkpoint_sha256
+            ):
+                raise ValueError("frozen checkpoint identity changed before test load")
+        if self._test_loaded:
+            raise RuntimeError("formal test data may be loaded exactly once")
+        self._test_loaded = True
+        rows = assets.manifest.loc[assets.manifest["split"] == "test"]
+        recordings = tuple(
+            self._recording_loader(Path(row.imu_path), Path(row.vicon_path))
+            for row in rows.itertuples(index=False)
+        )
+        if tuple(recording.id for recording in recordings) != tuple(rows["recording_id"]):
+            raise ValueError("loaded test recording identities do not match manifest")
+        return recordings
+
+    @staticmethod
+    def _full_mask(target: torch.Tensor, recording_id: str, seed: int, topology: str, rate: float):
+        digest = hashlib.sha256(
+            canonical_json(["formal-test-mask-v1", recording_id, seed, topology, rate]).encode("utf-8")
+        ).digest()
+        condition_seed = int.from_bytes(digest[:8], "big") % (2**63 - 1)
+        generator = {"point": point_missing, "block": contiguous_block, "channel": channel_outage}[topology]
+        return generator(target, rate, condition_seed).mask
+
+    def _predict_full(
+        self, candidate: _Candidate, target: torch.Tensor, mask: torch.Tensor, time: torch.Tensor
+    ) -> np.ndarray:
+        observed = torch.where(mask.bool(), target, torch.zeros_like(target))
+        if candidate.condition in _CLASSICAL_MODELS:
+            window = SimpleNamespace(observed=observed, mask=mask, time=time)
+            return _window_raw_predictions(candidate.condition, None, [window], self.device)[0]
+        length = len(target)
+        samples = candidate.context_samples
+        if length < samples:
+            raise ValueError("test recording is shorter than selected context")
+        stride = max(1, samples // 2)
+        starts = list(range(0, length - samples + 1, stride))
+        if starts[-1] != length - samples:
+            starts.append(length - samples)
+        delta = torch.empty_like(time)
+        delta[1:] = time[1:] - time[:-1]
+        delta[0] = delta[1] if len(delta) > 1 else torch.tensor(
+            self.config.nominal_dt_s, dtype=time.dtype
+        )
+        features = build_features(target, mask, delta).values
+        baseline = timestamp_linear(observed, mask, time, empty_fill=0.0)
+        if candidate.condition in _PYPOTS_MODELS:
+            x = np.stack([
+                np.where(mask[start:start + samples].numpy().astype(bool),
+                         target[start:start + samples].numpy(), np.nan)
+                for start in starts
+            ])
+            predicted = candidate.predictor.impute({"X": x})
+        else:
+            candidate.predictor.eval()
+            predicted_parts = []
+            with torch.inference_mode():
+                for offset in range(0, len(starts), self.config.batch_size):
+                    group = starts[offset:offset + self.config.batch_size]
+                    output = candidate.predictor(
+                        torch.stack([features[s:s + samples] for s in group]).to(self.device),
+                        torch.stack([delta[s:s + samples] for s in group]).to(self.device),
+                        torch.stack([observed[s:s + samples] for s in group]).to(self.device),
+                        torch.stack([mask[s:s + samples] for s in group]).to(self.device),
+                        torch.stack([baseline[s:s + samples] for s in group]).to(self.device),
+                    )
+                    predicted_parts.extend(output.raw.detach().cpu().numpy())
+            predicted = np.asarray(predicted_parts)
+        total = np.zeros(target.shape, dtype=np.float64)
+        count = np.zeros((length, 1), dtype=np.int64)
+        for raw, start in zip(predicted, starts):
+            total[start:start + samples] += raw
+            count[start:start + samples] += 1
+        if np.any(count == 0):
+            raise RuntimeError("formal stitched prediction left uncovered samples")
+        return total / count
+
+    def evaluate_test_once(
+        self, frozen: _SelectedModels, test_data: tuple[Any, ...], plan: Mapping
+    ) -> Mapping[str, Any]:
+        if frozen is not self._frozen or not self._test_loaded:
+            raise ValueError("test evaluation requires frozen models and one loaded test set")
+        scenarios = dict(zip(self._assets.manifest["recording_id"], self._assets.manifest["scenario"]))
+        rows: list[pd.DataFrame] = []
+        ledger: dict[tuple[int, str, str, float], dict[str, Any]] = {}
+        for (seed, condition), candidate in sorted(frozen.candidates.items()):
+            for recording in test_data:
+                cell = (seed, condition, recording.id)
+                if cell in self._evaluated_cells:
+                    raise RuntimeError("each recording/model/seed may be evaluated exactly once")
+                self._evaluated_cells.add(cell)
+                target_np = self._assets.scaler.transform(recording.imu_six)
+                target = torch.as_tensor(target_np, dtype=torch.float32)
+                time = torch.as_tensor(recording.imu_time_s, dtype=torch.float32)
+                time = time - time[0]
+                for topology in self.config.training_topologies:
+                    for rate in self.config.training_rates:
+                        key = (seed, recording.id, topology, rate)
+                        mask = self._full_mask(target, recording.id, seed, topology, rate)
+                        mask_bytes = np.ascontiguousarray(mask.numpy()).tobytes()
+                        mask_sha = _sha256_bytes(mask_bytes)
+                        prior = ledger.get(key)
+                        entry = {
+                            "seed": seed, "recording_id": recording.id,
+                            "topology": topology, "requested_fraction": rate,
+                            "realized_fraction": float((mask == 0).double().mean()),
+                            "mask_sha256": mask_sha,
+                        }
+                        if prior is not None and prior != entry:
+                            raise RuntimeError("formal masks changed across models")
+                        ledger[key] = entry
+                        raw = self._predict_full(candidate, target, mask, time)
+                        rows.append(evaluate_record_rows(
+                            raw_windows=[raw], starts=[0], target_normalized=target_np,
+                            observed_mask=mask.numpy(), time=recording.imu_time_s,
+                            scaler=self._assets.scaler, run_id=f"formal-{seed}-{condition}",
+                            seed=seed, recording_id=recording.id,
+                            scenario=str(scenarios[recording.id]), topology=topology,
+                            requested_fraction=rate,
+                            realized_fraction=entry["realized_fraction"], model=condition,
+                            checkpoint_sha256=candidate.checkpoint_sha256,
+                        ))
+        metrics = pd.concat(rows, ignore_index=True)
+        return {
+            "per_record_metrics": metrics,
+            "mask_ledger": pd.DataFrame(list(ledger.values())),
+            "strongest_baseline": frozen.strongest_baseline,
+            "primary_candidate_model": "teacher_actual_residual",
+            "required_scenarios": sorted(set(scenarios.values())),
+        }
+
+
 class FormalBackend(Protocol):
     """Phase-separated backend that makes pre-freeze test access impossible by API."""
 
@@ -518,17 +1245,23 @@ def run_formal_protocol(
     if not isinstance(strongest, str) or not strongest:
         raise ValueError("strongest_baseline must be a non-empty string")
     condition_metrics = validate_per_record_metrics(evaluation["per_record_metrics"])
-    primary_conditions = tuple(
-        evaluation.get("primary_teacher_conditions", ("teacher_actual_residual",))
+    candidate_model = evaluation.get(
+        "primary_candidate_model", "teacher_actual_residual"
     )
-    primary = make_primary_rows(
+    if not isinstance(candidate_model, str):
+        raise TypeError("primary_candidate_model must be a string")
+    summary, primary = paired_formal_summaries(
         condition_metrics,
-        teacher_conditions=primary_conditions,
+        candidate_model=candidate_model,
         strongest_baseline=strongest,
-    )
-    summary = paired_model_summary(
-        primary,
-        baseline=strongest,
+        required_topologies=config.training_topologies,
+        required_rates=config.training_rates,
+        required_scenarios=tuple(
+            evaluation.get(
+                "required_scenarios",
+                sorted(set(condition_metrics["scenario"].astype(str))),
+            )
+        ),
         required_seeds=FORMAL_SEEDS,
     )
     gate = success_gate_payload(summary, strongest_baseline=strongest)
@@ -552,10 +1285,12 @@ def run_formal_protocol(
 __all__ = [
     "FORMAL_SEEDS",
     "FormalBackend",
+    "OXIODFormalBackend",
     "build_native_model",
     "evaluate_record_rows",
     "formal_matrix_plan",
     "make_primary_rows",
+    "paired_formal_summaries",
     "run_formal_protocol",
     "success_gate_payload",
     "teacher_success",
