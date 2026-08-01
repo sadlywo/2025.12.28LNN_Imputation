@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+import gc
 import hashlib
+import io
 import json
 import math
 from numbers import Real
@@ -19,13 +21,17 @@ from typing import Any, Final, Protocol
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from imputation_v3.config import TeacherConfig
 from imputation_v3.data.features import build_features
-from imputation_v3.data.windows import collate_prepared_windows, materialize_teacher_windows
+from imputation_v3.data.windows import collate_prepared_windows, iter_teacher_windows
 from imputation_v3.experiments.evaluate import evaluate_record_diagnostics
-from imputation_v3.experiments.pypots import build_pypots_model, to_pypots_sets
+from imputation_v3.experiments.pypots import (
+    build_pypots_model,
+    installed_pypots_version,
+    to_pypots_sets,
+)
 from imputation_v3.experiments.training import make_teacher_callbacks
 from imputation_v3.models.baselines import (
     constant_velocity_rts,
@@ -159,9 +165,12 @@ def reload_pypots_predictor(
 ) -> None:
     """Hash-verify and load exact frozen inner PyPOTS predictor bytes."""
     path = Path(checkpoint_path)
+    frozen_bytes = _read_verified_bytes(
+        path, expected_sha256, label="PyPOTS checkpoint"
+    )
+    payload = torch.load(io.BytesIO(frozen_bytes), map_location="cpu", weights_only=True)
     if not path.is_file() or _sha256_path(path) != expected_sha256:
-        raise ValueError("PyPOTS checkpoint hash does not match frozen identity")
-    payload = torch.load(path, map_location="cpu", weights_only=True)
+        raise ValueError("PyPOTS checkpoint changed during deserialization")
     expected_identity = canonical_json(dict(constructor_identity))
     if not isinstance(payload, dict) or payload.get("constructor_identity") != expected_identity:
         raise ValueError("PyPOTS constructor identity does not match checkpoint")
@@ -182,7 +191,13 @@ def freeze_pypots_predictor(
     identity_json = canonical_json(dict(constructor_identity))
     fitted_state = _cpu_state_dict(_pypots_state_target(adapter))
     if path.exists():
-        existing = torch.load(path, map_location="cpu", weights_only=True)
+        existing_bytes = path.read_bytes()
+        existing_digest = _sha256_bytes(existing_bytes)
+        existing = torch.load(
+            io.BytesIO(existing_bytes), map_location="cpu", weights_only=True
+        )
+        if not path.is_file() or _sha256_path(path) != existing_digest:
+            raise ValueError("PyPOTS checkpoint changed during comparison")
         if (
             not isinstance(existing, dict)
             or existing.get("constructor_identity") != identity_json
@@ -755,20 +770,14 @@ def write_formal_artifacts(
             if not path.is_file() or path.read_bytes() != content:
                 raise FileExistsError(f"inconsistent prior formal artifact: {name}")
     root.mkdir(parents=True, exist_ok=True)
-    for name, content in payloads.items():
-        path = root / name
-        if path.exists():
-            continue
-        try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            if path.read_bytes() != content:
-                raise FileExistsError(f"inconsistent prior formal artifact: {name}")
-            continue
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
+    # The hash manifest is the completion marker and is deliberately published
+    # last. A crash can leave complete individual files, never a partial target;
+    # rerun safely completes the set after the same-content preflight.
+    ordered_names = [
+        name for name in payloads if name != "artifact_hashes.json"
+    ] + ["artifact_hashes.json"]
+    for name in ordered_names:
+        _write_stable(root / name, payloads[name])
     return hashes
 
 
@@ -788,25 +797,53 @@ class _SharedWindowRepository:
     def __init__(self, assets: _FormalAssets, config: TeacherConfig) -> None:
         self.assets = assets
         self.config = config
-        self._cache: dict[tuple[str, int, int], tuple[PreparedWindow, ...]] = {}
+        self._identity_cache: dict[tuple[str, int, int], tuple[str, int]] = {}
 
-    def get(self, split: str, seed: int, samples: int) -> tuple[PreparedWindow, ...]:
+    def iter(self, split: str, seed: int, samples: int):
         if split not in {"train", "validation"}:
             raise ValueError("shared training windows may only use train or validation")
+        return iter_teacher_windows(
+            self.assets.recordings[split],
+            self.assets.scaler,
+            window_samples=samples,
+            stride=max(1, samples // 2),
+            seed=seed,
+            topologies=self.config.training_topologies,
+            rates=self.config.training_rates,
+            exhaustive=True,
+        )
+
+    def identity(self, split: str, seed: int, samples: int) -> tuple[str, int]:
         key = (split, seed, samples)
-        if key not in self._cache:
-            windows = materialize_teacher_windows(
-                self.assets.recordings[split],
-                self.assets.scaler,
-                window_samples=samples,
-                stride=max(1, samples // 2),
-                seed=seed,
-                topologies=self.config.training_topologies,
-                rates=self.config.training_rates,
-                exhaustive=True,
+        if key not in self._identity_cache:
+            identifiers = [window.window_id for window in self.iter(*key)]
+            self._identity_cache[key] = (
+                _sha256_bytes(canonical_json(identifiers).encode("utf-8")),
+                len(identifiers),
             )
-            self._cache[key] = tuple(windows)
-        return self._cache[key]
+        return self._identity_cache[key]
+
+    @property
+    def cached_tensor_windows(self) -> int:
+        return 0
+
+    @property
+    def identity_cache_cardinality(self) -> int:
+        return len(self._identity_cache)
+
+
+class _WindowIterableDataset(IterableDataset):
+    def __init__(
+        self, repository: _SharedWindowRepository, split: str, seed: int, samples: int
+    ) -> None:
+        super().__init__()
+        self.repository = repository
+        self.split = split
+        self.seed = seed
+        self.samples = samples
+
+    def __iter__(self):
+        return self.repository.iter(self.split, self.seed, self.samples)
 
 
 @dataclass
@@ -816,11 +853,12 @@ class _Candidate:
     condition: str
     context_samples: int
     validation_rmse: float
-    predictor: Any
     checkpoint_sha256: str
     checkpoint_path: Path
     capacity: dict[str, Any] | None = None
     validation_scores: tuple[dict[str, Any], ...] = ()
+    inference_config: dict[str, Any] | None = None
+    constructor_identity: dict[str, Any] | None = None
 
 
 @dataclass
@@ -846,22 +884,42 @@ def _verify_source_sha(path: Path, expected_sha256: str) -> None:
         raise ValueError(f"frozen source SHA256 mismatch: {path}")
 
 
+def _read_verified_bytes(path: Path, expected_sha256: str, *, label: str) -> bytes:
+    if not path.is_file():
+        raise ValueError(f"{label} is missing: {path}")
+    content = path.read_bytes()
+    if _sha256_bytes(content) != expected_sha256:
+        raise ValueError(f"{label} hash does not match frozen identity")
+    return content
+
+
 def _write_stable(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         if not path.is_file() or path.read_bytes() != content:
             raise FileExistsError(f"inconsistent frozen asset: {path.name}")
         return
+    temporary: Path | None = None
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        if path.read_bytes() != content:
-            raise FileExistsError(f"inconsistent frozen asset: {path.name}")
-        return
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=path.parent, prefix=f".{path.name}-", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if _sha256_path(temporary) != _sha256_bytes(content):
+            raise OSError(f"temporary publish verification failed: {path.name}")
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if not path.is_file() or path.read_bytes() != content:
+                raise FileExistsError(f"inconsistent frozen asset: {path.name}")
+        if not path.is_file() or _sha256_path(path) != _sha256_bytes(content):
+            raise OSError(f"published asset verification failed: {path.name}")
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def _seed_everything(seed: int) -> None:
@@ -871,6 +929,33 @@ def _seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(True)
+
+
+def _relative_time_tensor(raw_time: Any) -> torch.Tensor:
+    time64 = np.asarray(raw_time, dtype=np.float64)
+    if time64.ndim != 1 or time64.size < 2 or not np.isfinite(time64).all():
+        raise ValueError("recording time must be a finite one-dimensional sequence")
+    if not np.all(np.diff(time64) > 0):
+        raise ValueError("recording time must be strictly increasing")
+    relative64 = time64 - time64[0]
+    relative32 = relative64.astype(np.float32)
+    if not np.isfinite(relative32).all() or not np.all(np.diff(relative32) > 0):
+        raise ValueError("relative recording time must remain strictly increasing")
+    return torch.from_numpy(np.array(relative32, copy=True))
+
+
+def _release_predictor(predictor: Any) -> None:
+    module = predictor if isinstance(predictor, torch.nn.Module) else None
+    if module is None:
+        outer = getattr(predictor, "model", None)
+        inner = getattr(outer, "model", None)
+        module = inner if isinstance(inner, torch.nn.Module) else outer
+    if isinstance(module, torch.nn.Module):
+        module.to(device="cpu")
+    del predictor
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _window_raw_predictions(
@@ -954,6 +1039,33 @@ def _missing_rmse(
     return result
 
 
+def _stream_missing_rmse(
+    condition: str,
+    predictor: Any,
+    windows: Any,
+    device: torch.device,
+) -> float:
+    squared = np.zeros(6, dtype=np.float64)
+    counts = np.zeros(6, dtype=np.int64)
+    seen = 0
+    for window in windows:
+        prediction = _window_raw_predictions(
+            condition, predictor, [window], device
+        )[0]
+        target = window.target.numpy()
+        missing = window.mask.numpy() == 0
+        error = np.asarray(prediction, dtype=np.float64) - target
+        if not np.isfinite(error[missing]).all():
+            raise ValueError("validation predictions must be finite at missing values")
+        squared += np.where(missing, error * error, 0.0).sum(axis=0)
+        counts += missing.sum(axis=0)
+        seen += 1
+    represented = counts > 0
+    if seen == 0 or not represented.any():
+        raise ValueError("validation windows must contain missing values")
+    return float(np.sqrt(np.mean(squared[represented] / counts[represented])))
+
+
 class OXIODFormalBackend:
     """Concrete OXIOD implementation of the frozen formal protocol.
 
@@ -1005,6 +1117,18 @@ class OXIODFormalBackend:
             self._source_verifier(Path(row.imu_path), str(row.imu_sha256))
             self._source_verifier(Path(row.vicon_path), str(row.vicon_sha256))
 
+    def _load_verified_recording(self, row: Any) -> Any:
+        imu_path = Path(row.imu_path)
+        vicon_path = Path(row.vicon_path)
+        self._source_verifier(imu_path, str(row.imu_sha256))
+        self._source_verifier(vicon_path, str(row.vicon_sha256))
+        recording = self._recording_loader(imu_path, vicon_path)
+        # The legacy OXIOD loader is path-based.  A second verification closes
+        # the mutation-during-parse window and rejects any mixed snapshot.
+        self._source_verifier(imu_path, str(row.imu_sha256))
+        self._source_verifier(vicon_path, str(row.vicon_sha256))
+        return recording
+
     def load_frozen_manifest_and_scaler(self) -> _FormalAssets:
         if self._assets is not None:
             return self._assets
@@ -1028,7 +1152,7 @@ class OXIODFormalBackend:
             rows = manifest.loc[manifest["split"] == split]
             self._verify_split_sources(manifest, split)
             recordings = tuple(
-                self._recording_loader(Path(row.imu_path), Path(row.vicon_path))
+                self._load_verified_recording(row)
                 for row in rows.itertuples(index=False)
             )
             if tuple(recording.id for recording in recordings) != tuple(rows["recording_id"]):
@@ -1081,23 +1205,26 @@ class OXIODFormalBackend:
         condition: str,
         seed: int,
         samples: int,
-        train_windows: Sequence[PreparedWindow],
-        validation_windows: Sequence[PreparedWindow],
-        assets: _FormalAssets,
+        windows: _SharedWindowRepository,
         capacity: Mapping[str, Any],
     ) -> _Candidate:
         _seed_everything(seed)
         model = build_native_model(
             condition, self.config, capacity=capacity
         ).to(self.device)
-        generator = torch.Generator().manual_seed(seed)
         train_loader = DataLoader(
-            list(train_windows), batch_size=self.config.batch_size, shuffle=True,
-            generator=generator, collate_fn=collate_prepared_windows,
+            _WindowIterableDataset(windows, "train", seed, samples),
+            batch_size=self.config.batch_size,
+            collate_fn=collate_prepared_windows,
         )
         validation_loader = DataLoader(
-            list(validation_windows), batch_size=self.config.batch_size, shuffle=False,
+            _WindowIterableDataset(windows, "validation", seed, samples),
+            batch_size=self.config.batch_size,
             collate_fn=collate_prepared_windows,
+        )
+        train_identity, train_count = windows.identity("train", seed, samples)
+        validation_identity, validation_count = windows.identity(
+            "validation", seed, samples
         )
         resolved = {
             "mode": "imputation_v3_formal_candidate",
@@ -1117,17 +1244,16 @@ class OXIODFormalBackend:
                 "training_topologies": list(self.config.training_topologies),
                 "training_rates": list(self.config.training_rates),
             },
-            "train_window_ids_sha256": _sha256_bytes(
-                canonical_json([window.window_id for window in train_windows]).encode("utf-8")
-            ),
-            "validation_window_ids_sha256": _sha256_bytes(
-                canonical_json([window.window_id for window in validation_windows]).encode("utf-8")
-            ),
+            "train_window_ids_sha256": train_identity,
+            "train_window_count": train_count,
+            "validation_window_ids_sha256": validation_identity,
+            "validation_window_count": validation_count,
         }
         provenance = collect_provenance(
-            resolved, seed, split_hash=assets.split_hash,
-            scaler_hash=assets.scaler_hash, git_commit=assets.git_commit,
-            dirty_digest=assets.dirty_digest,
+            resolved, seed, split_hash=windows.assets.split_hash,
+            scaler_hash=windows.assets.scaler_hash,
+            git_commit=windows.assets.git_commit,
+            dirty_digest=windows.assets.dirty_digest,
         )
         run_dir = self.output_root / "candidates" / provenance["run_id"]
         metadata_path = run_dir / "checkpoint.json"
@@ -1144,24 +1270,36 @@ class OXIODFormalBackend:
             optimizer=torch.optim.Adam(model.parameters(), lr=self.config.learning_rate),
             expected_checkpoint_sha256=expected,
         )
-        state = torch.load(run_dir / "best.pt", map_location=self.device, weights_only=True)
+        checkpoint = run_dir / "best.pt"
+        frozen_bytes = _read_verified_bytes(
+            checkpoint, metadata["checkpoint_sha256"], label="native checkpoint"
+        )
+        state = torch.load(
+            io.BytesIO(frozen_bytes), map_location=self.device, weights_only=True
+        )
+        if _sha256_path(checkpoint) != metadata["checkpoint_sha256"]:
+            raise ValueError("native checkpoint changed during deserialization")
         model.load_state_dict(state)
         score = float(eval_epoch(model, validation_loader, 0)["missing_rmse"])
-        return _Candidate(
-            seed, condition, condition, samples, score, model,
-            metadata["checkpoint_sha256"], run_dir / "best.pt",
+        candidate = _Candidate(
+            seed, condition, condition, samples, score,
+            metadata["checkpoint_sha256"], checkpoint,
             capacity=dict(capacity),
+            inference_config={"kind": "native"},
         )
+        _release_predictor(model)
+        return candidate
 
     def _pypots_candidate(
         self,
         condition: str,
         seed: int,
         samples: int,
-        train_windows: Sequence[PreparedWindow],
-        validation_windows: Sequence[PreparedWindow],
+        windows: _SharedWindowRepository,
     ) -> _Candidate:
         _seed_everything(seed)
+        train_windows = tuple(windows.iter("train", seed, samples))
+        validation_windows = tuple(windows.iter("validation", seed, samples))
         train_data = SimpleNamespace(
             target=np.stack([window.target.numpy() for window in train_windows]),
             mask=np.stack([window.mask.numpy() for window in train_windows]),
@@ -1185,8 +1323,9 @@ class OXIODFormalBackend:
         checkpoint = saving_path / "formal-best.pt"
         outer = adapter.model
         inner = _pypots_state_target(adapter)
+        actual_version = installed_pypots_version()
         constructor_identity = {
-            "pypots_version": "1.5.0",
+            "pypots_version": actual_version,
             "condition": condition,
             "n_steps": samples,
             "epochs": self.config.epochs,
@@ -1199,10 +1338,15 @@ class OXIODFormalBackend:
             checkpoint,
             constructor_identity=constructor_identity,
         )
-        return _Candidate(
-            seed, condition, condition, samples, score, adapter, digest, checkpoint,
+        candidate = _Candidate(
+            seed, condition, condition, samples, score, digest, checkpoint,
             capacity={"capacity": "fixed"},
+            inference_config={"kind": "pypots", "pypots_version": actual_version},
+            constructor_identity=constructor_identity,
         )
+        _release_predictor(adapter)
+        del train_windows, validation_windows, train_data, validation_data
+        return candidate
 
     def train_select_validation(
         self, windows: _SharedWindowRepository, plan: Mapping
@@ -1222,8 +1366,6 @@ class OXIODFormalBackend:
             condition = str(cell["condition"])
             alias = str(cell["model"])
             samples = int(cell["context_samples"])
-            train_windows = windows.get("train", seed, samples)
-            validation_windows = windows.get("validation", seed, samples)
             for raw_capacity in cell["capacity_candidates"]:
                 capacity = dict(raw_capacity)
                 capacity_json = canonical_json(capacity)
@@ -1240,11 +1382,17 @@ class OXIODFormalBackend:
                         if condition == "rts"
                         else None
                     )
-                    score = _missing_rmse(
-                        _window_raw_predictions(
-                            condition, predictor, validation_windows, self.device
-                        ),
-                        validation_windows,
+                    score = _stream_missing_rmse(
+                        condition,
+                        predictor,
+                        windows.iter("validation", seed, samples),
+                        self.device,
+                    )
+                    train_identity, train_count = windows.identity(
+                        "train", seed, samples
+                    )
+                    validation_identity, validation_count = windows.identity(
+                        "validation", seed, samples
                     )
                     descriptor = {
                         "kind": "classical", "condition": condition, "seed": seed,
@@ -1252,12 +1400,10 @@ class OXIODFormalBackend:
                         "selection_split": "validation", "validation_rmse": score,
                         "split_hash": windows.assets.split_hash,
                         "scaler_hash": windows.assets.scaler_hash,
-                        "train_window_ids_sha256": _sha256_bytes(
-                            canonical_json([item.window_id for item in train_windows]).encode("utf-8")
-                        ),
-                        "validation_window_ids_sha256": _sha256_bytes(
-                            canonical_json([item.window_id for item in validation_windows]).encode("utf-8")
-                        ),
+                        "train_window_ids_sha256": train_identity,
+                        "train_window_count": train_count,
+                        "validation_window_ids_sha256": validation_identity,
+                        "validation_window_count": validation_count,
                     }
                     if condition == "rts":
                         descriptor.update(
@@ -1266,18 +1412,18 @@ class OXIODFormalBackend:
                         )
                     path, digest = self._classical_checkpoint(descriptor)
                     candidate = _Candidate(
-                        seed, alias, condition, samples, score, predictor, digest, path,
+                        seed, alias, condition, samples, score, digest, path,
                         capacity=capacity,
+                        inference_config=dict(predictor or {}),
                     )
                 elif condition in _PYPOTS_MODELS:
                     candidate = self._pypots_candidate(
-                        condition, seed, samples, train_windows, validation_windows
+                        condition, seed, samples, windows
                     )
                     candidate.model_alias = alias
                 else:
                     candidate = self._native_candidate(
-                        condition, seed, samples, train_windows, validation_windows,
-                        windows.assets, capacity,
+                        condition, seed, samples, windows, capacity,
                     )
                     candidate.model_alias = alias
                 key = (seed, condition)
@@ -1366,6 +1512,9 @@ class OXIODFormalBackend:
                     "validation_rmse": candidate.validation_rmse,
                     "validation_scores": list(candidate.validation_scores),
                     "checkpoint_sha256": candidate.checkpoint_sha256,
+                    "checkpoint_path": str(candidate.checkpoint_path),
+                    "inference_config": candidate.inference_config,
+                    "constructor_identity": candidate.constructor_identity,
                 }
                 for (seed, condition), candidate in sorted(selected.items())
             ],
@@ -1392,14 +1541,14 @@ class OXIODFormalBackend:
         if self._test_loaded:
             raise RuntimeError("formal test data may be loaded exactly once")
         self._verify_split_sources(assets.manifest, "test")
-        self._test_loaded = True
         rows = assets.manifest.loc[assets.manifest["split"] == "test"]
         recordings = tuple(
-            self._recording_loader(Path(row.imu_path), Path(row.vicon_path))
+            self._load_verified_recording(row)
             for row in rows.itertuples(index=False)
         )
         if tuple(recording.id for recording in recordings) != tuple(rows["recording_id"]):
             raise ValueError("loaded test recording identities do not match manifest")
+        self._test_loaded = True
         return recordings
 
     @staticmethod
@@ -1412,14 +1561,14 @@ class OXIODFormalBackend:
         return generator(target, rate, condition_seed).mask
 
     def _predict_full(
-        self, candidate: _Candidate, target: torch.Tensor, mask: torch.Tensor, time: torch.Tensor
+        self,
+        candidate: _Candidate,
+        predictor: Any,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        time: torch.Tensor,
     ) -> np.ndarray:
         observed = torch.where(mask.bool(), target, torch.zeros_like(target))
-        if candidate.condition in _CLASSICAL_MODELS:
-            window = SimpleNamespace(observed=observed, mask=mask, time=time)
-            return _window_raw_predictions(
-                candidate.condition, candidate.predictor, [window], self.device
-            )[0]
         length = len(target)
         samples = candidate.context_samples
         if length < samples:
@@ -1428,6 +1577,19 @@ class OXIODFormalBackend:
         starts = list(range(0, length - samples + 1, stride))
         if starts[-1] != length - samples:
             starts.append(length - samples)
+        if candidate.condition in _CLASSICAL_MODELS:
+            windows = [
+                SimpleNamespace(
+                    observed=observed[start:start + samples],
+                    mask=mask[start:start + samples],
+                    time=time[start:start + samples] - time[start],
+                )
+                for start in starts
+            ]
+            predicted = _window_raw_predictions(
+                candidate.condition, predictor, windows, self.device
+            )
+            return self._overlap_predictions(predicted, starts, target.shape)
         delta = torch.empty_like(time)
         delta[1:] = time[1:] - time[:-1]
         delta[0] = delta[1] if len(delta) > 1 else torch.tensor(
@@ -1441,14 +1603,14 @@ class OXIODFormalBackend:
                          target[start:start + samples].numpy(), np.nan)
                 for start in starts
             ])
-            predicted = candidate.predictor.impute({"X": x})
+            predicted = predictor.impute({"X": x})
         else:
-            candidate.predictor.eval()
+            predictor.eval()
             predicted_parts = []
             with torch.inference_mode():
                 for offset in range(0, len(starts), self.config.batch_size):
                     group = starts[offset:offset + self.config.batch_size]
-                    output = candidate.predictor(
+                    output = predictor(
                         torch.stack([features[s:s + samples] for s in group]).to(self.device),
                         torch.stack([delta[s:s + samples] for s in group]).to(self.device),
                         torch.stack([observed[s:s + samples] for s in group]).to(self.device),
@@ -1457,11 +1619,67 @@ class OXIODFormalBackend:
                     )
                     predicted_parts.extend(output.raw.detach().cpu().numpy())
             predicted = np.asarray(predicted_parts)
-        total = np.zeros(target.shape, dtype=np.float64)
+        return self._overlap_predictions(predicted, starts, target.shape)
+
+    def _load_candidate_predictor(self, candidate: _Candidate) -> Any:
+        frozen_bytes = _read_verified_bytes(
+            candidate.checkpoint_path,
+            candidate.checkpoint_sha256,
+            label=f"{candidate.condition} checkpoint",
+        )
+        if candidate.condition in _CLASSICAL_MODELS:
+            json.loads(frozen_bytes.decode("utf-8"))
+            return dict(candidate.inference_config or {})
+        if candidate.condition in _PYPOTS_MODELS:
+            actual_version = installed_pypots_version()
+            if (
+                candidate.inference_config is None
+                or candidate.inference_config.get("pypots_version") != actual_version
+                or candidate.constructor_identity is None
+            ):
+                raise ValueError("frozen PyPOTS version or constructor identity changed")
+            adapter = build_pypots_model(
+                candidate.condition,
+                n_steps=candidate.context_samples,
+                epochs=self.config.epochs,
+                batch_size=self.config.batch_size,
+                device=str(self.device),
+                saving_path=self.output_root / "evaluation" / (
+                    f"{candidate.condition}-{candidate.seed}"
+                ),
+            )
+            reload_pypots_predictor(
+                adapter,
+                candidate.checkpoint_path,
+                expected_sha256=candidate.checkpoint_sha256,
+                constructor_identity=candidate.constructor_identity,
+            )
+            return adapter
+        model = build_native_model(
+            candidate.condition, self.config, capacity=candidate.capacity
+        ).to(self.device)
+        state = torch.load(
+            io.BytesIO(frozen_bytes), map_location=self.device, weights_only=True
+        )
+        if _sha256_path(candidate.checkpoint_path) != candidate.checkpoint_sha256:
+            raise ValueError("native checkpoint changed during deserialization")
+        model.load_state_dict(state, strict=True)
+        return model
+
+
+    @staticmethod
+    def _overlap_predictions(
+        predicted: Sequence[np.ndarray],
+        starts: Sequence[int],
+        target_shape: Sequence[int],
+    ) -> np.ndarray:
+        total = np.zeros(target_shape, dtype=np.float64)
+        length = int(target_shape[0])
         count = np.zeros((length, 1), dtype=np.int64)
         for raw, start in zip(predicted, starts):
-            total[start:start + samples] += raw
-            count[start:start + samples] += 1
+            stop = start + len(raw)
+            total[start:stop] += raw
+            count[start:stop] += 1
         if np.any(count == 0):
             raise RuntimeError("formal stitched prediction left uncovered samples")
         return total / count
@@ -1475,42 +1693,48 @@ class OXIODFormalBackend:
         rows: list[pd.DataFrame] = []
         ledger: dict[tuple[int, str, str, float], dict[str, Any]] = {}
         for (seed, condition), candidate in sorted(frozen.candidates.items()):
-            for recording in test_data:
-                cell = (seed, condition, recording.id)
-                if cell in self._evaluated_cells:
-                    raise RuntimeError("each recording/model/seed may be evaluated exactly once")
-                self._evaluated_cells.add(cell)
-                target_np = self._assets.scaler.transform(recording.imu_six)
-                target = torch.as_tensor(target_np, dtype=torch.float32)
-                time = torch.as_tensor(recording.imu_time_s, dtype=torch.float32)
-                time = time - time[0]
-                for topology in self.config.training_topologies:
-                    for rate in self.config.training_rates:
-                        key = (seed, recording.id, topology, rate)
-                        mask = self._full_mask(target, recording.id, seed, topology, rate)
-                        mask_bytes = np.ascontiguousarray(mask.numpy()).tobytes()
-                        mask_sha = _sha256_bytes(mask_bytes)
-                        prior = ledger.get(key)
-                        entry = {
-                            "seed": seed, "recording_id": recording.id,
-                            "topology": topology, "requested_fraction": rate,
-                            "realized_fraction": float((mask == 0).double().mean()),
-                            "mask_sha256": mask_sha,
-                        }
-                        if prior is not None and prior != entry:
-                            raise RuntimeError("formal masks changed across models")
-                        ledger[key] = entry
-                        raw = self._predict_full(candidate, target, mask, time)
-                        rows.append(evaluate_record_rows(
-                            raw_windows=[raw], starts=[0], target_normalized=target_np,
-                            observed_mask=mask.numpy(), time=recording.imu_time_s,
-                            scaler=self._assets.scaler, run_id=f"formal-{seed}-{condition}",
-                            seed=seed, recording_id=recording.id,
-                            scenario=str(scenarios[recording.id]), topology=topology,
-                            requested_fraction=rate,
-                            realized_fraction=entry["realized_fraction"], model=condition,
-                            checkpoint_sha256=candidate.checkpoint_sha256,
-                        ))
+            predictor = self._load_candidate_predictor(candidate)
+            try:
+                for recording in test_data:
+                    cell = (seed, condition, recording.id)
+                    if cell in self._evaluated_cells:
+                        raise RuntimeError("each recording/model/seed may be evaluated exactly once")
+                    self._evaluated_cells.add(cell)
+                    target_np = self._assets.scaler.transform(recording.imu_six)
+                    target = torch.as_tensor(target_np, dtype=torch.float32)
+                    time = _relative_time_tensor(recording.imu_time_s)
+                    for topology in self.config.training_topologies:
+                        for rate in self.config.training_rates:
+                            key = (seed, recording.id, topology, rate)
+                            mask = self._full_mask(target, recording.id, seed, topology, rate)
+                            mask_bytes = np.ascontiguousarray(mask.numpy()).tobytes()
+                            mask_sha = _sha256_bytes(mask_bytes)
+                            prior = ledger.get(key)
+                            entry = {
+                                "seed": seed, "recording_id": recording.id,
+                                "topology": topology, "requested_fraction": rate,
+                                "realized_fraction": float((mask == 0).double().mean()),
+                                "mask_sha256": mask_sha,
+                            }
+                            if prior is not None and prior != entry:
+                                raise RuntimeError("formal masks changed across models")
+                            ledger[key] = entry
+                            raw = self._predict_full(
+                                candidate, predictor, target, mask, time
+                            )
+                            rows.append(evaluate_record_rows(
+                                raw_windows=[raw], starts=[0], target_normalized=target_np,
+                                observed_mask=mask.numpy(), time=recording.imu_time_s,
+                                scaler=self._assets.scaler, run_id=f"formal-{seed}-{condition}",
+                                seed=seed, recording_id=recording.id,
+                                scenario=str(scenarios[recording.id]), topology=topology,
+                                requested_fraction=rate,
+                                realized_fraction=entry["realized_fraction"], model=condition,
+                                checkpoint_sha256=candidate.checkpoint_sha256,
+                            ))
+            finally:
+                _release_predictor(predictor)
+                predictor = None
         metrics = pd.concat(rows, ignore_index=True)
         return {
             "per_record_metrics": metrics,

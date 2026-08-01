@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from importlib import import_module
+from importlib import metadata
 from numbers import Integral
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,24 @@ import numpy as np
 
 SUPPORTED_PYPOTS_MODELS = ("brits", "saits", "csdi")
 _N_FEATURES = 6
+_PINNED_PYPOTS_VERSION = "1.5.0"
+
+
+def installed_pypots_version() -> str:
+    """Return the installed PyPOTS version only when it matches the formal pin."""
+    try:
+        actual = metadata.version("pypots")
+    except metadata.PackageNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "PyPOTS baselines require the optional pinned dependency "
+            "pypots==1.5.0 from requirements-imputation-v3-baselines.txt"
+        ) from exc
+    if actual != _PINNED_PYPOTS_VERSION:
+        raise RuntimeError(
+            "formal PyPOTS execution requires exactly pypots==1.5.0; "
+            f"installed version is {actual}"
+        )
+    return actual
 
 
 def _array_attribute(dataset: object, attribute: str, dataset_name: str) -> np.ndarray:
@@ -220,6 +239,7 @@ def build_pypots_model(
     if not path_text:
         raise ValueError("saving_path must be non-empty")
 
+    installed_pypots_version()
     try:
         imputation = import_module("pypots.imputation")
     except ModuleNotFoundError as exc:
@@ -270,5 +290,6 @@ __all__ = [
     "PyPOTSAdapter",
     "SUPPORTED_PYPOTS_MODELS",
     "build_pypots_model",
+    "installed_pypots_version",
     "to_pypots_sets",
 ]

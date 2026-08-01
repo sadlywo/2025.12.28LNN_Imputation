@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -13,6 +14,7 @@ import pandas as pd
 import pytest
 import torch
 
+import imputation_v3.experiments.runner as runner_module
 from imputation_v3.config import load_teacher_config
 from imputation_v3.experiments.evaluate import (
     aggregate_raw_windows,
@@ -48,6 +50,7 @@ from imputation_v3.models.native_controls import (
 )
 from imputation_v3.models.teacher import OfflineTeacher
 from validation_v2.evaluation.statistics import PER_RECORD_COLUMNS
+from validation_v2.data.normalization import RobustTrainScaler
 from validation_v2.types import Recording
 
 
@@ -555,10 +558,10 @@ def test_rts_train_only_variance_and_frozen_process_grid():
 
 
 def test_rts_full_record_prediction_uses_frozen_selected_variances(monkeypatch):
-    captured = {}
+    captured = []
 
     def rts_spy(observed, mask, time, **kwargs):
-        captured.update(kwargs)
+        captured.append((time.clone(), dict(kwargs)))
         return observed.clone()
 
     monkeypatch.setattr(
@@ -568,19 +571,24 @@ def test_rts_full_record_prediction_uses_frozen_selected_variances(monkeypatch):
     backend.device = torch.device("cpu")
     candidate = SimpleNamespace(
         condition="rts",
-        predictor={"process_var": 1e-4, "observation_var": 0.321},
+        context_samples=4,
     )
+    predictor = {"process_var": 1e-4, "observation_var": 0.321}
     target = torch.arange(18, dtype=torch.float64).reshape(6, 3)
     mask = torch.ones_like(target, dtype=torch.bool)
     mask[2:4] = False
     time = torch.arange(6, dtype=torch.float64) * 0.01
 
-    predicted = backend._predict_full(candidate, target, mask, time)
+    predicted = backend._predict_full(candidate, predictor, target, mask, time)
 
     assert predicted.shape == (6, 3)
-    assert captured["process_var"] == pytest.approx(1e-4)
-    assert captured["observation_var"] == pytest.approx(0.321)
-    assert captured["empty_fill"] == 0.0
+    assert len(captured) == 2
+    for local_time, kwargs in captured:
+        assert local_time.shape == (4,)
+        assert local_time[0] == 0.0
+        assert kwargs["process_var"] == pytest.approx(1e-4)
+        assert kwargs["observation_var"] == pytest.approx(0.321)
+        assert kwargs["empty_fill"] == 0.0
 
 
 def test_capacity_candidates_are_inner_selection_not_matrix_multiplication():
@@ -710,7 +718,9 @@ def test_formal_protocol_requires_exact_preregistered_seeds_before_backend_use(t
     assert backend.events == []
 
 
-def test_formal_artifacts_are_immutable_and_hash_bound(tmp_path):
+def test_formal_artifacts_are_immutable_hash_bound_and_crash_recoverable(
+    tmp_path, monkeypatch
+):
     metrics = pd.DataFrame(
         [_metric_row(model="teacher"), _metric_row(model="saits", value=3.0)],
         columns=PER_RECORD_COLUMNS,
@@ -745,6 +755,71 @@ def test_formal_artifacts_are_immutable_and_hash_bound(tmp_path):
             tmp_path / "bad", metrics, nonfinite_summary, gate, ledger
         )
 
+    partial = tmp_path / "partial"
+    stable_write = runner_module._write_stable
+
+    def crash_on_summary(path, content):
+        if Path(path).name == "summary.csv":
+            raise OSError("simulated artifact crash")
+        stable_write(path, content)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(runner_module, "_write_stable", crash_on_summary)
+        with pytest.raises(OSError, match="simulated artifact crash"):
+            write_formal_artifacts(partial, metrics, summary, gate, ledger)
+    assert (partial / "per_record_metrics.csv").is_file()
+    assert not (partial / "artifact_hashes.json").exists()
+    recovered = write_formal_artifacts(partial, metrics, summary, gate, ledger)
+    assert recovered == first
+    assert (partial / "artifact_hashes.json").is_file()
+
+
+def test_atomic_stable_write_leaves_no_partial_target_when_publish_crashes(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "checkpoint.bin"
+
+    def crash_before_publish(source, destination):
+        del source, destination
+        raise OSError("simulated publish crash")
+
+    monkeypatch.setattr(runner_module.os, "link", crash_before_publish)
+    with pytest.raises(OSError, match="simulated publish crash"):
+        runner_module._write_stable(target, b"complete-checkpoint")
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_pypots_reload_detects_checkpoint_mutation_during_deserialization(
+    tmp_path, monkeypatch
+):
+    class Outer:
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1, bias=False)
+
+    adapter = SimpleNamespace(model=Outer())
+    checkpoint = tmp_path / "pypots.pt"
+    identity = {"name": "brits", "pypots_version": "1.5.0"}
+    digest = freeze_pypots_predictor(
+        adapter, checkpoint, constructor_identity=identity
+    )
+    original_load = runner_module.torch.load
+
+    def mutate_during_load(source, *args, **kwargs):
+        frozen_bytes = source.read() if hasattr(source, "read") else Path(source).read_bytes()
+        checkpoint.write_bytes(b"mutated-during-load")
+        return original_load(io.BytesIO(frozen_bytes), *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.torch, "load", mutate_during_load)
+    with pytest.raises(ValueError, match="changed during|hash"):
+        reload_pypots_predictor(
+            adapter,
+            checkpoint,
+            expected_sha256=digest,
+            constructor_identity=identity,
+        )
+
 
 def test_teacher_matrix_cli_dry_run_is_canonical_and_does_not_discover_data(monkeypatch, capsys):
     import imputation_v3.cli as cli
@@ -767,16 +842,16 @@ def test_teacher_matrix_cli_dry_run_is_canonical_and_does_not_discover_data(monk
     assert payload["test_data_accessed"] is False
 
 
-def _recording(recording_id):
-    time = np.arange(8, dtype=np.float64) * 0.01
+def _recording(recording_id, *, epoch_s=0.0, rows=8):
+    time = float(epoch_s) + np.arange(rows, dtype=np.float64) * 0.01
     return Recording(
         id=recording_id,
         imu_time_s=time,
-        imu_six=np.arange(48, dtype=np.float64).reshape(8, 6),
+        imu_six=np.arange(rows * 6, dtype=np.float64).reshape(rows, 6),
         vicon_time_s=time,
-        vicon_position_m=np.zeros((8, 3)),
-        vicon_quaternion_xyzw=np.tile([0.0, 0.0, 0.0, 1.0], (8, 1)),
-        overlap_s=(0.0, 0.07),
+        vicon_position_m=np.zeros((rows, 3)),
+        vicon_quaternion_xyzw=np.tile([0.0, 0.0, 0.0, 1.0], (rows, 1)),
+        overlap_s=(float(time[0]), float(time[-1])),
         metadata={},
     )
 
@@ -821,13 +896,46 @@ def test_concrete_backend_loads_only_train_validation_before_freeze(tmp_path):
     assert list(tmp_path.glob("split_manifest-*.csv"))
     assert list(tmp_path.glob("scaler-*.json"))
     repository = backend.materialize_train_validation(assets, formal_matrix_plan(config))
-    first = repository.get("train", 2026, 4)
-    second = repository.get("train", 2026, 4)
-    assert first is second
+    first = tuple(repository.iter("train", 2026, 4))
+    second = tuple(repository.iter("train", 2026, 4))
     assert first and [window.window_id for window in first] == [window.window_id for window in second]
+    assert not hasattr(repository, "_cache")
+    assert repository.cached_tensor_windows == 0
+    assert repository.identity_cache_cardinality <= 1
     with pytest.raises(RuntimeError, match="freeze"):
         backend.load_test_data(assets)
     assert calls == ["train", "validation"]
+
+
+def test_simulated_full_matrix_repository_caches_only_bounded_identities():
+    config = replace(
+        load_teacher_config(ROOT / "configs/imputation_v3/teacher_full.yaml"),
+        training_topologies=("point",),
+        training_rates=(0.2,),
+    )
+    train = _recording("train", rows=600)
+    validation = _recording("validation", rows=600)
+    scaler = RobustTrainScaler.fit((train,), allowed_ids={"train"})
+    assets = SimpleNamespace(
+        recordings={"train": (train,), "validation": (validation,)},
+        scaler=scaler,
+    )
+    repository = runner_module._SharedWindowRepository(assets, config)
+    plan = formal_matrix_plan(config)
+    scopes = {
+        (int(cell["seed"]), int(cell["context_samples"]))
+        for cell in plan["cells"]
+    }
+    for split in ("train", "validation"):
+        for seed, samples in sorted(scopes):
+            digest, count = repository.identity(split, seed, samples)
+            assert len(digest) == 64
+            assert count > 0
+
+    assert plan["counts"]["matrix_cells"] == 240
+    assert repository.cached_tensor_windows == 0
+    assert repository.identity_cache_cardinality == 2 * len(scopes) == 30
+    assert "predictor" not in {field.name for field in fields(runner_module._Candidate)}
 
 
 def test_teacher_matrix_cli_non_dry_builds_real_backend_and_runs_protocol(monkeypatch, tmp_path, capsys):
@@ -846,6 +954,7 @@ def test_teacher_matrix_cli_non_dry_builds_real_backend_and_runs_protocol(monkey
 
     monkeypatch.setattr(cli, "OXIODFormalBackend", backend_factory)
     monkeypatch.setattr(cli, "run_formal_protocol", protocol)
+    monkeypatch.setattr(cli, "installed_pypots_version", lambda: "1.5.0")
     package = ModuleType("pypots")
     package.__path__ = []
     monkeypatch.setitem(sys.modules, "pypots", package)
@@ -858,6 +967,35 @@ def test_teacher_matrix_cli_non_dry_builds_real_backend_and_runs_protocol(monkey
     assert captured["protocol"][1] is sentinel
     assert captured["protocol"][2] == tmp_path.resolve()
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
+
+
+def test_teacher_matrix_cli_rejects_pypots_version_before_backend(
+    monkeypatch, tmp_path, capsys
+):
+    import imputation_v3.cli as cli
+
+    def reject_version():
+        raise RuntimeError(
+            "formal PyPOTS execution requires exactly pypots==1.5.0; "
+            "installed version is 1.5.1"
+        )
+
+    monkeypatch.setattr(cli, "installed_pypots_version", reject_version)
+    monkeypatch.setattr(
+        cli,
+        "OXIODFormalBackend",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("backend must not start")
+        ),
+    )
+
+    assert cli.main([
+        "teacher-matrix",
+        "--config", "configs/imputation_v3/teacher_full.yaml",
+        "--device", "cpu",
+        "--output-root", str(tmp_path),
+    ]) == 2
+    assert "requires exactly pypots==1.5.0" in capsys.readouterr().err
 
 
 def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
@@ -881,7 +1019,9 @@ def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
         config, repository_root=ROOT, output_root=tmp_path, requested_device="cpu",
         discover_pairs=lambda root: [{"root": str(root)}],
         splitter=lambda pairs, seed: manifest.copy(),
-        recording_loader=lambda imu, vicon: _recording(str(imu).removesuffix("-imu")),
+        recording_loader=lambda imu, vicon: _recording(
+            str(imu).removesuffix("-imu"), epoch_s=1.496e9
+        ),
         source_verifier=lambda path, digest: None,
     )
     plan = formal_matrix_plan(config)
@@ -889,6 +1029,7 @@ def test_concrete_backend_executes_tiny_native_and_classical_protocol(tmp_path):
     windows = backend.materialize_train_validation(assets, plan)
     selected = backend.train_select_validation(windows, plan)
     assert len(selected) == 6
+    assert all(not hasattr(candidate, "predictor") for candidate in selected.values())
     native_manifest = next(
         json.loads(path.read_text(encoding="utf-8"))
         for path in (tmp_path / "candidates").glob("*/run.json")
@@ -990,3 +1131,46 @@ def test_concrete_backend_rehashes_deferred_test_sources_before_parsing(tmp_path
     with pytest.raises(ValueError, match="source SHA256"):
         backend.load_test_data(assets)
     assert calls == ["train", "validation"]
+
+
+def test_concrete_backend_rejects_source_mutation_during_recording_load(tmp_path):
+    config = replace(
+        load_teacher_config(ROOT / "configs/imputation_v3/teacher_smoke.yaml"),
+        models=("linear",),
+    )
+    rows = []
+    source_paths = {}
+    for split in ("train", "validation", "test"):
+        paths = []
+        digests = []
+        for kind in ("imu", "vi"):
+            path = tmp_path / f"{split}-{kind}.csv"
+            path.write_text(f"{split}-{kind}", encoding="utf-8")
+            source_paths[(split, kind)] = path
+            paths.append(path)
+            digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
+        rows.append([split, "s", str(paths[0]), str(paths[1]), split, *digests])
+    manifest = pd.DataFrame(rows, columns=(
+        "recording_id", "scenario", "imu_path", "vicon_path", "split",
+        "imu_sha256", "vicon_sha256",
+    ))
+
+    def mutating_loader(imu, vicon):
+        del vicon
+        recording_id = Path(imu).stem.removesuffix("-imu")
+        if recording_id == "train":
+            Path(imu).write_text("changed while parsing", encoding="utf-8")
+        return _recording(recording_id)
+
+    backend = OXIODFormalBackend(
+        config,
+        repository_root=ROOT,
+        output_root=tmp_path / "output",
+        requested_device="cpu",
+        discover_pairs=lambda root: [{"root": str(root)}],
+        splitter=lambda pairs, seed: manifest.copy(),
+        recording_loader=mutating_loader,
+    )
+
+    with pytest.raises(ValueError, match="source SHA256 mismatch"):
+        backend.load_frozen_manifest_and_scaler()

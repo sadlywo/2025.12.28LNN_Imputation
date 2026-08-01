@@ -16,6 +16,7 @@ from imputation_v3.experiments.runner import (
     formal_matrix_plan,
     run_formal_protocol,
 )
+from imputation_v3.experiments.pypots import installed_pypots_version
 from imputation_v3.experiments.training import run_teacher_smoke
 from validation_v2.experiments.provenance import canonical_json
 
@@ -75,13 +76,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "formal teacher-matrix execution requires seeds 2026 through 2030"
                 )
             if any(name in config.models for name in ("brits", "saits", "csdi")):
-                try:
-                    __import__("pypots.imputation")
-                except ModuleNotFoundError as exc:
-                    raise ModuleNotFoundError(
-                        "formal PyPOTS baselines require pypots==1.5.0 from "
-                        "requirements-imputation-v3-baselines.txt"
-                    ) from exc
+                installed_pypots_version()
             selected_output = arguments.output_root or config.output_root
             effective_output = (
                 selected_output

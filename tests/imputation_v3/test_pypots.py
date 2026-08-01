@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+import imputation_v3.experiments.pypots as pypots_module
 from imputation_v3.experiments.pypots import (
     SUPPORTED_PYPOTS_MODELS,
     PyPOTSAdapter,
@@ -294,6 +295,7 @@ def test_pypots_adapter_rejects_malformed_imputation_results(result, error, mess
 
 
 def _install_fake_pypots(monkeypatch):
+    monkeypatch.setattr(pypots_module.metadata, "version", lambda name: "1.5.0")
     package = ModuleType("pypots")
     imputation = ModuleType("pypots.imputation")
     classes = {}
@@ -315,6 +317,21 @@ def _install_fake_pypots(monkeypatch):
     monkeypatch.setitem(sys.modules, "pypots", package)
     monkeypatch.setitem(sys.modules, "pypots.imputation", imputation)
     return classes
+
+
+def test_build_pypots_model_rejects_installed_version_mismatch(monkeypatch):
+    _install_fake_pypots(monkeypatch)
+    monkeypatch.setattr(pypots_module.metadata, "version", lambda name: "1.5.1")
+
+    with pytest.raises(RuntimeError, match=r"requires exactly pypots==1\.5\.0.*1\.5\.1"):
+        build_pypots_model(
+            "brits",
+            n_steps=8,
+            epochs=1,
+            batch_size=1,
+            device="cpu",
+            saving_path="results",
+        )
 
 
 @pytest.mark.parametrize("name", SUPPORTED_PYPOTS_MODELS)
