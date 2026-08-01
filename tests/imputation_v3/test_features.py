@@ -216,6 +216,86 @@ def test_dt_is_converted_to_target_dtype_for_deterministic_concatenation():
     torch.testing.assert_close(batch.values[:, 12], dt.to(torch.float64))
 
 
+def test_mask_binary_validation_happens_before_target_dtype_conversion():
+    target = torch.ones(2, 6, dtype=torch.float16)
+    mask = torch.ones(2, 6, dtype=torch.float64)
+    mask[0, 0] = 1.0001
+    dt = torch.ones(2, dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="0 or 1"):
+        build_features(target, mask, dt)
+
+
+def test_dt_zero_is_excluded_and_large_placeholder_cannot_erase_first_interval():
+    target = torch.tensor([[0.0] * 6, [2.0] * 6], dtype=torch.float32)
+    mask = torch.ones_like(target)
+    dt = torch.tensor([1e30, 1.0], dtype=torch.float64)
+
+    values = build_features(target, mask, dt).values
+
+    torch.testing.assert_close(values[1, 19:25], torch.full((6,), 2.0))
+    torch.testing.assert_close(values[1, 25:31], torch.ones(6))
+    assert torch.isfinite(values).all()
+
+
+def test_cumulative_elapsed_time_overflow_is_rejected():
+    target = torch.arange(18, dtype=torch.float64).reshape(3, 6)
+    mask = torch.ones_like(target)
+    dt = torch.tensor([1.0, 1e308, 1e308], dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="derived temporal features|dt"):
+        build_features(target, mask, dt)
+
+
+def test_finite_accumulator_slope_that_overflows_target_dtype_is_rejected():
+    target = torch.tensor([[0.0] * 6, [3e38] * 6], dtype=torch.float32)
+    mask = torch.ones_like(target)
+    dt = torch.tensor([1.0, 1e-10], dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="derived temporal features"):
+        build_features(target, mask, dt)
+
+
+def test_staggered_channels_keep_independent_irregular_temporal_histories():
+    target = torch.zeros(6, 6, dtype=torch.float64)
+    mask = torch.ones_like(target)
+    mask[[1, 2, 4, 5], 0] = 0
+    mask[[0, 2, 3, 5], 1] = 0
+    target[0, 0] = 1.0
+    target[3, 0] = 10.0
+    target[1, 1] = 2.0
+    target[4, 1] = 17.0
+    target[mask == 0] = 999999.0
+    dt = torch.tensor([99.0, 0.5, 1.5, 0.25, 2.0, 0.75], dtype=torch.float64)
+
+    values = build_features(target, mask, dt).values
+
+    torch.testing.assert_close(
+        values[:, 13],
+        torch.tensor([0.0, 0.5, 2.0, 0.0, 2.0, 2.75], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        values[:, 19],
+        torch.tensor([0.0, 0.0, 0.0, 4.0, 4.0, 4.0], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        values[:, 25],
+        torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 1.0], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        values[:, 14],
+        torch.tensor([0.0, 0.0, 1.5, 1.75, 0.0, 0.75], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        values[:, 20],
+        torch.tensor([0.0, 0.0, 0.0, 0.0, 4.0, 4.0], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        values[:, 26],
+        torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 1.0], dtype=torch.float64),
+    )
+
+
 def test_inputs_must_share_a_device():
     target, mask, dt = _valid_inputs(samples=2)
     meta_mask = mask.to(device="meta")
