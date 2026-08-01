@@ -1417,7 +1417,9 @@ class OXIODFormalBackend:
         observed = torch.where(mask.bool(), target, torch.zeros_like(target))
         if candidate.condition in _CLASSICAL_MODELS:
             window = SimpleNamespace(observed=observed, mask=mask, time=time)
-            return _window_raw_predictions(candidate.condition, None, [window], self.device)[0]
+            return _window_raw_predictions(
+                candidate.condition, candidate.predictor, [window], self.device
+            )[0]
         length = len(target)
         samples = candidate.context_samples
         if length < samples:

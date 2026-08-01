@@ -554,6 +554,35 @@ def test_rts_train_only_variance_and_frozen_process_grid():
     assert RTS_PROCESS_VARIANCES == (1e-4, 1e-3, 1e-2, 1e-1, 1.0)
 
 
+def test_rts_full_record_prediction_uses_frozen_selected_variances(monkeypatch):
+    captured = {}
+
+    def rts_spy(observed, mask, time, **kwargs):
+        captured.update(kwargs)
+        return observed.clone()
+
+    monkeypatch.setattr(
+        "imputation_v3.experiments.runner.constant_velocity_rts", rts_spy
+    )
+    backend = object.__new__(OXIODFormalBackend)
+    backend.device = torch.device("cpu")
+    candidate = SimpleNamespace(
+        condition="rts",
+        predictor={"process_var": 1e-4, "observation_var": 0.321},
+    )
+    target = torch.arange(18, dtype=torch.float64).reshape(6, 3)
+    mask = torch.ones_like(target, dtype=torch.bool)
+    mask[2:4] = False
+    time = torch.arange(6, dtype=torch.float64) * 0.01
+
+    predicted = backend._predict_full(candidate, target, mask, time)
+
+    assert predicted.shape == (6, 3)
+    assert captured["process_var"] == pytest.approx(1e-4)
+    assert captured["observation_var"] == pytest.approx(0.321)
+    assert captured["empty_fill"] == 0.0
+
+
 def test_capacity_candidates_are_inner_selection_not_matrix_multiplication():
     config = load_teacher_config(ROOT / "configs/imputation_v3/teacher_full.yaml")
     candidates = capacity_candidates("teacher_actual_residual", config)
