@@ -1,4 +1,5 @@
 import math
+from fractions import Fraction
 
 import pytest
 import torch
@@ -94,6 +95,49 @@ def test_backward_reaches_projection_depthwise_and_pointwise_weights():
         assert parameter.grad.abs().sum() > 0
 
 
+@pytest.mark.parametrize(
+    "constructor",
+    (
+        lambda: SymmetricTCNEncoder(3, width=1, dilations=(1,)),
+        lambda: DepthwiseResidualBlock(
+            width=1, kernel_size=3, dilation=1, dropout=0.0
+        ),
+    ),
+    ids=("encoder", "block"),
+)
+def test_public_tcn_constructors_reject_width_one(constructor):
+    with pytest.raises(ValueError, match="width.*at least 2"):
+        constructor()
+
+
+def test_width_two_remains_input_dependent_with_finite_input_gradients():
+    model = SymmetricTCNEncoder(
+        2, width=2, dilations=(1,), kernel_size=3, dropout=0.0
+    )
+    direct_block = DepthwiseResidualBlock(
+        width=2, kernel_size=3, dilation=1, dropout=0.0
+    )
+    assert direct_block.width == 2
+
+    with torch.no_grad():
+        model.projection.weight.copy_(torch.eye(2))
+        model.projection.bias.zero_()
+        block = model.blocks[0]
+        block.depthwise.weight.zero_()
+        block.depthwise.bias.zero_()
+        block.pointwise.weight.zero_()
+        block.pointwise.bias.zero_()
+
+    features = torch.tensor([[[0.25, -0.25]]], requires_grad=True)
+    output = model(features)
+    output[0, 0, 0].backward()
+
+    assert output[0, 0, 0] != output[0, 0, 1]
+    assert features.grad is not None
+    assert torch.isfinite(features.grad).all()
+    assert features.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("field", ("input_size", "width"))
 @pytest.mark.parametrize("value", (True, 0, -1, 1.5, "3"))
 def test_encoder_rejects_non_positive_or_non_integer_dimensions(field, value):
@@ -127,6 +171,13 @@ def test_encoder_rejects_invalid_kernel_sizes(kernel_size):
 def test_encoder_rejects_invalid_dropout(dropout):
     with pytest.raises((TypeError, ValueError), match="dropout"):
         SymmetricTCNEncoder(3, width=4, dilations=(1,), dropout=dropout)
+
+
+def test_dropout_overflow_is_reported_as_a_deterministic_value_error():
+    too_large = Fraction(10**10000, 1)
+
+    with pytest.raises(ValueError, match="dropout"):
+        SymmetricTCNEncoder(3, width=4, dilations=(1,), dropout=too_large)
 
 
 @pytest.mark.parametrize(

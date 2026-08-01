@@ -24,10 +24,20 @@ def _odd_kernel_size(value: object) -> int:
     return converted
 
 
+def _minimum_width(value: object) -> int:
+    converted = _positive_integer(value, "width")
+    if converted < 2:
+        raise ValueError("width must be at least 2 for meaningful LayerNorm features")
+    return converted
+
+
 def _dropout_probability(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError("dropout must be a finite numeric value in [0, 1)")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("dropout must be convertible to a finite numeric value") from exc
     if not isfinite(converted):
         raise ValueError("dropout must be finite")
     if not 0.0 <= converted < 1.0:
@@ -64,7 +74,7 @@ class DepthwiseResidualBlock(nn.Module):
         dropout: float,
     ) -> None:
         super().__init__()
-        self.width = _positive_integer(width, "width")
+        self.width = _minimum_width(width)
         self.kernel_size = _odd_kernel_size(kernel_size)
         self.dilation = _positive_integer(dilation, "dilation")
         probability = _dropout_probability(dropout)
@@ -109,7 +119,7 @@ class SymmetricTCNEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.input_size = _positive_integer(input_size, "input_size")
-        self.width = _positive_integer(width, "width")
+        self.width = _minimum_width(width)
         self.dilations = _positive_dilations(dilations)
         self.kernel_size = _odd_kernel_size(kernel_size)
         probability = _dropout_probability(dropout)
