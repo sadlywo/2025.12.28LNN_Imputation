@@ -18,6 +18,7 @@ from imputation_v3.experiments.runner import (
 )
 from imputation_v3.experiments.pypots import installed_pypots_version
 from imputation_v3.experiments.training import run_teacher_smoke
+from imputation_v3.experiments.validate_artifacts import validate_artifacts
 from validation_v2.experiments.provenance import canonical_json
 
 
@@ -45,12 +46,17 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("--dry-run", action="store_true")
     matrix.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     matrix.add_argument("--output-root", type=Path)
+    validation = subcommands.add_parser("validate-artifacts")
+    validation.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        if arguments.command == "validate-artifacts":
+            print(canonical_json(validate_artifacts(arguments.output)))
+            return 0
         if arguments.command == "teacher":
             if not arguments.smoke:
                 raise ValueError(

@@ -138,6 +138,10 @@ CfC 的核心优势：
 - 分离处理头更符合物理直觉
 - 不确定性估计帮助模型识别难以预测的区域
 
+## Experiment documentation
+
+- [Imputation v3 offline teacher runbook](docs/imputation_v3_teacher_runbook.md)
+
 ## License
 
 MIT
