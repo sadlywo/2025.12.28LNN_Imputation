@@ -336,6 +336,55 @@ def test_smoke_orchestration_is_train_validation_only_and_seeded(tmp_path, monke
     assert Path(report["run_dir"]).parent == tmp_path / "override-output"
 
 
+def test_smoke_enables_fail_closed_deterministic_algorithms(tmp_path, monkeypatch):
+    import imputation_v3.experiments.training as training
+
+    _patch_smoke_data(monkeypatch, training)
+    previous_enabled = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(False)
+    original = torch.use_deterministic_algorithms
+    calls = []
+    observed = {}
+
+    def tracked(enabled, *, warn_only=False):
+        calls.append((enabled, warn_only))
+        return original(enabled, warn_only=warn_only)
+
+    def fake_train_one_run(run_dir, manifest, **kwargs):
+        observed["enabled"] = torch.are_deterministic_algorithms_enabled()
+        observed["warn_only"] = torch.is_deterministic_algorithms_warn_only_enabled()
+        try:
+            torch.zeros(1).put_(torch.tensor([0]), torch.tensor([1.0]))
+        except RuntimeError as error:
+            observed["unsupported_error"] = str(error)
+        else:
+            observed["unsupported_error"] = None
+        return {
+            "run_id": manifest["run_id"],
+            "best_epoch": 1,
+            "selection_split": "validation",
+            "selection_metric": "missing_rmse",
+            "checkpoint_sha256": "d" * 64,
+        }
+
+    monkeypatch.setattr(torch, "use_deterministic_algorithms", tracked)
+    monkeypatch.setattr(training, "train_one_run", fake_train_one_run)
+    try:
+        training.run_teacher_smoke(
+            _config(Path("runs")), repository_root=tmp_path, requested_device="cpu"
+        )
+
+        assert calls == [(True, False)]
+        assert observed["enabled"] is True
+        assert observed["warn_only"] is False
+        assert "does not have a deterministic implementation" in observed[
+            "unsupported_error"
+        ]
+    finally:
+        original(previous_enabled, warn_only=previous_warn_only)
+
+
 def test_smoke_consumes_at_most_four_windows_per_split(tmp_path, monkeypatch):
     import imputation_v3.experiments.training as training
 

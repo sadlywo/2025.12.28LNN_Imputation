@@ -213,6 +213,7 @@ def run_teacher_smoke(
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
 
     pairs = discover_oxiod_pairs(data_root)
     split_frame = stratified_file_split(pairs, seed=2026)
