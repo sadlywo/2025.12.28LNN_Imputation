@@ -12,11 +12,16 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import torch
 
+from imputation_v3.config import TeacherConfig
 from imputation_v3.experiments.runner import (
     FORMAL_SEEDS,
+    formal_mask_seed,
+    formal_matrix_plan,
     success_gate_payload,
 )
+from validation_v2.data.masking import channel_outage, contiguous_block, point_missing
 from validation_v2.data.splits import MANIFEST_COLUMNS
 from validation_v2.evaluation.statistics import (
     GROUP_COLUMNS,
@@ -32,7 +37,9 @@ from validation_v2.experiments.provenance import (
 from validation_v2.experiments.train import select_best_checkpoint
 
 
-_RUN_FILES = frozenset({"run.json", "history.json", "best.pt", "checkpoint.json"})
+_RUN_FILES = frozenset(
+    {"run.json", "history.json", "best.pt", "checkpoint.json", "evidence.json"}
+)
 _CHECKPOINT_FIELDS = frozenset(
     {"run_id", "best_epoch", "selection_split", "selection_metric", "checkpoint_sha256"}
 )
@@ -48,7 +55,10 @@ _FORMAL_HASHED_FILES = frozenset(
     }
 )
 _FORMAL_FIXED_FILES = _FORMAL_HASHED_FILES | frozenset(
-    {"artifact_hashes.json", "frozen_models.json"}
+    {
+        "artifact_hashes.json", "frozen_models.json", "resolved_config.json",
+        "window_identity_ledger.json",
+    }
 )
 _MASK_COLUMNS = (
     "seed",
@@ -57,6 +67,11 @@ _MASK_COLUMNS = (
     "requested_fraction",
     "realized_fraction",
     "mask_sha256",
+    "generator",
+    "condition_seed",
+    "target_source_sha256",
+    "target_length",
+    "channels",
 )
 _COVERAGE_COLUMNS = (
     *GROUP_COLUMNS,
@@ -192,7 +207,9 @@ def _string_list(value: Any, name: str, *, pattern: re.Pattern[str] | None = Non
     return list(value)
 
 
-def _validate_smoke_config(config: Any, manifest_seed: int) -> tuple[list[str], list[str]]:
+def _validate_smoke_config(
+    config: Any, manifest_seed: int, split_hash: str, scaler_hash: str
+) -> tuple[list[str], list[str]]:
     config = _mapping(config, "run config")
     if (
         config.get("mode") != "imputation_v3_teacher_smoke"
@@ -228,6 +245,76 @@ def _validate_smoke_config(config: Any, manifest_seed: int) -> tuple[list[str], 
     )
     if set(train_windows) & set(validation_windows):
         raise ValueError("train and validation window identities must be disjoint")
+
+    split_manifest = config.get("split_manifest")
+    if not isinstance(split_manifest, list) or not split_manifest:
+        raise ValueError("split_manifest must preserve canonical split evidence")
+    split_fields = {
+        "recording_id", "scenario", "imu_path", "vicon_path", "split",
+        "imu_sha256", "vicon_sha256",
+    }
+    if any(not isinstance(row, Mapping) or set(row) != split_fields for row in split_manifest):
+        raise ValueError("split_manifest rows must use the exact evidence schema")
+    if split_manifest != sorted(split_manifest, key=lambda row: row["recording_id"]):
+        raise ValueError("split_manifest rows must use canonical recording order")
+    if hashlib.sha256(canonical_json(split_manifest).encode("utf-8")).hexdigest() != split_hash:
+        raise ValueError("split_hash does not match preserved split membership")
+    for row in split_manifest:
+        for path_name, hash_name in (("imu_path", "imu_sha256"), ("vicon_path", "vicon_sha256")):
+            source = Path(str(row[path_name]))
+            if source.is_symlink() or not source.is_file():
+                raise ValueError("smoke split source is missing or symlinked")
+            digest = str(row[hash_name])
+            if _HEX64.fullmatch(digest) is None or _sha256(source) != digest:
+                raise ValueError("smoke split source hash mismatch")
+    computed_counts = {
+        name: sum(row["split"] == name for row in split_manifest)
+        for name in ("train", "validation", "test")
+    }
+    if dict(split_counts) != computed_counts:
+        raise ValueError("split_counts do not match preserved split membership")
+
+    scaler_state = _mapping(config.get("scaler_state"), "scaler_state")
+    if set(scaler_state) != {"center", "scale", "training_ids", "split_hash"}:
+        raise ValueError("scaler_state must use the exact frozen schema")
+    if hashlib.sha256(canonical_json(scaler_state).encode("utf-8")).hexdigest() != scaler_hash:
+        raise ValueError("scaler_hash does not match preserved scaler material")
+    if scaler_state["split_hash"] != split_hash or scaler_state["training_ids"] != scaler_ids:
+        raise ValueError("scaler state provenance is inconsistent")
+    center = np.asarray(scaler_state["center"], dtype=float)
+    scale = np.asarray(scaler_state["scale"], dtype=float)
+    if center.shape != (6,) or scale.shape != (6,) or not np.isfinite(center).all() or not np.isfinite(scale).all() or (scale <= 0).any():
+        raise ValueError("scaler evidence must contain six finite channels and positive scales")
+
+    window_evidence = _mapping(config.get("window_evidence"), "window_evidence")
+    if set(window_evidence) != {"train", "validation"}:
+        raise ValueError("window_evidence must contain train and validation")
+    evidence_fields = {
+        "window_id", "recording_id", "topology", "requested_fraction",
+        "realized_fraction", "mask_sha256", "mask_bytes_hex", "mask_dtype",
+        "samples", "channels",
+    }
+    for split, expected_ids in (("train", train_windows), ("validation", validation_windows)):
+        rows = window_evidence[split]
+        if not isinstance(rows, list) or [row.get("window_id") for row in rows if isinstance(row, Mapping)] != expected_ids:
+            raise ValueError("window evidence identities do not match selected_window_ids")
+        for row in rows:
+            if not isinstance(row, Mapping) or set(row) != evidence_fields:
+                raise ValueError("window evidence row does not use the exact schema")
+            if row["mask_dtype"] != "float32-le" or type(row["samples"]) is not int or row["samples"] < 1 or row["channels"] != 6:
+                raise ValueError("window mask material has invalid dtype or shape")
+            try:
+                content = bytes.fromhex(str(row["mask_bytes_hex"]))
+            except ValueError as exc:
+                raise ValueError("window mask material is not valid hexadecimal") from exc
+            if len(content) != row["samples"] * row["channels"] * 4 or hashlib.sha256(content).hexdigest() != row["mask_sha256"]:
+                raise ValueError("window mask material hash mismatch")
+            mask = np.frombuffer(content, dtype="<f4")
+            if not np.isin(mask, (0.0, 1.0)).all():
+                raise ValueError("window mask material must be binary")
+            realized = float(np.mean(mask == 0.0))
+            if not math.isclose(realized, float(row["realized_fraction"]), rel_tol=0.0, abs_tol=1e-15):
+                raise ValueError("window mask realized fraction is inconsistent")
     return train_windows, validation_windows
 
 
@@ -249,7 +336,7 @@ def _validate_smoke_run(run_dir: Path) -> dict[str, Any]:
     if manifest["run_id"] != run_dir.name:
         raise ValueError("run directory name does not match run.json run_id")
     train_windows, validation_windows = _validate_smoke_config(
-        manifest["config"], manifest["seed"]
+        manifest["config"], manifest["seed"], manifest["split_hash"], manifest["scaler_hash"]
     )
     for name in ("split_hash", "scaler_hash", "config_sha256"):
         if _HEX64.fullmatch(str(manifest[name])) is None:
@@ -273,6 +360,17 @@ def _validate_smoke_run(run_dir: Path) -> dict[str, Any]:
     actual_checkpoint_hash = _sha256(run_dir / "best.pt")
     if checkpoint["checkpoint_sha256"] != actual_checkpoint_hash:
         raise ValueError("best.pt SHA-256 does not match checkpoint.json")
+    evidence = _mapping(_strict_canonical_json(run_dir / "evidence.json"), "evidence.json")
+    expected_evidence = {
+        "schema": "imputation-v3-smoke-evidence-v1",
+        "run_id": manifest["run_id"],
+        "run_manifest_sha256": _sha256(run_dir / "run.json"),
+        "history_sha256": _sha256(run_dir / "history.json"),
+        "checkpoint_metadata_sha256": _sha256(run_dir / "checkpoint.json"),
+        "checkpoint_sha256": actual_checkpoint_hash,
+    }
+    if set(evidence) != set(expected_evidence) or dict(evidence) != expected_evidence:
+        raise ValueError("smoke evidence does not bind the completed artifact set")
     return {
         "run_id": manifest["run_id"],
         "config_sha256": manifest["config_sha256"],
@@ -323,16 +421,113 @@ def _validate_formal_layout(root: Path) -> tuple[Path, Path]:
     return split_files[0], scaler_files[0]
 
 
-def _validate_formal_hashes(root: Path) -> None:
+def _validate_formal_hashes(root: Path, split_path: Path, scaler_path: Path) -> None:
     hashes = _mapping(_strict_canonical_json(root / "artifact_hashes.json"), "artifact_hashes.json")
-    if set(hashes) != set(_FORMAL_HASHED_FILES):
+    expected = set(_FORMAL_HASHED_FILES) | {
+        "frozen_models.json", "resolved_config.json", "window_identity_ledger.json",
+        split_path.name, scaler_path.name,
+    }
+    if set(hashes) != expected:
         raise ValueError("artifact_hashes.json must bind the exact completed formal artifact set")
-    for name in sorted(_FORMAL_HASHED_FILES):
+    for name in sorted(expected):
         digest = hashes[name]
         if not isinstance(digest, str) or _HEX64.fullmatch(digest) is None:
             raise ValueError(f"artifact_hashes.json contains malformed digest for {name}")
         if _sha256(root / name) != digest:
             raise ValueError(f"formal artifact hash mismatch: {name}")
+
+
+def _config_from_payload(payload: Mapping[str, Any]) -> TeacherConfig:
+    expected = {
+        "data_root", "output_root", "selection_split", "seeds", "window_seconds",
+        "nominal_dt_s", "batch_size", "epochs", "hidden_size", "tcn_width",
+        "tcn_dilations", "learning_rate", "training_rates", "training_topologies",
+        "models",
+    }
+    if set(payload) != expected:
+        raise ValueError("resolved formal config does not use the exact TeacherConfig schema")
+    return TeacherConfig(
+        data_root=Path(str(payload["data_root"])),
+        output_root=Path(str(payload["output_root"])),
+        selection_split=str(payload["selection_split"]),
+        seeds=tuple(payload["seeds"]),
+        window_seconds=tuple(payload["window_seconds"]),
+        nominal_dt_s=payload["nominal_dt_s"],
+        batch_size=payload["batch_size"],
+        epochs=payload["epochs"],
+        hidden_size=payload["hidden_size"],
+        tcn_width=payload["tcn_width"],
+        tcn_dilations=tuple(payload["tcn_dilations"]),
+        learning_rate=payload["learning_rate"],
+        training_rates=tuple(payload["training_rates"]),
+        training_topologies=tuple(payload["training_topologies"]),
+        models=tuple(payload["models"]),
+    )
+
+
+def _validate_resolved_config(root: Path) -> tuple[TeacherConfig, str, str]:
+    document = _mapping(
+        _strict_canonical_json(root / "resolved_config.json"), "resolved_config.json"
+    )
+    if set(document) != {"schema", "resolved", "resolved_config_sha256", "matrix_plan_sha256"} or document["schema"] != "imputation-v3-formal-resolved-config-v1":
+        raise ValueError("resolved_config.json does not use the exact formal schema")
+    resolved = _mapping(document["resolved"], "resolved formal payload")
+    if set(resolved) != {"config", "device", "output_root"}:
+        raise ValueError("resolved formal payload does not use the exact schema")
+    if resolved["device"] not in {"cpu", "cuda"}:
+        raise ValueError("resolved formal device is invalid")
+    try:
+        recorded_output = Path(str(resolved["output_root"])).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("resolved formal output root does not exist") from exc
+    if recorded_output != root:
+        raise ValueError("resolved formal output root does not match validated root")
+    payload = _mapping(resolved["config"], "resolved formal config")
+    config_sha = hashlib.sha256(canonical_json(resolved).encode("utf-8")).hexdigest()
+    if document["resolved_config_sha256"] != config_sha:
+        raise ValueError("resolved formal config digest mismatch")
+    config = _config_from_payload(payload)
+    plan_sha = hashlib.sha256(canonical_json(formal_matrix_plan(config)).encode("utf-8")).hexdigest()
+    if document["matrix_plan_sha256"] != plan_sha:
+        raise ValueError("resolved formal matrix digest mismatch")
+    return config, config_sha, plan_sha
+
+
+def _validate_window_ledger(
+    root: Path, config: TeacherConfig
+) -> tuple[dict[tuple[int, int, str], tuple[str, int]], str]:
+    path = root / "window_identity_ledger.json"
+    document = _mapping(_strict_canonical_json(path), "window_identity_ledger.json")
+    if set(document) != {"schema", "entries", "entries_sha256"} or document["schema"] != "imputation-v3-formal-window-identities-v1":
+        raise ValueError("window identity ledger does not use the exact schema")
+    entries = document["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("window identity ledger must contain entries")
+    if document["entries_sha256"] != hashlib.sha256(canonical_json(entries).encode("utf-8")).hexdigest():
+        raise ValueError("window identity ledger digest mismatch")
+    expected_fields = {
+        "seed", "context_samples", "split", "window_ids_sha256", "window_count"
+    }
+    identities: dict[tuple[int, int, str], tuple[str, int]] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != expected_fields:
+            raise ValueError("window identity ledger entry schema mismatch")
+        key = (entry["seed"], entry["context_samples"], entry["split"])
+        digest, count = entry["window_ids_sha256"], entry["window_count"]
+        if key in identities or key[0] not in FORMAL_SEEDS or key[2] not in {"train", "validation"} or key[1] not in config.window_samples:
+            raise ValueError("window identity ledger contains an unexpected or duplicate cell")
+        if not isinstance(digest, str) or _HEX64.fullmatch(digest) is None or type(count) is not int or count <= 0:
+            raise ValueError("window identity ledger contains malformed identity material")
+        identities[key] = (digest, count)
+    expected_keys = {
+        (seed, samples, split)
+        for seed in FORMAL_SEEDS
+        for samples in config.window_samples
+        for split in ("train", "validation")
+    }
+    if set(identities) != expected_keys:
+        raise ValueError("window identity ledger does not cover the full matrix")
+    return identities, _sha256(path)
 
 
 def _validate_split(root: Path, path: Path) -> tuple[pd.DataFrame, str]:
@@ -380,16 +575,33 @@ def _validate_scaler(path: Path, manifest: pd.DataFrame, split_hash: str) -> str
     return expected_hash
 
 
-def _validate_frozen_models(root: Path, split_hash: str, scaler_hash: str) -> tuple[Mapping[str, Any], dict[tuple[int, str], str]]:
+def _validate_frozen_models(
+    root: Path,
+    split_hash: str,
+    scaler_hash: str,
+    config_sha256: str,
+    matrix_plan_sha256: str,
+    window_identities: Mapping[tuple[int, int, str], tuple[str, int]],
+    window_ledger_sha256: str,
+    config: TeacherConfig,
+) -> tuple[Mapping[str, Any], dict[tuple[int, str], str]]:
     frozen = _mapping(_strict_canonical_json(root / "frozen_models.json"), "frozen_models.json")
     required = {
         "selection_split", "split_hash", "scaler_hash", "git_commit",
         "dirty_state_digest", "strongest_baseline", "checkpoints",
+        "resolved_config_sha256", "matrix_plan_sha256",
+        "window_identity_ledger_sha256",
     }
     if set(frozen) != required or frozen["selection_split"] != "validation":
         raise ValueError("frozen_models.json does not use the exact validation-selected schema")
     if frozen["split_hash"] != split_hash or frozen["scaler_hash"] != scaler_hash:
         raise ValueError("frozen model provenance does not match split/scaler artifacts")
+    if (
+        frozen["resolved_config_sha256"] != config_sha256
+        or frozen["matrix_plan_sha256"] != matrix_plan_sha256
+        or frozen["window_identity_ledger_sha256"] != window_ledger_sha256
+    ):
+        raise ValueError("frozen model provenance does not match config or window evidence")
     strongest = frozen["strongest_baseline"]
     checkpoints = frozen["checkpoints"]
     if not isinstance(strongest, str) or not strongest or not isinstance(checkpoints, list) or not checkpoints:
@@ -398,6 +610,8 @@ def _validate_frozen_models(root: Path, split_hash: str, scaler_hash: str) -> tu
         "seed", "condition", "context_samples", "capacity", "validation_rmse",
         "validation_scores", "checkpoint_sha256", "checkpoint_path",
         "inference_config", "constructor_identity",
+        "train_window_ids_sha256", "train_window_count",
+        "validation_window_ids_sha256", "validation_window_count",
     }
     identities: dict[tuple[int, str], str] = {}
     candidates = (root / "candidates").resolve(strict=True)
@@ -427,6 +641,16 @@ def _validate_frozen_models(root: Path, split_hash: str, scaler_hash: str) -> tu
         if _sha256(resolved) != digest:
             raise ValueError("frozen checkpoint content hash mismatch")
         identities[identity] = digest
+        for split in ("train", "validation"):
+            expected_window = window_identities.get(
+                (seed, checkpoint["context_samples"], split)
+            )
+            actual_window = (
+                checkpoint[f"{split}_window_ids_sha256"],
+                checkpoint[f"{split}_window_count"],
+            )
+            if actual_window != expected_window:
+                raise ValueError("frozen checkpoint window identity disagrees with ledger")
     if {seed for seed, _ in identities} != set(FORMAL_SEEDS):
         raise ValueError("frozen checkpoints must cover the exact formal seed set")
     conditions_by_seed = [{condition for candidate_seed, condition in identities if candidate_seed == seed} for seed in FORMAL_SEEDS]
@@ -434,10 +658,20 @@ def _validate_frozen_models(root: Path, split_hash: str, scaler_hash: str) -> tu
         raise ValueError("frozen checkpoint condition matrix is incomplete")
     if strongest not in conditions_by_seed[0] or "teacher_actual_residual" not in conditions_by_seed[0]:
         raise ValueError("frozen checkpoint matrix omits the teacher or strongest baseline")
+    expected_conditions = {
+        str(cell["condition"]) for cell in formal_matrix_plan(config)["cells"]
+    }
+    if conditions_by_seed[0] != expected_conditions:
+        raise ValueError("frozen checkpoint conditions do not match the resolved matrix")
     return frozen, identities
 
 
-def _validate_formal_tables(root: Path, frozen: Mapping[str, Any], checkpoint_hashes: Mapping[tuple[int, str], str]) -> None:
+def _validate_formal_tables(
+    root: Path,
+    manifest: pd.DataFrame,
+    frozen: Mapping[str, Any],
+    checkpoint_hashes: Mapping[tuple[int, str], str],
+) -> None:
     metrics = validate_per_record_metrics(_read_csv(root / "per_record_metrics.csv", PER_RECORD_COLUMNS, "per-record metrics"))
     _finite_frame(metrics, "per-record metrics")
     if set(metrics["seed"].astype(int)) != set(FORMAL_SEEDS):
@@ -450,8 +684,14 @@ def _validate_formal_tables(root: Path, frozen: Mapping[str, Any], checkpoint_ha
     primary = metrics.loc[metrics["protocol"] == "teacher_primary"]
     if primary.empty or set(primary["model"].astype(str)) != {"teacher", str(frozen["strongest_baseline"])}:
         raise ValueError("formal metrics omit the exact teacher-primary comparison")
-    if any(_HEX64.fullmatch(str(value)) is None for value in primary["checkpoint_sha256"]):
-        raise ValueError("primary metric checkpoint provenance is malformed")
+    for row in primary.itertuples(index=False):
+        condition = (
+            "teacher_actual_residual"
+            if row.model == "teacher"
+            else str(frozen["strongest_baseline"])
+        )
+        if row.checkpoint_sha256 != checkpoint_hashes.get((int(row.seed), condition)):
+            raise ValueError("primary metric checkpoint provenance is inconsistent")
 
     summary = _read_csv(root / "summary.csv", SUMMARY_COLUMNS, "summary")
     _finite_frame(summary, "summary")
@@ -468,6 +708,42 @@ def _validate_formal_tables(root: Path, frozen: Mapping[str, Any], checkpoint_ha
     fractions = ledger[["requested_fraction", "realized_fraction"]].to_numpy(dtype=float)
     if ((fractions < 0.0) | (fractions > 1.0)).any() or any(_HEX64.fullmatch(str(value)) is None for value in ledger["mask_sha256"]):
         raise ValueError("mask ledger contains invalid fractions or identities")
+    test_sources = {
+        str(row.recording_id): str(row.imu_sha256)
+        for row in manifest.loc[manifest["split"] == "test"].itertuples(index=False)
+    }
+    generators = {
+        "point": point_missing,
+        "block": contiguous_block,
+        "channel": channel_outage,
+    }
+    for row in ledger.itertuples(index=False):
+        if (
+            row.generator != "formal-test-mask-v1"
+            or row.target_source_sha256 != test_sources.get(str(row.recording_id))
+            or type(row.condition_seed) is not int
+            or type(row.target_length) is not int
+            or type(row.channels) is not int
+            or row.target_length <= 0
+            or row.channels != 6
+        ):
+            raise ValueError("mask generator/source/shape evidence is inconsistent")
+        expected_seed = formal_mask_seed(
+            str(row.recording_id), int(row.seed), str(row.topology),
+            float(row.requested_fraction),
+        )
+        if row.condition_seed != expected_seed or row.topology not in generators:
+            raise ValueError("mask condition seed is inconsistent")
+        target = torch.zeros((row.target_length, row.channels), dtype=torch.float32)
+        recomputed = generators[row.topology](
+            target, float(row.requested_fraction), expected_seed
+        ).mask
+        content = np.ascontiguousarray(recomputed.numpy()).tobytes()
+        if hashlib.sha256(content).hexdigest() != row.mask_sha256:
+            raise ValueError("mask SHA-256 cannot be recomputed from sealed generator evidence")
+        realized = float((recomputed == 0).double().mean())
+        if not math.isclose(realized, float(row.realized_fraction), rel_tol=0.0, abs_tol=1e-15):
+            raise ValueError("mask realized fraction cannot be recomputed")
     metric_cells = non_primary.loc[:, [*key, "realized_fraction"]].drop_duplicates()
     merged = metric_cells.merge(ledger.loc[:, [*key, "realized_fraction"]], on=key, how="outer", suffixes=("_metric", "_ledger"), indicator=True)
     if (merged["_merge"] != "both").any() or not np.allclose(merged["realized_fraction_metric"], merged["realized_fraction_ledger"], rtol=0.0, atol=1e-12):
@@ -483,11 +759,16 @@ def _validate_formal_tables(root: Path, frozen: Mapping[str, Any], checkpoint_ha
 
 def _validate_formal_root(root: Path) -> dict[str, Any]:
     split_path, scaler_path = _validate_formal_layout(root)
-    _validate_formal_hashes(root)
+    _validate_formal_hashes(root, split_path, scaler_path)
     manifest, split_hash = _validate_split(root, split_path)
     scaler_hash = _validate_scaler(scaler_path, manifest, split_hash)
-    frozen, checkpoints = _validate_frozen_models(root, split_hash, scaler_hash)
-    _validate_formal_tables(root, frozen, checkpoints)
+    config, config_sha, matrix_sha = _validate_resolved_config(root)
+    window_identities, window_ledger_sha = _validate_window_ledger(root, config)
+    frozen, checkpoints = _validate_frozen_models(
+        root, split_hash, scaler_hash, config_sha, matrix_sha,
+        window_identities, window_ledger_sha, config,
+    )
+    _validate_formal_tables(root, manifest, frozen, checkpoints)
     return {
         "status": "valid",
         "kind": "formal_root",
@@ -533,7 +814,10 @@ def validate_artifacts(output: Path | str) -> dict[str, Any]:
                 "split_hashes": True,
                 "scaler_hashes": True,
                 "window_identities": True,
+                "mask_hashes": True,
                 "checkpoint_hashes": True,
+                "metrics_hashes": True,
+                "artifact_hashes": True,
             },
             "runs": [run],
         }
@@ -555,7 +839,10 @@ def validate_artifacts(output: Path | str) -> dict[str, Any]:
             "split_hashes": True,
             "scaler_hashes": True,
             "window_identities": True,
+            "mask_hashes": True,
             "checkpoint_hashes": True,
+            "metrics_hashes": True,
+            "artifact_hashes": True,
         },
         "runs": runs,
     }

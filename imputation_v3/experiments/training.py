@@ -8,7 +8,9 @@ from itertools import islice
 import json
 from pathlib import Path
 import math
+import os
 import random
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -35,6 +37,54 @@ from validation_v2.experiments.train import train_one_run
 
 
 _BATCH_TENSORS = ("features", "target", "observed", "mask", "dt", "baseline")
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_stable(path: Path, content: bytes) -> None:
+    if path.exists():
+        if not path.is_file() or path.read_bytes() != content:
+            raise ValueError(f"{path.name} already has inconsistent content")
+        return
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=path.parent, prefix=f".{path.name}-", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError as error:
+            if path.read_bytes() != content:
+                raise ValueError(f"{path.name} already has inconsistent content") from error
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def _window_evidence(window: Any) -> dict[str, Any]:
+    mask = np.ascontiguousarray(window.mask.numpy(), dtype=np.float32)
+    return {
+        "window_id": window.window_id,
+        "recording_id": window.recording_id,
+        "topology": window.topology,
+        "requested_fraction": window.requested_fraction,
+        "realized_fraction": window.realized_fraction,
+        "mask_sha256": hashlib.sha256(mask.tobytes()).hexdigest(),
+        "mask_bytes_hex": mask.tobytes().hex(),
+        "mask_dtype": "float32-le",
+        "samples": int(mask.shape[0]),
+        "channels": int(mask.shape[1]),
+    }
 
 
 def _device_batch(batch: Any, device: torch.device) -> dict[str, torch.Tensor]:
@@ -330,6 +380,12 @@ def run_teacher_smoke(
             split: [window.window_id for window in prepared[split]]
             for split in ("train", "validation")
         },
+        "split_manifest": split_rows,
+        "scaler_state": scaler_state,
+        "window_evidence": {
+            split: [_window_evidence(window) for window in prepared[split]]
+            for split in ("train", "validation")
+        },
         "bounds": {
             "max_recordings_per_split": 2,
             "max_windows_per_split": 4,
@@ -359,8 +415,13 @@ def run_teacher_smoke(
         dirty_digest=identity["dirty_state_digest"],
     )
     run_dir = effective_output.resolve() / manifest["run_id"]
-    artifact_names = ("run.json", "history.json", "best.pt", "checkpoint.json")
-    completed_before = all((run_dir / name).is_file() for name in artifact_names)
+    artifact_names = (
+        "run.json", "history.json", "best.pt", "checkpoint.json", "evidence.json"
+    )
+    present_artifacts = {name for name in artifact_names if (run_dir / name).exists()}
+    if present_artifacts and present_artifacts != set(artifact_names):
+        raise ValueError("partial or inconsistent smoke evidence cannot be resumed")
+    completed_before = present_artifacts == set(artifact_names)
     expected_checkpoint_sha256 = None
     metadata_path = run_dir / "checkpoint.json"
     if metadata_path.is_file():
@@ -393,6 +454,18 @@ def run_teacher_smoke(
         model=model,
         optimizer=optimizer,
         expected_checkpoint_sha256=expected_checkpoint_sha256,
+    )
+    evidence = {
+        "schema": "imputation-v3-smoke-evidence-v1",
+        "run_id": manifest["run_id"],
+        "run_manifest_sha256": _sha256_path(run_dir / "run.json"),
+        "history_sha256": _sha256_path(run_dir / "history.json"),
+        "checkpoint_metadata_sha256": _sha256_path(run_dir / "checkpoint.json"),
+        "checkpoint_sha256": _sha256_path(run_dir / "best.pt"),
+    }
+    _write_stable(
+        run_dir / "evidence.json",
+        (canonical_json(evidence) + "\n").encode("utf-8"),
     )
     return {
         "status": "resumed" if completed_before else "completed",

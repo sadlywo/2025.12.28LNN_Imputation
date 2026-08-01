@@ -3,19 +3,25 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import struct
 
 import pytest
 import torch
+import numpy as np
 import pandas as pd
 
 from imputation_v3.experiments.validate_artifacts import validate_artifacts
 from imputation_v3.experiments.runner import (
     FORMAL_SEEDS,
+    formal_mask_seed,
+    formal_matrix_plan,
     make_primary_rows,
     paired_formal_summaries,
     success_gate_payload,
     write_formal_artifacts,
 )
+from imputation_v3.config import TeacherConfig
+from validation_v2.data.masking import point_missing
 from validation_v2.data.splits import MANIFEST_COLUMNS
 from validation_v2.evaluation.statistics import PER_RECORD_COLUMNS
 from validation_v2.experiments.provenance import canonical_json, collect_provenance
@@ -25,8 +31,60 @@ def _write_canonical(path: Path, value: object) -> None:
     path.write_bytes((canonical_json(value) + "\n").encode("utf-8"))
 
 
-def _smoke_config() -> dict:
-    return {
+def _smoke_config(tmp_path: Path) -> tuple[dict, str, str]:
+    source_root = tmp_path / "smoke-sources"
+    source_root.mkdir(exist_ok=True)
+    split_manifest = []
+    for recording_id, split in (
+        ("train-a", "train"),
+        ("train-b", "train"),
+        ("validation-a", "validation"),
+        ("test-a", "test"),
+    ):
+        paths = []
+        for kind in ("imu", "vicon"):
+            path = source_root / f"{recording_id}-{kind}.csv"
+            path.write_bytes(f"{recording_id}:{kind}\n".encode("ascii"))
+            paths.append(path)
+        split_manifest.append(
+            {
+                "recording_id": recording_id,
+                "scenario": "handheld",
+                "imu_path": str(paths[0].resolve()),
+                "vicon_path": str(paths[1].resolve()),
+                "split": split,
+                "imu_sha256": hashlib.sha256(paths[0].read_bytes()).hexdigest(),
+                "vicon_sha256": hashlib.sha256(paths[1].read_bytes()).hexdigest(),
+            }
+        )
+    split_manifest.sort(key=lambda row: row["recording_id"])
+    split_hash = hashlib.sha256(canonical_json(split_manifest).encode("utf-8")).hexdigest()
+    scaler_state = {
+        "center": [0.0] * 6,
+        "scale": [1.0] * 6,
+        "training_ids": ["train-a", "train-b"],
+        "split_hash": split_hash,
+    }
+    scaler_hash = hashlib.sha256(canonical_json(scaler_state).encode("utf-8")).hexdigest()
+    train_ids = ["teacher-window-sha256-" + "1" * 64]
+    validation_ids = ["teacher-window-sha256-" + "2" * 64]
+
+    def window_evidence(window_id: str, recording_id: str) -> dict:
+        mask = struct.pack("<12f", 0.0, *([1.0] * 11))
+        return {
+            "window_id": window_id,
+            "recording_id": recording_id,
+            "topology": "point",
+            "requested_fraction": 0.2,
+            "realized_fraction": 1.0 / 12.0,
+            "mask_sha256": hashlib.sha256(mask).hexdigest(),
+            "mask_bytes_hex": mask.hex(),
+            "mask_dtype": "float32-le",
+            "samples": 2,
+            "channels": 6,
+        }
+
+    config = {
         "mode": "imputation_v3_teacher_smoke",
         "selection_split": "validation",
         "test_evaluation": False,
@@ -43,8 +101,14 @@ def _smoke_config() -> dict:
         },
         "scaler_training_ids": ["train-a", "train-b"],
         "selected_window_ids": {
-            "train": ["teacher-window-sha256-" + "1" * 64],
-            "validation": ["teacher-window-sha256-" + "2" * 64],
+            "train": train_ids,
+            "validation": validation_ids,
+        },
+        "split_manifest": split_manifest,
+        "scaler_state": scaler_state,
+        "window_evidence": {
+            "train": [window_evidence(train_ids[0], "train-a")],
+            "validation": [window_evidence(validation_ids[0], "validation-a")],
         },
         "bounds": {"max_recordings_per_split": 2, "max_windows_per_split": 4},
         "hyperparameters": {
@@ -62,15 +126,17 @@ def _smoke_config() -> dict:
             "time_mode": "actual",
         },
     }
+    return config, split_hash, scaler_hash
 
 
 def _make_smoke_root(tmp_path: Path) -> tuple[Path, Path, dict]:
     root = tmp_path / "smoke"
+    config, split_hash, scaler_hash = _smoke_config(tmp_path)
     manifest = collect_provenance(
-        _smoke_config(),
+        config,
         2026,
-        split_hash="a" * 64,
-        scaler_hash="b" * 64,
+        split_hash=split_hash,
+        scaler_hash=scaler_hash,
         git_commit="c" * 40,
         dirty_digest="",
     )
@@ -95,6 +161,15 @@ def _make_smoke_root(tmp_path: Path) -> tuple[Path, Path, dict]:
         "checkpoint_sha256": checkpoint_hash,
     }
     _write_canonical(run_dir / "checkpoint.json", checkpoint)
+    evidence = {
+        "schema": "imputation-v3-smoke-evidence-v1",
+        "run_id": manifest["run_id"],
+        "run_manifest_sha256": hashlib.sha256((run_dir / "run.json").read_bytes()).hexdigest(),
+        "history_sha256": hashlib.sha256((run_dir / "history.json").read_bytes()).hexdigest(),
+        "checkpoint_metadata_sha256": hashlib.sha256((run_dir / "checkpoint.json").read_bytes()).hexdigest(),
+        "checkpoint_sha256": checkpoint_hash,
+    }
+    _write_canonical(run_dir / "evidence.json", evidence)
     return root, run_dir, manifest
 
 
@@ -124,7 +199,8 @@ def test_validate_smoke_root_and_direct_run_are_read_only(tmp_path):
 
 
 def _formal_metric_row(
-    *, seed: int, recording_id: str, model: str, checkpoint_sha256: str, value: float
+    *, seed: int, recording_id: str, model: str, checkpoint_sha256: str, value: float,
+    realized_fraction: float = 0.2,
 ) -> dict:
     return {
         "run_id": f"formal-{seed}-{model}",
@@ -134,7 +210,7 @@ def _formal_metric_row(
         "protocol": "overall",
         "topology": "point",
         "requested_fraction": 0.2,
-        "realized_fraction": 0.2,
+        "realized_fraction": realized_fraction,
         "model": model,
         "metric": "rmse_physical",
         "value": value,
@@ -176,12 +252,88 @@ def _make_formal_root(tmp_path: Path) -> Path:
     scaler_hash = hashlib.sha256(scaler_bytes).hexdigest()
     (root / f"scaler-{scaler_hash}.json").write_bytes(scaler_bytes)
 
+    formal_config = TeacherConfig(
+        data_root=Path("Oxford Dataset"),
+        output_root=Path("results/imputation_v3/formal"),
+        selection_split="validation",
+        seeds=FORMAL_SEEDS,
+        window_seconds=(1.28,),
+        nominal_dt_s=0.01,
+        batch_size=2,
+        epochs=1,
+        hidden_size=16,
+        tcn_width=16,
+        tcn_dilations=(1, 2),
+        learning_rate=0.001,
+        training_rates=(0.2,),
+        training_topologies=("point",),
+        models=("linear", "teacher"),
+    )
+    config_payload = json.loads(canonical_json(formal_config))
+    resolved_payload = {
+        "config": config_payload,
+        "device": "cpu",
+        "output_root": str(root.resolve()),
+    }
+    config_sha = hashlib.sha256(
+        canonical_json(resolved_payload).encode("utf-8")
+    ).hexdigest()
+    matrix_sha = hashlib.sha256(
+        canonical_json(formal_matrix_plan(formal_config)).encode("utf-8")
+    ).hexdigest()
+    _write_canonical(
+        root / "resolved_config.json",
+        {
+            "schema": "imputation-v3-formal-resolved-config-v1",
+            "resolved": resolved_payload,
+            "resolved_config_sha256": config_sha,
+            "matrix_plan_sha256": matrix_sha,
+        },
+    )
+    window_entries = [
+        {
+            "seed": seed,
+            "context_samples": 128,
+            "split": split_name,
+            "window_ids_sha256": hashlib.sha256(
+                f"{seed}:128:{split_name}".encode("ascii")
+            ).hexdigest(),
+            "window_count": 4,
+        }
+        for seed in FORMAL_SEEDS
+        for split_name in ("train", "validation")
+    ]
+    _write_canonical(
+        root / "window_identity_ledger.json",
+        {
+            "schema": "imputation-v3-formal-window-identities-v1",
+            "entries": window_entries,
+            "entries_sha256": hashlib.sha256(
+                canonical_json(window_entries).encode("utf-8")
+            ).hexdigest(),
+        },
+    )
+    window_lookup = {
+        (entry["seed"], entry["split"]): entry for entry in window_entries
+    }
+    window_ledger_sha = hashlib.sha256(
+        (root / "window_identity_ledger.json").read_bytes()
+    ).hexdigest()
+
     candidates = root / "candidates"
     candidates.mkdir()
     checkpoints = []
     checkpoint_hashes = {}
+    conditions = (
+        "linear",
+        "teacher_actual_residual",
+        "teacher_constant_residual",
+        "teacher_dt_feature_only_residual",
+        "teacher_no_dt_residual",
+        "teacher_actual_raw",
+    )
     for seed in FORMAL_SEEDS:
-        for condition in ("linear", "teacher_actual_residual"):
+        for condition in conditions:
             checkpoint = candidates / f"{seed}-{condition}.bin"
             checkpoint.write_bytes(f"{seed}:{condition}".encode("ascii"))
             digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
@@ -204,6 +356,14 @@ def _make_formal_root(tmp_path: Path) -> Path:
                     "checkpoint_path": str(checkpoint.resolve()),
                     "inference_config": {},
                     "constructor_identity": None,
+                    "train_window_ids_sha256": window_lookup[(seed, "train")][
+                        "window_ids_sha256"
+                    ],
+                    "train_window_count": 4,
+                    "validation_window_ids_sha256": window_lookup[
+                        (seed, "validation")
+                    ]["window_ids_sha256"],
+                    "validation_window_count": 4,
                 }
             )
     frozen = {
@@ -212,6 +372,9 @@ def _make_formal_root(tmp_path: Path) -> Path:
         "scaler_hash": scaler_hash,
         "git_commit": "c" * 40,
         "dirty_state_digest": "",
+        "resolved_config_sha256": config_sha,
+        "matrix_plan_sha256": matrix_sha,
+        "window_identity_ledger_sha256": window_ledger_sha,
         "strongest_baseline": "linear",
         "checkpoints": checkpoints,
     }
@@ -220,26 +383,23 @@ def _make_formal_root(tmp_path: Path) -> Path:
     rows = []
     for seed in FORMAL_SEEDS:
         for recording_id in ("test-a", "test-b"):
-            rows.extend(
-                (
-                    _formal_metric_row(
-                        seed=seed,
-                        recording_id=recording_id,
-                        model="linear",
-                        checkpoint_sha256=checkpoint_hashes[(seed, "linear")],
-                        value=2.0,
-                    ),
-                    _formal_metric_row(
-                        seed=seed,
-                        recording_id=recording_id,
-                        model="teacher_actual_residual",
-                        checkpoint_sha256=checkpoint_hashes[
-                            (seed, "teacher_actual_residual")
-                        ],
-                        value=1.0,
-                    ),
-                )
+            mask_seed = formal_mask_seed(recording_id, seed, "point", 0.2)
+            realized_fraction = float(
+                (point_missing(torch.zeros((12, 6)), 0.2, mask_seed).mask == 0)
+                .double()
+                .mean()
             )
+            for condition in conditions:
+                rows.append(
+                    _formal_metric_row(
+                        seed=seed,
+                        recording_id=recording_id,
+                        model=condition,
+                        checkpoint_sha256=checkpoint_hashes[(seed, condition)],
+                        value=1.0 if condition == "teacher_actual_residual" else 2.0,
+                        realized_fraction=realized_fraction,
+                    )
+                )
     metrics = pd.DataFrame(rows, columns=PER_RECORD_COLUMNS)
     primary = make_primary_rows(
         metrics,
@@ -260,22 +420,33 @@ def _make_formal_root(tmp_path: Path) -> Path:
         bootstrap_samples=20,
     )
     gate = success_gate_payload(summary, strongest_baseline="linear")
-    ledger = pd.DataFrame(
-        [
-            {
+    test_source_hashes = dict(
+        zip(
+            split.loc[split["split"] == "test", "recording_id"],
+            split.loc[split["split"] == "test", "imu_sha256"],
+        )
+    )
+    ledger_rows = []
+    for seed in FORMAL_SEEDS:
+        for recording_id in ("test-a", "test-b"):
+            condition_seed = formal_mask_seed(recording_id, seed, "point", 0.2)
+            mask = point_missing(torch.zeros((12, 6)), 0.2, condition_seed).mask
+            ledger_rows.append({
                 "seed": seed,
                 "recording_id": recording_id,
                 "topology": "point",
                 "requested_fraction": 0.2,
-                "realized_fraction": 0.2,
+                "realized_fraction": float((mask == 0).double().mean()),
                 "mask_sha256": hashlib.sha256(
-                    f"{seed}:{recording_id}:point:0.2".encode("ascii")
+                    np.ascontiguousarray(mask.numpy()).tobytes()
                 ).hexdigest(),
-            }
-            for seed in FORMAL_SEEDS
-            for recording_id in ("test-a", "test-b")
-        ]
-    )
+                "generator": "formal-test-mask-v1",
+                "condition_seed": condition_seed,
+                "target_source_sha256": test_source_hashes[recording_id],
+                "target_length": 12,
+                "channels": 6,
+            })
+    ledger = pd.DataFrame(ledger_rows)
     write_formal_artifacts(
         root,
         pd.concat((metrics, primary), ignore_index=True),
@@ -390,3 +561,35 @@ def test_validate_artifacts_cli_prints_canonical_json_and_returns_two_on_failure
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "checkpoint.json" in captured.err
+
+
+def _reseal_formal_hash(root: Path, name: str) -> None:
+    hashes_path = root / "artifact_hashes.json"
+    hashes = json.loads(hashes_path.read_text(encoding="utf-8"))
+    hashes[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+    _write_canonical(hashes_path, hashes)
+
+
+def test_formal_primary_checkpoint_cannot_be_forged_with_internal_rehash(tmp_path):
+    root = _make_formal_root(tmp_path)
+    metrics_path = root / "per_record_metrics.csv"
+    metrics = pd.read_csv(metrics_path)
+    target = (metrics["protocol"] == "teacher_primary") & (metrics["model"] == "teacher")
+    metrics.loc[target, "checkpoint_sha256"] = "f" * 64
+    metrics_path.write_bytes(metrics.to_csv(index=False, lineterminator="\n").encode("utf-8"))
+    _reseal_formal_hash(root, "per_record_metrics.csv")
+
+    with pytest.raises(ValueError, match="primary|checkpoint"):
+        validate_artifacts(root)
+
+
+def test_formal_mask_cannot_be_forged_with_internal_rehash(tmp_path):
+    root = _make_formal_root(tmp_path)
+    ledger_path = root / "mask_ledger.csv"
+    ledger = pd.read_csv(ledger_path)
+    ledger.loc[0, "mask_sha256"] = "f" * 64
+    ledger_path.write_bytes(ledger.to_csv(index=False, lineterminator="\n").encode("utf-8"))
+    _reseal_formal_hash(root, "mask_ledger.csv")
+
+    with pytest.raises(ValueError, match="mask"):
+        validate_artifacts(root)

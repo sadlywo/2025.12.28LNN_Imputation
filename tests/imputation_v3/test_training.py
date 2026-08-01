@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from imputation_v3.models.teacher import OfflineTeacher, TeacherOutput
 from imputation_v3.config import TeacherConfig
 from validation_v2.data.normalization import RobustTrainScaler
 from validation_v2.types import Recording
+from validation_v2.experiments.provenance import canonical_json
 
 
 def _recording(recording_id: str, rows: int = 40) -> Recording:
@@ -126,6 +128,32 @@ def _patch_smoke_data(monkeypatch, module, *, split_token: str = "base"):
         lambda root: {"git_commit": "abc", "dirty_state_digest": ""},
     )
     return loaded
+
+
+def _write_fake_core_artifacts(run_dir: Path, manifest: dict) -> dict:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_bytes(
+        (canonical_json(manifest) + "\n").encode("utf-8")
+    )
+    history = [
+        {"epoch": 1, "train": {"missing_rmse": 1.0}, "validation": {"missing_rmse": 0.5}}
+    ]
+    (run_dir / "history.json").write_bytes(
+        (canonical_json(history) + "\n").encode("utf-8")
+    )
+    (run_dir / "best.pt").write_bytes(b"fake-checkpoint")
+    digest = hashlib.sha256((run_dir / "best.pt").read_bytes()).hexdigest()
+    metadata = {
+        "run_id": manifest["run_id"],
+        "best_epoch": 1,
+        "selection_split": "validation",
+        "selection_metric": "missing_rmse",
+        "checkpoint_sha256": digest,
+    }
+    (run_dir / "checkpoint.json").write_bytes(
+        (canonical_json(metadata) + "\n").encode("utf-8")
+    )
+    return metadata
 
 
 def test_teacher_callback_factory_is_public():
@@ -299,13 +327,7 @@ def test_smoke_orchestration_is_train_validation_only_and_seeded(tmp_path, monke
 
     def fake_train_one_run(run_dir, manifest, **kwargs):
         captured.update(run_dir=run_dir, manifest=manifest, **kwargs)
-        return {
-            "run_id": manifest["run_id"],
-            "best_epoch": 1,
-            "selection_split": "validation",
-            "selection_metric": "missing_rmse",
-            "checkpoint_sha256": "d" * 64,
-        }
+        return _write_fake_core_artifacts(run_dir, manifest)
 
     monkeypatch.setattr(training, "train_one_run", fake_train_one_run)
     report = training.run_teacher_smoke(
@@ -360,13 +382,7 @@ def test_smoke_enables_fail_closed_deterministic_algorithms(tmp_path, monkeypatc
             observed["unsupported_error"] = str(error)
         else:
             observed["unsupported_error"] = None
-        return {
-            "run_id": manifest["run_id"],
-            "best_epoch": 1,
-            "selection_split": "validation",
-            "selection_metric": "missing_rmse",
-            "checkpoint_sha256": "d" * 64,
-        }
+        return _write_fake_core_artifacts(run_dir, manifest)
 
     monkeypatch.setattr(torch, "use_deterministic_algorithms", tracked)
     monkeypatch.setattr(training, "train_one_run", fake_train_one_run)
@@ -404,13 +420,9 @@ def test_smoke_consumes_at_most_four_windows_per_split(tmp_path, monkeypatch):
     monkeypatch.setattr(
         training,
         "train_one_run",
-        lambda run_dir, manifest, **kwargs: {
-            "run_id": manifest["run_id"],
-            "best_epoch": 1,
-            "selection_split": "validation",
-            "selection_metric": "missing_rmse",
-            "checkpoint_sha256": "d" * 64,
-        },
+        lambda run_dir, manifest, **kwargs: _write_fake_core_artifacts(
+            run_dir, manifest
+        ),
     )
 
     training.run_teacher_smoke(
@@ -420,7 +432,7 @@ def test_smoke_consumes_at_most_four_windows_per_split(tmp_path, monkeypatch):
     assert yielded == {"train": 4, "validation": 4}
 
 
-def test_smoke_seals_four_artifacts_and_validates_resume(tmp_path, monkeypatch):
+def test_smoke_seals_evidence_and_validates_resume(tmp_path, monkeypatch):
     import imputation_v3.experiments.training as training
 
     _patch_smoke_data(monkeypatch, training)
@@ -437,6 +449,7 @@ def test_smoke_seals_four_artifacts_and_validates_resume(tmp_path, monkeypatch):
         "history.json",
         "best.pt",
         "checkpoint.json",
+        "evidence.json",
     }
     assert json.loads((run_dir / "checkpoint.json").read_text())["checkpoint_sha256"]
 

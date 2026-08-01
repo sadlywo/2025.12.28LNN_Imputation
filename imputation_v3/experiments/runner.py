@@ -577,6 +577,9 @@ def make_primary_rows(
                 raise ValueError("primary RMSE values must be finite")
             source_run_ids = [str(value) for value in model_rows["run_id"]]
             checkpoint_hashes = [str(value) for value in model_rows["checkpoint_sha256"]]
+            unique_checkpoint_hashes = set(checkpoint_hashes)
+            if len(unique_checkpoint_hashes) != 1:
+                raise ValueError("primary condition rows must share one frozen checkpoint")
             rows.append(
                 {
                     "run_id": "primary-" + _digest_strings(source_run_ids)[:16],
@@ -594,7 +597,7 @@ def make_primary_rows(
                     "model": model_name,
                     "metric": "rmse_physical",
                     "value": _stable_rms(values),
-                    "checkpoint_sha256": _digest_strings(checkpoint_hashes),
+                    "checkpoint_sha256": next(iter(unique_checkpoint_hashes)),
                 }
             )
     result = pd.DataFrame(rows, columns=PER_RECORD_COLUMNS).sort_values(
@@ -758,6 +761,19 @@ def write_formal_artifacts(
         payloads["coverage_ledger.csv"] = _dataframe_bytes(
             coverage_ledger, "coverage_ledger"
         )
+    upstream_fixed = (
+        "resolved_config.json", "window_identity_ledger.json", "frozen_models.json"
+    )
+    upstream_present = [name for name in upstream_fixed if (root / name).exists()]
+    split_paths = sorted(root.glob("split_manifest-*.csv")) if root.exists() else []
+    scaler_paths = sorted(root.glob("scaler-*.json")) if root.exists() else []
+    if upstream_present or split_paths or scaler_paths:
+        if len(upstream_present) != len(upstream_fixed) or len(split_paths) != 1 or len(scaler_paths) != 1:
+            raise ValueError("formal provenance evidence is incomplete")
+        for name in upstream_fixed:
+            payloads[name] = (root / name).read_bytes()
+        payloads[split_paths[0].name] = split_paths[0].read_bytes()
+        payloads[scaler_paths[0].name] = scaler_paths[0].read_bytes()
     hashes = {
         name: hashlib.sha256(content).hexdigest() for name, content in payloads.items()
     }
@@ -859,6 +875,10 @@ class _Candidate:
     validation_scores: tuple[dict[str, Any], ...] = ()
     inference_config: dict[str, Any] | None = None
     constructor_identity: dict[str, Any] | None = None
+    train_window_ids_sha256: str = ""
+    train_window_count: int = 0
+    validation_window_ids_sha256: str = ""
+    validation_window_count: int = 0
 
 
 @dataclass
@@ -877,6 +897,15 @@ def _sha256_path(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def formal_mask_seed(recording_id: str, seed: int, topology: str, rate: float) -> int:
+    digest = hashlib.sha256(
+        canonical_json(
+            ["formal-test-mask-v1", recording_id, seed, topology, rate]
+        ).encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big") % (2**63 - 1)
 
 
 def _verify_source_sha(path: Path, expected_sha256: str) -> None:
@@ -1110,6 +1139,36 @@ class OXIODFormalBackend:
         self._frozen: _SelectedModels | None = None
         self._test_loaded = False
         self._evaluated_cells: set[tuple[int, str, str]] = set()
+        self._resolved_config_sha256 = ""
+        self._matrix_plan_sha256 = ""
+        self._window_identity_ledger_sha256 = ""
+
+    def _seal_resolved_config(self) -> None:
+        if self._resolved_config_sha256:
+            return
+        plan = formal_matrix_plan(self.config)
+        config_payload = json.loads(canonical_json(self.config))
+        resolved_payload = {
+            "config": config_payload,
+            "device": str(self.device),
+            "output_root": str(self.output_root),
+        }
+        config_sha256 = _sha256_bytes(
+            canonical_json(resolved_payload).encode("utf-8")
+        )
+        matrix_sha256 = _sha256_bytes(canonical_json(plan).encode("utf-8"))
+        document = {
+            "schema": "imputation-v3-formal-resolved-config-v1",
+            "resolved": resolved_payload,
+            "resolved_config_sha256": config_sha256,
+            "matrix_plan_sha256": matrix_sha256,
+        }
+        _write_stable(
+            self.output_root / "resolved_config.json",
+            (canonical_json(document) + "\n").encode("utf-8"),
+        )
+        self._resolved_config_sha256 = config_sha256
+        self._matrix_plan_sha256 = matrix_sha256
 
     def _verify_split_sources(self, manifest: pd.DataFrame, split: str) -> None:
         rows = manifest.loc[manifest["split"] == split]
@@ -1132,6 +1191,7 @@ class OXIODFormalBackend:
     def load_frozen_manifest_and_scaler(self) -> _FormalAssets:
         if self._assets is not None:
             return self._assets
+        self._seal_resolved_config()
         data_root = self.config.data_root
         if not data_root.is_absolute():
             data_root = self.repository_root / data_root
@@ -1358,6 +1418,33 @@ class OXIODFormalBackend:
         # materialisation instead of silently training against stale provenance.
         self._verify_split_sources(windows.assets.manifest, "train")
         self._verify_split_sources(windows.assets.manifest, "validation")
+        identity_entries = []
+        for seed in FORMAL_SEEDS:
+            for context in plan["contexts"]:
+                samples = int(context["samples"])
+                for split in ("train", "validation"):
+                    digest, count = windows.identity(split, seed, samples)
+                    identity_entries.append(
+                        {
+                            "seed": seed,
+                            "context_samples": samples,
+                            "split": split,
+                            "window_ids_sha256": digest,
+                            "window_count": count,
+                        }
+                    )
+        ledger_document = {
+            "schema": "imputation-v3-formal-window-identities-v1",
+            "entries": identity_entries,
+            "entries_sha256": _sha256_bytes(
+                canonical_json(identity_entries).encode("utf-8")
+            ),
+        }
+        ledger_path = self.output_root / "window_identity_ledger.json"
+        _write_stable(
+            ledger_path, (canonical_json(ledger_document) + "\n").encode("utf-8")
+        )
+        self._window_identity_ledger_sha256 = _sha256_path(ledger_path)
         best: dict[tuple[int, str], _Candidate] = {}
         score_ledger: dict[tuple[int, str], list[dict[str, Any]]] = {}
         seen: set[tuple[int, str, int, str]] = set()
@@ -1426,6 +1513,14 @@ class OXIODFormalBackend:
                         condition, seed, samples, windows, capacity,
                     )
                     candidate.model_alias = alias
+                train_identity, train_count = windows.identity("train", seed, samples)
+                validation_identity, validation_count = windows.identity(
+                    "validation", seed, samples
+                )
+                candidate.train_window_ids_sha256 = train_identity
+                candidate.train_window_count = train_count
+                candidate.validation_window_ids_sha256 = validation_identity
+                candidate.validation_window_count = validation_count
                 key = (seed, condition)
                 score_ledger.setdefault(key, []).append(
                     {
@@ -1504,6 +1599,9 @@ class OXIODFormalBackend:
             "scaler_hash": self._assets.scaler_hash,
             "git_commit": self._assets.git_commit,
             "dirty_state_digest": self._assets.dirty_digest,
+            "resolved_config_sha256": self._resolved_config_sha256,
+            "matrix_plan_sha256": self._matrix_plan_sha256,
+            "window_identity_ledger_sha256": self._window_identity_ledger_sha256,
             "strongest_baseline": strongest,
             "checkpoints": [
                 {
@@ -1517,6 +1615,10 @@ class OXIODFormalBackend:
                     "checkpoint_path": str(candidate.checkpoint_path),
                     "inference_config": candidate.inference_config,
                     "constructor_identity": candidate.constructor_identity,
+                    "train_window_ids_sha256": candidate.train_window_ids_sha256,
+                    "train_window_count": candidate.train_window_count,
+                    "validation_window_ids_sha256": candidate.validation_window_ids_sha256,
+                    "validation_window_count": candidate.validation_window_count,
                 }
                 for (seed, condition), candidate in sorted(selected.items())
             ],
@@ -1555,10 +1657,7 @@ class OXIODFormalBackend:
 
     @staticmethod
     def _full_mask(target: torch.Tensor, recording_id: str, seed: int, topology: str, rate: float):
-        digest = hashlib.sha256(
-            canonical_json(["formal-test-mask-v1", recording_id, seed, topology, rate]).encode("utf-8")
-        ).digest()
-        condition_seed = int.from_bytes(digest[:8], "big") % (2**63 - 1)
+        condition_seed = formal_mask_seed(recording_id, seed, topology, rate)
         generator = {"point": point_missing, "block": contiguous_block, "channel": channel_outage}[topology]
         return generator(target, rate, condition_seed).mask
 
@@ -1726,6 +1825,9 @@ class OXIODFormalBackend:
         if frozen is not self._frozen or not self._test_loaded:
             raise ValueError("test evaluation requires frozen models and one loaded test set")
         scenarios = dict(zip(self._assets.manifest["recording_id"], self._assets.manifest["scenario"]))
+        source_hashes = dict(
+            zip(self._assets.manifest["recording_id"], self._assets.manifest["imu_sha256"])
+        )
         rows: list[pd.DataFrame] = []
         ledger: dict[tuple[int, str, str, float], dict[str, Any]] = {}
         for (seed, condition), candidate in sorted(frozen.candidates.items()):
@@ -1751,6 +1853,13 @@ class OXIODFormalBackend:
                                 "topology": topology, "requested_fraction": rate,
                                 "realized_fraction": float((mask == 0).double().mean()),
                                 "mask_sha256": mask_sha,
+                                "generator": "formal-test-mask-v1",
+                                "condition_seed": formal_mask_seed(
+                                    recording.id, seed, topology, rate
+                                ),
+                                "target_source_sha256": str(source_hashes[recording.id]),
+                                "target_length": int(target.shape[0]),
+                                "channels": int(target.shape[1]),
                             }
                             if prior is not None and prior != entry:
                                 raise RuntimeError("formal masks changed across models")
