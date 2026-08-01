@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+import imputation_v3.models.baselines as baselines_module
 from imputation_v3.models.baselines import (
     complete_signal,
     constant_velocity_rts,
@@ -164,6 +165,91 @@ def test_rts_reconstructs_constant_velocity_interior_points_sensibly():
     assert torch.isfinite(result).all()
 
 
+def test_rts_diffuse_prior_reconstructs_a_substantial_leading_gap():
+    time = torch.tensor([0.0, 0.2, 0.21], dtype=torch.float64)
+    truth = (1.0 + 2.0 * time)[:, None]
+    mask = torch.tensor([[0], [1], [1]], dtype=torch.bool)
+    source = torch.where(mask, truth, torch.full_like(truth, math.nan))
+
+    result = constant_velocity_rts(
+        source,
+        mask,
+        time,
+        empty_fill=0.0,
+        process_var=1e-4,
+        observation_var=1e-5,
+    )
+
+    # Two distinct, exact analytic measurements identify the line. The 2e-2
+    # allowance covers model weighting but is far below the old 7e-2 bias.
+    torch.testing.assert_close(result[0], truth[0], rtol=0, atol=2e-2)
+
+
+def test_rts_processes_boundary_measurements_once_before_a_trailing_gap():
+    time = torch.tensor([0.0, 0.01, 0.8], dtype=torch.float64)
+    truth = (1.0 + 2.0 * time)[:, None]
+    mask = torch.tensor([[1], [1], [0]], dtype=torch.bool)
+    source = torch.where(mask, truth, torch.full_like(truth, math.inf))
+
+    result = constant_velocity_rts(
+        source,
+        mask,
+        time,
+        empty_fill=0.0,
+        process_var=1e-4,
+        observation_var=1e-5,
+    )
+
+    # The diffuse prior lets two exact measurements identify velocity. The
+    # allowance is far below the old 2.65e-1 bias from reusing row zero.
+    torch.testing.assert_close(result[2], truth[2], rtol=0, atol=2e-2)
+
+
+def test_rts_solve_failure_reports_channel_and_time_index(monkeypatch):
+    source = torch.tensor(
+        [[math.nan, 1.0], [math.nan, math.nan], [math.nan, 3.0]],
+        dtype=torch.float64,
+    )
+    mask = torch.tensor([[0, 1], [0, 0], [0, 1]], dtype=torch.bool)
+    time = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float64)
+
+    def fail_solve(*args, **kwargs):
+        raise RuntimeError("singular test system")
+
+    monkeypatch.setattr(torch.linalg, "solve", fail_solve)
+
+    with pytest.raises(ValueError, match="channel 1 at time index 1"):
+        constant_velocity_rts(
+            source,
+            mask,
+            time,
+            empty_fill=0.0,
+            process_var=1e-4,
+            observation_var=1e-5,
+        )
+
+
+def test_rts_does_not_translate_unrelated_runtime_errors(monkeypatch):
+    source = torch.tensor([[1.0], [2.0]], dtype=torch.float64)
+    mask = torch.ones_like(source, dtype=torch.bool)
+    time = torch.tensor([0.0, 1.0], dtype=torch.float64)
+
+    def fail_transition(*args, **kwargs):
+        raise RuntimeError("unrelated allocation failure")
+
+    monkeypatch.setattr(baselines_module, "_transition_and_noise", fail_transition)
+
+    with pytest.raises(RuntimeError, match="unrelated allocation failure"):
+        constant_velocity_rts(
+            source,
+            mask,
+            time,
+            empty_fill=0.0,
+            process_var=1e-4,
+            observation_var=1e-5,
+        )
+
+
 def test_complete_signal_rejects_only_non_finite_predictions_that_are_used():
     observed = torch.tensor([[1.0], [2.0]])
     mask = torch.tensor([[1], [0]], dtype=torch.bool)
@@ -173,6 +259,47 @@ def test_complete_signal_rejects_only_non_finite_predictions_that_are_used():
 
     with pytest.raises(ValueError, match="prediction"):
         complete_signal(observed, mask, torch.tensor([[0.0], [math.nan]]))
+
+
+@pytest.mark.parametrize("dtype", (torch.int64, torch.bool))
+def test_complete_signal_rejects_non_floating_predictions(dtype):
+    observed = torch.ones(2, 1, dtype=torch.float32)
+    mask = torch.tensor([[1], [0]], dtype=torch.bool)
+    prediction = torch.ones(2, 1, dtype=dtype)
+
+    with pytest.raises(TypeError, match="floating"):
+        complete_signal(observed, mask, prediction)
+
+
+def test_complete_signal_rejects_mixed_floating_prediction_dtype():
+    observed = torch.ones(2, 1, dtype=torch.float32)
+    mask = torch.tensor([[1], [0]], dtype=torch.bool)
+    prediction = torch.ones(2, 1, dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="dtype"):
+        complete_signal(observed, mask, prediction)
+
+
+def test_complete_signal_preserves_observed_dtype_without_promotion():
+    observed = torch.tensor([[1.0], [2.0]], dtype=torch.float64)
+    mask = torch.tensor([[1], [0]], dtype=torch.bool)
+    prediction = torch.tensor([[99.0], [3.0]], dtype=torch.float64)
+
+    result = complete_signal(observed, mask, prediction)
+
+    assert result.dtype == observed.dtype
+    torch.testing.assert_close(
+        result, torch.tensor([[1.0], [3.0]], dtype=torch.float64)
+    )
+
+
+def test_complete_signal_rejects_prediction_on_a_different_device():
+    observed = torch.ones(2, 1)
+    mask = torch.ones_like(observed, dtype=torch.bool)
+    prediction = torch.ones(2, 1, device="meta")
+
+    with pytest.raises(ValueError, match="device"):
+        complete_signal(observed, mask, prediction)
 
 
 @pytest.mark.parametrize(

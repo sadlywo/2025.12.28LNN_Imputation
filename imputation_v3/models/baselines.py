@@ -6,6 +6,9 @@ from numbers import Real
 import torch
 
 
+_RTS_DIFFUSE_PRIOR_VARIANCE = 1e6
+
+
 def _validate_finite_scalar(value: Real, name: str, *, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError(f"{name} must be a real finite scalar")
@@ -86,16 +89,15 @@ def complete_signal(
         raise ValueError("prediction shape must match observed shape")
     if prediction.device != observed.device:
         raise ValueError("observed, mask, and prediction must share a device")
-    if prediction.is_complex():
-        raise TypeError("prediction must be real-valued")
+    if not prediction.is_floating_point():
+        raise TypeError("prediction must be a floating tensor")
+    if prediction.dtype != observed.dtype:
+        raise ValueError("prediction dtype must match observed dtype")
 
     missing = ~mask_bool
     if not torch.isfinite(prediction[missing]).all().item():
         raise ValueError("prediction values used at missing entries must be finite")
-    converted = prediction.to(dtype=observed.dtype)
-    if not torch.isfinite(converted[missing]).all().item():
-        raise ValueError("prediction values used at missing entries must remain finite")
-    result = torch.where(mask_bool, observed, converted)
+    result = torch.where(mask_bool, observed, prediction)
     if not torch.isfinite(result).all().item():
         raise ValueError("completed signal must be finite")
     return result
@@ -232,7 +234,21 @@ def constant_velocity_rts(
     process_var: Real,
     observation_var: Real,
 ) -> torch.Tensor:
-    """Smooth each channel with a real-time constant-velocity RTS model."""
+    """Run an offline constant-velocity RTS smoother independently per channel.
+
+    The state is ``[value, velocity]``. Real timestamp gaps define
+    ``F=[[1, dt], [0, 1]]`` and
+    ``Q=q*[[dt^3/3, dt^2/2], [dt^2/2, dt]]``; observations use
+    ``H=[1, 0]`` and scalar ``R=observation_var``. At row zero the filter uses
+    an identity transition and an observation-independent diffuse prior with
+    mean ``[empty_fill, 0]``. Thus every measurement is assimilated exactly
+    once at its own timestamp, while the backward RTS pass legitimately gives
+    this offline baseline access to future observations.
+
+    A channel with no observations is filled with ``empty_fill``. Channels
+    with one or all rows observed use the same filter/smoother; final observed
+    entries are restored exactly by :func:`complete_signal`.
+    """
     mask_bool, valid_time, fill = _validate_baseline_inputs(
         source, mask, time, empty_fill
     )
@@ -253,15 +269,13 @@ def constant_velocity_rts(
             ).flatten()
             if observed_rows.numel() == 0:
                 continue
-            observed_values = source[observed_rows, channel].to(dtype=torch.float64)
-            if observed_rows.numel() == 1:
-                prediction[:, channel].fill_(float(observed_values[0].item()))
-                continue
-
             state = torch.stack(
-                (observed_values[0], torch.zeros_like(observed_values[0]))
+                (
+                    torch.as_tensor(fill, dtype=torch.float64, device=source.device),
+                    torch.zeros((), dtype=torch.float64, device=source.device),
+                )
             )
-            covariance = identity.clone()
+            covariance = identity * _RTS_DIFFUSE_PRIOR_VARIANCE
 
             predicted_states: list[torch.Tensor] = []
             predicted_covariances: list[torch.Tensor] = []
@@ -269,74 +283,77 @@ def constant_velocity_rts(
             filtered_covariances: list[torch.Tensor] = []
             transitions: list[torch.Tensor] = []
 
-            try:
-                for row in range(source.shape[0]):
-                    if row == 0:
-                        transition = identity
-                        predicted_state = state
-                        predicted_covariance = covariance
-                    else:
-                        dt = internal_time[row] - internal_time[row - 1]
-                        transition, noise = _transition_and_noise(dt, q)
-                        predicted_state = transition @ state
-                        predicted_covariance = (
-                            transition @ covariance @ transition.T + noise
-                        )
+            for row in range(source.shape[0]):
+                if row == 0:
+                    transition = identity
+                    predicted_state = state
+                    predicted_covariance = covariance
+                else:
+                    dt = internal_time[row] - internal_time[row - 1]
+                    transition, noise = _transition_and_noise(dt, q)
+                    predicted_state = transition @ state
                     predicted_covariance = (
-                        predicted_covariance + predicted_covariance.T
-                    ) / 2.0
-                    _require_finite_rts(predicted_state, predicted_covariance)
+                        transition @ covariance @ transition.T + noise
+                    )
+                predicted_covariance = (
+                    predicted_covariance + predicted_covariance.T
+                ) / 2.0
+                _require_finite_rts(predicted_state, predicted_covariance)
 
-                    if mask_bool[row, channel].item():
-                        innovation = (
-                            source[row, channel].to(dtype=torch.float64)
-                            - observation @ predicted_state
-                        )
-                        innovation_covariance = (
-                            observation @ predicted_covariance @ observation + r
-                        )
-                        gain = (
-                            predicted_covariance @ observation
-                        ) / innovation_covariance
-                        state = predicted_state + gain * innovation
-                        residual_transform = identity - torch.outer(gain, observation)
-                        covariance = (
-                            residual_transform
-                            @ predicted_covariance
-                            @ residual_transform.T
-                            + r * torch.outer(gain, gain)
-                        )
-                    else:
-                        state = predicted_state
-                        covariance = predicted_covariance
-                    covariance = (covariance + covariance.T) / 2.0
-                    _require_finite_rts(state, covariance)
-                    transitions.append(transition)
-                    predicted_states.append(predicted_state)
-                    predicted_covariances.append(predicted_covariance)
-                    filtered_states.append(state)
-                    filtered_covariances.append(covariance)
+                if mask_bool[row, channel].item():
+                    innovation = (
+                        source[row, channel].to(dtype=torch.float64)
+                        - observation @ predicted_state
+                    )
+                    innovation_covariance = (
+                        observation @ predicted_covariance @ observation + r
+                    )
+                    gain = (
+                        predicted_covariance @ observation
+                    ) / innovation_covariance
+                    state = predicted_state + gain * innovation
+                    residual_transform = identity - torch.outer(gain, observation)
+                    covariance = (
+                        residual_transform
+                        @ predicted_covariance
+                        @ residual_transform.T
+                        + r * torch.outer(gain, gain)
+                    )
+                else:
+                    state = predicted_state
+                    covariance = predicted_covariance
+                covariance = (covariance + covariance.T) / 2.0
+                _require_finite_rts(state, covariance)
+                transitions.append(transition)
+                predicted_states.append(predicted_state)
+                predicted_covariances.append(predicted_covariance)
+                filtered_states.append(state)
+                filtered_covariances.append(covariance)
 
-                smoothed_states = list(filtered_states)
-                smoothed_covariance = filtered_covariances[-1]
-                for row in range(source.shape[0] - 2, -1, -1):
-                    transition = transitions[row + 1]
+            smoothed_states = list(filtered_states)
+            smoothed_covariance = filtered_covariances[-1]
+            for row in range(source.shape[0] - 2, -1, -1):
+                transition = transitions[row + 1]
+                try:
                     smoother_gain = torch.linalg.solve(
                         predicted_covariances[row + 1],
                         transition @ filtered_covariances[row],
                     ).T
-                    smoothed_states[row] = filtered_states[row] + smoother_gain @ (
-                        smoothed_states[row + 1] - predicted_states[row + 1]
-                    )
-                    smoothed_covariance = filtered_covariances[row] + smoother_gain @ (
-                        smoothed_covariance - predicted_covariances[row + 1]
-                    ) @ smoother_gain.T
-                    smoothed_covariance = (
-                        smoothed_covariance + smoothed_covariance.T
-                    ) / 2.0
-                    _require_finite_rts(smoothed_states[row], smoothed_covariance)
-            except RuntimeError as exc:
-                raise ValueError("RTS linear algebra failed") from exc
+                except RuntimeError as exc:
+                    raise ValueError(
+                        "RTS smoothing solve failed for "
+                        f"channel {channel} at time index {row}"
+                    ) from exc
+                smoothed_states[row] = filtered_states[row] + smoother_gain @ (
+                    smoothed_states[row + 1] - predicted_states[row + 1]
+                )
+                smoothed_covariance = filtered_covariances[row] + smoother_gain @ (
+                    smoothed_covariance - predicted_covariances[row + 1]
+                ) @ smoother_gain.T
+                smoothed_covariance = (
+                    smoothed_covariance + smoothed_covariance.T
+                ) / 2.0
+                _require_finite_rts(smoothed_states[row], smoothed_covariance)
 
             channel_prediction = torch.stack(smoothed_states)[:, 0]
             _require_finite_rts(channel_prediction)
