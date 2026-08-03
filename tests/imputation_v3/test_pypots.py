@@ -334,6 +334,12 @@ def test_build_pypots_model_rejects_installed_version_mismatch(monkeypatch):
         )
 
 
+def test_installed_pypots_version_accepts_equivalent_release_metadata(monkeypatch):
+    monkeypatch.setattr(pypots_module.metadata, "version", lambda name: "1.5")
+
+    assert pypots_module.installed_pypots_version() == "1.5.0"
+
+
 @pytest.mark.parametrize("name", SUPPORTED_PYPOTS_MODELS)
 def test_build_pypots_model_uses_pinned_1_5_constructor_contract(monkeypatch, name):
     classes = _install_fake_pypots(monkeypatch)

@@ -1,5 +1,6 @@
 .worktrees/
 .venv-server/
+.conda-v3/
 results/validation_v2/
 __pycache__/
 .pytest_cache/

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from packaging.version import InvalidVersion, Version
 
 
 SUPPORTED_PYPOTS_MODELS = ("brits", "saits", "csdi")
@@ -26,12 +27,16 @@ def installed_pypots_version() -> str:
             "PyPOTS baselines require the optional pinned dependency "
             "pypots==1.5.0 from requirements-imputation-v3-baselines.txt"
         ) from exc
-    if actual != _PINNED_PYPOTS_VERSION:
+    try:
+        matches_pin = Version(actual) == Version(_PINNED_PYPOTS_VERSION)
+    except InvalidVersion:
+        matches_pin = False
+    if not matches_pin:
         raise RuntimeError(
             "formal PyPOTS execution requires exactly pypots==1.5.0; "
             f"installed version is {actual}"
         )
-    return actual
+    return _PINNED_PYPOTS_VERSION
 
 
 def _array_attribute(dataset: object, attribute: str, dataset_name: str) -> np.ndarray:
