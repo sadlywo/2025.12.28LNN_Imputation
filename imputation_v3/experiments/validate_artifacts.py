@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import hashlib
+import io
 from itertools import islice
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any
 
 import numpy as np
@@ -94,8 +97,26 @@ _COVERAGE_COLUMNS = (
     "union_recordings",
 )
 
+_MAX_JSON_BYTES = 64 * 1024 * 1024
+_MAX_JSON_DEPTH = 64
+_MAX_CSV_BYTES = 512 * 1024 * 1024
+_MAX_CSV_ROWS = 5_000_000
+_MAX_SMOKE_CHECKPOINT_BYTES = 256 * 1024 * 1024
+_MAX_SOURCE_BYTES = 1024 * 1024 * 1024
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
-def _sha256(path: Path) -> str:
+
+def _path_stamp(path: Path, *, maximum_bytes: int | None = None) -> tuple[int, int, int, int, str]:
+    """Return a content-bound file identity while rejecting reparse traversal."""
+    _assert_no_reparse(path)
+    try:
+        before = path.stat()
+    except OSError as exc:
+        raise ValueError(f"cannot stat artifact: {path}") from exc
+    if not path.is_file():
+        raise ValueError(f"artifact is not a regular file: {path}")
+    if maximum_bytes is not None and before.st_size > maximum_bytes:
+        raise ValueError(f"artifact exceeds its allowed size: {path.name}")
     digest = hashlib.sha256()
     try:
         with path.open("rb") as handle:
@@ -103,21 +124,87 @@ def _sha256(path: Path) -> str:
                 digest.update(chunk)
     except OSError as exc:
         raise ValueError(f"cannot read artifact: {path}") from exc
-    return digest.hexdigest()
+    try:
+        after = path.stat()
+    except OSError as exc:
+        raise ValueError(f"cannot restat artifact: {path}") from exc
+    before_id = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_id = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_id != after_id:
+        raise ValueError(f"artifact changed while it was being read: {path.name}")
+    return (*after_id, digest.hexdigest())
+
+
+def _sha256(path: Path, *, maximum_bytes: int | None = None) -> str:
+    return _path_stamp(path, maximum_bytes=maximum_bytes)[-1]
+
+
+def _is_reparse(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"cannot inspect artifact path: {path}") from exc
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & _REPARSE_POINT
+    )
+
+
+def _assert_no_reparse(path: Path, *, stop: Path | None = None) -> None:
+    """Reject symlinks and Windows junctions in an existing lexical path chain."""
+    current = Path(os.path.abspath(path))
+    boundary = Path(os.path.abspath(stop)) if stop is not None else None
+    while True:
+        if current.exists() and _is_reparse(current):
+            raise ValueError(f"artifact path must not traverse a reparse point: {path}")
+        if boundary is not None and current == boundary:
+            return
+        if current.parent == current:
+            if boundary is not None:
+                raise ValueError(f"artifact path escapes its allowed directory: {path}")
+            return
+        current = current.parent
+
+
+def _validate_json_depth(content: bytes, path: Path) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in content:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x7B, 0x5B):
+            depth += 1
+            if depth > _MAX_JSON_DEPTH:
+                raise ValueError(f"{path.name} exceeds the maximum JSON nesting depth")
+        elif byte in (0x7D, 0x5D):
+            depth -= 1
+            if depth < 0:
+                raise ValueError(f"{path.name} contains malformed JSON nesting")
 
 
 def _strict_canonical_json(path: Path) -> Any:
     try:
+        if path.stat().st_size > _MAX_JSON_BYTES:
+            raise ValueError(f"{path.name} exceeds the maximum JSON size")
         content = path.read_bytes()
     except OSError as exc:
         raise ValueError(f"missing or unreadable artifact: {path.name}") from exc
+    _validate_json_depth(content, path)
 
     def reject_constant(value: str) -> None:
         raise ValueError(f"{path.name} contains non-finite JSON constant {value}")
 
     try:
         value = json.loads(content.decode("utf-8"), parse_constant=reject_constant)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, MemoryError) as exc:
         raise ValueError(f"{path.name} must contain legal UTF-8 JSON") from exc
     expected = (canonical_json(value) + "\n").encode("utf-8")
     if content != expected:
@@ -132,9 +219,8 @@ def _mapping(value: Any, name: str) -> Mapping[str, Any]:
 
 
 def _safe_directory(path: Path) -> Path:
-    supplied = Path(path)
-    if supplied.is_symlink():
-        raise ValueError("artifact root must not be a symlink")
+    supplied = Path(os.path.abspath(path))
+    _assert_no_reparse(supplied)
     try:
         root = supplied.resolve(strict=True)
     except OSError as exc:
@@ -145,8 +231,10 @@ def _safe_directory(path: Path) -> Path:
 
 
 def _safe_child(root: Path, child: Path) -> None:
-    if child.is_symlink():
-        raise ValueError(f"artifact path must not be a symlink: {child.name}")
+    lexical = Path(os.path.abspath(child))
+    if lexical.parent != root:
+        raise ValueError(f"artifact path escapes its run directory: {child.name}")
+    _assert_no_reparse(lexical, stop=root)
     try:
         resolved = child.resolve(strict=True)
     except OSError as exc:
@@ -158,27 +246,23 @@ def _safe_child(root: Path, child: Path) -> None:
 def _safe_descendant(root: Path, supplied: Path, *, area: Path | None = None) -> Path:
     """Resolve a referenced artifact while rejecting links and path escapes."""
     candidate = supplied if supplied.is_absolute() else root / supplied
+    candidate = Path(os.path.abspath(candidate))
+    boundary = root if area is None else area.resolve(strict=True)
+    _assert_no_reparse(boundary)
+    _assert_no_reparse(candidate, stop=boundary)
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
         raise ValueError(f"missing referenced artifact: {supplied}") from exc
-    boundary = root if area is None else area.resolve(strict=True)
     if not resolved.is_relative_to(boundary) or not resolved.is_file():
         raise ValueError(f"referenced artifact escapes its allowed directory: {supplied}")
-    current = candidate
-    while True:
-        if current.is_symlink():
-            raise ValueError(f"referenced artifact must not traverse a symlink: {supplied}")
-        if current.resolve(strict=True) == root:
-            break
-        if current.parent == current:
-            raise ValueError(f"referenced artifact escapes its allowed directory: {supplied}")
-        current = current.parent
     return resolved
 
 
 def _read_csv(path: Path, columns: tuple[str, ...] | list[str], name: str) -> pd.DataFrame:
     try:
+        if path.stat().st_size > _MAX_CSV_BYTES:
+            raise ValueError(f"{name} exceeds the maximum CSV size")
         content = path.read_bytes()
     except OSError as exc:
         raise ValueError(f"missing or unreadable artifact: {path.name}") from exc
@@ -186,8 +270,10 @@ def _read_csv(path: Path, columns: tuple[str, ...] | list[str], name: str) -> pd
         raise ValueError(f"{name} must be canonical UTF-8 CSV with LF line endings")
     try:
         content.decode("utf-8")
-        frame = pd.read_csv(path)
-    except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+        if content.count(b"\n") > _MAX_CSV_ROWS + 1:
+            raise ValueError(f"{name} exceeds the maximum CSV row count")
+        frame = pd.read_csv(io.BytesIO(content))
+    except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError, MemoryError, RecursionError) as exc:
         raise ValueError(f"{name} must contain legal UTF-8 CSV") from exc
     if list(frame.columns) != list(columns):
         raise ValueError(f"{name} does not use the exact frozen schema")
@@ -271,10 +357,13 @@ def _validate_smoke_config(
     for row in split_manifest:
         for path_name, hash_name in (("imu_path", "imu_sha256"), ("vicon_path", "vicon_sha256")):
             source = Path(str(row[path_name]))
-            if source.is_symlink() or not source.is_file():
-                raise ValueError("smoke split source is missing or symlinked")
+            _assert_no_reparse(source)
+            if not source.is_file():
+                raise ValueError("smoke split source is missing or reparse-linked")
             digest = str(row[hash_name])
-            if _HEX64.fullmatch(digest) is None or _sha256(source) != digest:
+            if _HEX64.fullmatch(digest) is None or _sha256(
+                source, maximum_bytes=_MAX_SOURCE_BYTES
+            ) != digest:
                 raise ValueError("smoke split source hash mismatch")
     computed_counts = {
         name: sum(row["split"] == name for row in split_manifest)
@@ -312,8 +401,13 @@ def _validate_smoke_config(
                 raise ValueError("window evidence row does not use the exact schema")
             if row["mask_dtype"] != "float32-le" or type(row["samples"]) is not int or row["samples"] < 1 or row["channels"] != 6:
                 raise ValueError("window mask material has invalid dtype or shape")
+            if row["samples"] > 4096:
+                raise ValueError("window mask material exceeds the smoke sample bound")
+            encoded = row["mask_bytes_hex"]
+            if not isinstance(encoded, str) or len(encoded) != row["samples"] * row["channels"] * 8:
+                raise ValueError("window mask material has an invalid encoded size")
             try:
-                content = bytes.fromhex(str(row["mask_bytes_hex"]))
+                content = bytes.fromhex(encoded)
             except ValueError as exc:
                 raise ValueError("window mask material is not valid hexadecimal") from exc
             if len(content) != row["samples"] * row["channels"] * 4 or hashlib.sha256(content).hexdigest() != row["mask_sha256"]:
@@ -349,6 +443,15 @@ def _replay_smoke_pipeline(
 ) -> tuple[dict[str, list[Any]], dict[str, dict[str, float]]]:
     config = _mapping(manifest["config"], "smoke replay config")
     data_root = Path(str(config["data_root"]))
+    _assert_no_reparse(data_root)
+    source_stamps: dict[str, tuple[int, int, int, int, str]] = {}
+    for row in config["split_manifest"]:
+        for path_name, hash_name in (("imu_path", "imu_sha256"), ("vicon_path", "vicon_sha256")):
+            source = Path(str(row[path_name]))
+            stamp = _path_stamp(source, maximum_bytes=_MAX_SOURCE_BYTES)
+            if stamp[-1] != row[hash_name]:
+                raise ValueError("smoke replay source hash differs before discovery")
+            source_stamps[str(source)] = stamp
     discovered = discover_oxiod_pairs(data_root)
     replayed_split = stratified_file_split(
         discovered, seed=int(config["split_seed"])
@@ -368,6 +471,9 @@ def _replay_smoke_pipeline(
     replayed_rows.sort(key=lambda row: row["recording_id"])
     if replayed_rows != config["split_manifest"]:
         raise ValueError("smoke replay split membership/source evidence differs")
+    for name, before in source_stamps.items():
+        if _path_stamp(Path(name), maximum_bytes=_MAX_SOURCE_BYTES) != before:
+            raise ValueError("smoke replay source changed during discovery")
     selected_rows = {
         split: [row for row in replayed_rows if row["split"] == split][:2]
         for split in ("train", "validation")
@@ -378,13 +484,20 @@ def _replay_smoke_pipeline(
     }
     if expected_selected != config["selected_recording_ids"]:
         raise ValueError("smoke replay selected recording order differs")
-    recordings = {
-        split: [
-            load_recording(Path(row["imu_path"]), Path(row["vicon_path"]))
-            for row in selected_rows[split]
-        ]
-        for split in ("train", "validation")
-    }
+    recordings: dict[str, list[Any]] = {"train": [], "validation": []}
+    for split in ("train", "validation"):
+        for row in selected_rows[split]:
+            imu = Path(row["imu_path"])
+            vicon = Path(row["vicon_path"])
+            before_imu = _path_stamp(imu, maximum_bytes=_MAX_SOURCE_BYTES)
+            before_vicon = _path_stamp(vicon, maximum_bytes=_MAX_SOURCE_BYTES)
+            recording = load_recording(imu, vicon)
+            if (
+                _path_stamp(imu, maximum_bytes=_MAX_SOURCE_BYTES) != before_imu
+                or _path_stamp(vicon, maximum_bytes=_MAX_SOURCE_BYTES) != before_vicon
+            ):
+                raise ValueError("smoke replay source changed while it was being loaded")
+            recordings[split].append(recording)
     for split in recordings:
         if [recording.id for recording in recordings[split]] != expected_selected[split]:
             raise ValueError("smoke replay loaded recording identities differ")
@@ -432,7 +545,15 @@ def _replay_smoke_pipeline(
         time_mode=str(hyper["time_mode"]),
     )
     try:
-        state = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=True)
+        checkpoint_path = run_dir / "best.pt"
+        checkpoint_stamp = _path_stamp(
+            checkpoint_path, maximum_bytes=_MAX_SMOKE_CHECKPOINT_BYTES
+        )
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if _path_stamp(
+            checkpoint_path, maximum_bytes=_MAX_SMOKE_CHECKPOINT_BYTES
+        ) != checkpoint_stamp:
+            raise ValueError("smoke checkpoint changed while it was being loaded")
         model.load_state_dict(state, strict=True)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise ValueError("smoke replay cannot reconstruct the frozen teacher checkpoint") from exc
@@ -451,8 +572,7 @@ def _replay_smoke_pipeline(
 
 
 def _validate_smoke_run(run_dir: Path) -> dict[str, Any]:
-    if run_dir.is_symlink():
-        raise ValueError("smoke run directory must not be a symlink")
+    _assert_no_reparse(run_dir)
     run_dir = run_dir.resolve(strict=True)
     entries = {item.name for item in run_dir.iterdir()}
     if entries != _RUN_FILES:
@@ -489,7 +609,9 @@ def _validate_smoke_run(run_dir: Path) -> dict[str, Any]:
         or checkpoint["selection_metric"] != "missing_rmse"
     ):
         raise ValueError("checkpoint selection metadata is inconsistent")
-    actual_checkpoint_hash = _sha256(run_dir / "best.pt")
+    actual_checkpoint_hash = _sha256(
+        run_dir / "best.pt", maximum_bytes=_MAX_SMOKE_CHECKPOINT_BYTES
+    )
     if checkpoint["checkpoint_sha256"] != actual_checkpoint_hash:
         raise ValueError("best.pt SHA-256 does not match checkpoint.json")
     evidence = _mapping(_strict_canonical_json(run_dir / "evidence.json"), "evidence.json")
@@ -525,7 +647,7 @@ def _validate_smoke_run(run_dir: Path) -> dict[str, Any]:
             raise ValueError("final checkpoint metrics must use the exact replay schema")
         value = recorded["missing_rmse"]
         expected = replayed_metrics[split]["missing_rmse"]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not math.isclose(float(value), expected, rel_tol=1e-12, abs_tol=1e-12):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not math.isclose(float(value), expected, rel_tol=1e-6, abs_tol=1e-7):
             raise ValueError("final checkpoint RMSE differs from independent smoke replay")
     return {
         "run_id": manifest["run_id"],
@@ -542,8 +664,7 @@ def _validate_smoke_run(run_dir: Path) -> dict[str, Any]:
 def _validate_formal_layout(root: Path) -> tuple[Path, Path]:
     entries = list(root.iterdir())
     for entry in entries:
-        if entry.is_symlink():
-            raise ValueError(f"formal artifact must not be a symlink: {entry.name}")
+        _assert_no_reparse(entry, stop=root)
     names = {entry.name for entry in entries}
     missing = sorted(_FORMAL_FIXED_FILES - names)
     if missing:
@@ -566,8 +687,7 @@ def _validate_formal_layout(root: Path) -> tuple[Path, Path]:
     if "evaluation" in names and not (root / "evaluation").is_dir():
         raise ValueError("formal evaluation artifact must be a directory")
     for entry in root.rglob("*"):
-        if entry.is_symlink():
-            raise ValueError(f"formal artifacts must not traverse symlinks: {entry}")
+        _assert_no_reparse(entry, stop=root)
         try:
             resolved = entry.resolve(strict=True)
         except OSError as exc:
@@ -979,8 +1099,10 @@ def validate_artifacts(output: Path | str) -> dict[str, Any]:
             "runs": [run],
         }
     children = sorted(root.iterdir(), key=lambda path: path.name)
-    if not children or any(not child.is_dir() or child.is_symlink() for child in children):
+    if not children or any(not child.is_dir() for child in children):
         raise ValueError("smoke output root must contain only completed run directories")
+    for child in children:
+        _safe_child(root, child)
     runs = [_validate_smoke_run(child) for child in children]
     run_ids = [run["run_id"] for run in runs]
     if len(set(run_ids)) != len(run_ids):

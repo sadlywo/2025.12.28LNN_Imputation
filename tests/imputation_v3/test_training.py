@@ -475,6 +475,52 @@ def test_smoke_seals_evidence_and_validates_resume(tmp_path, monkeypatch):
         )
 
 
+def test_smoke_recovers_evidence_after_crash_between_core_and_seal(
+    tmp_path, monkeypatch
+):
+    import imputation_v3.experiments.training as training
+
+    _patch_smoke_data(monkeypatch, training)
+    monkeypatch.setattr(
+        training,
+        "train_one_run",
+        lambda run_dir, manifest, **kwargs: _write_fake_core_artifacts(
+            run_dir, manifest
+        ),
+    )
+    original_write = training._write_stable
+    failed = False
+
+    def fail_first_evidence(path, content):
+        nonlocal failed
+        if path.name == "evidence.json" and not failed:
+            failed = True
+            raise RuntimeError("injected evidence publish crash")
+        return original_write(path, content)
+
+    monkeypatch.setattr(training, "_write_stable", fail_first_evidence)
+    config = _config(Path("runs"))
+    with pytest.raises(RuntimeError, match="injected evidence"):
+        training.run_teacher_smoke(
+            config, repository_root=tmp_path, requested_device="cpu"
+        )
+
+    run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
+    assert len(run_dirs) == 1
+    assert {path.name for path in run_dirs[0].iterdir()} == {
+        "run.json", "history.json", "best.pt", "checkpoint.json"
+    }
+
+    recovered = training.run_teacher_smoke(
+        config, repository_root=tmp_path, requested_device="cpu"
+    )
+    assert recovered["status"] == "resumed"
+    assert recovered["evidence_recovered"] is True
+    assert {path.name for path in Path(recovered["run_dir"]).iterdir()} == {
+        "run.json", "history.json", "best.pt", "checkpoint.json", "evidence.json"
+    }
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [

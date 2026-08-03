@@ -488,6 +488,46 @@ def test_validate_artifacts_cli_prints_canonical_json_and_returns_two_on_failure
     assert "checkpoint.json" in captured.err
 
 
+def test_validate_artifacts_cli_rejects_excessive_json_depth(tmp_path, capsys):
+    import imputation_v3.cli as cli
+
+    root, run_dir, _ = _make_smoke_root(tmp_path)
+    (run_dir / "run.json").write_text("[" * 80 + "]" * 80, encoding="ascii")
+
+    assert cli.main(["validate-artifacts", "--output", str(root)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "nesting depth" in captured.err
+
+
+def test_smoke_replay_rejects_source_changed_during_load(tmp_path, monkeypatch):
+    import imputation_v3.experiments.validate_artifacts as validator
+
+    root, run_dir, _ = _make_smoke_root(tmp_path)
+    manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    selected_id = manifest["config"]["selected_recording_ids"]["train"][0]
+    selected = next(
+        row for row in manifest["config"]["split_manifest"]
+        if row["recording_id"] == selected_id
+    )
+    selected_imu = Path(selected["imu_path"])
+    original = validator.load_recording
+    mutated = False
+
+    def mutate_after_load(imu_path, vicon_path):
+        nonlocal mutated
+        recording = original(imu_path, vicon_path)
+        if Path(imu_path) == selected_imu and not mutated:
+            mutated = True
+            with selected_imu.open("ab") as handle:
+                handle.write(b"\n")
+        return recording
+
+    monkeypatch.setattr(validator, "load_recording", mutate_after_load)
+    with pytest.raises(ValueError, match="changed while|source changed"):
+        validator.validate_artifacts(root)
+
+
 def _reseal_formal_hash(root: Path, name: str) -> None:
     hashes_path = root / "artifact_hashes.json"
     hashes = json.loads(hashes_path.read_text(encoding="utf-8"))

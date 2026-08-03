@@ -445,13 +445,14 @@ def run_teacher_smoke(
         dirty_digest=identity["dirty_state_digest"],
     )
     run_dir = effective_output.resolve() / manifest["run_id"]
-    artifact_names = (
-        "run.json", "history.json", "best.pt", "checkpoint.json", "evidence.json"
-    )
+    core_artifact_names = {"run.json", "history.json", "best.pt", "checkpoint.json"}
+    artifact_names = (*sorted(core_artifact_names), "evidence.json")
     present_artifacts = {name for name in artifact_names if (run_dir / name).exists()}
-    if present_artifacts and present_artifacts != set(artifact_names):
+    complete_names = set(artifact_names)
+    recoverable_core = present_artifacts == core_artifact_names
+    if present_artifacts and present_artifacts not in (core_artifact_names, complete_names):
         raise ValueError("partial or inconsistent smoke evidence cannot be resumed")
-    completed_before = present_artifacts == set(artifact_names)
+    completed_before = present_artifacts in (core_artifact_names, complete_names)
     expected_checkpoint_sha256 = None
     metadata_path = run_dir / "checkpoint.json"
     if metadata_path.is_file():
@@ -516,6 +517,7 @@ def run_teacher_smoke(
             "validation_windows": len(prepared["validation"]),
             "test_recordings_loaded": 0,
         },
+        "evidence_recovered": bool(recoverable_core),
     }
 
 

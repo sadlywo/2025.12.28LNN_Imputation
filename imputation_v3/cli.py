@@ -101,7 +101,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(canonical_json(report))
             return 0
-    except (ModuleNotFoundError, OSError, RuntimeError, TypeError, ValueError, yaml.YAMLError) as error:
+    except (
+        MemoryError,
+        ModuleNotFoundError,
+        OSError,
+        RecursionError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        yaml.YAMLError,
+    ) as error:
         print(f"imputation-v3: {error}", file=sys.stderr)
         return 2
     raise AssertionError(f"unhandled command: {arguments.command}")
