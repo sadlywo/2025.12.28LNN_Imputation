@@ -521,6 +521,54 @@ def test_smoke_recovers_evidence_after_crash_between_core_and_seal(
     }
 
 
+@pytest.mark.parametrize("corruption", ("noncanonical_history", "extra_run_field"))
+def test_smoke_refuses_to_seal_corrupted_exact_core_four(
+    tmp_path, monkeypatch, corruption
+):
+    import imputation_v3.experiments.training as training
+
+    _patch_smoke_data(monkeypatch, training)
+    monkeypatch.setattr(
+        training,
+        "train_one_run",
+        lambda run_dir, manifest, **kwargs: _write_fake_core_artifacts(
+            run_dir, manifest
+        ),
+    )
+    original_write = training._write_stable
+
+    def crash_before_evidence(path, content):
+        if path.name == "evidence.json":
+            raise RuntimeError("injected evidence publish crash")
+        return original_write(path, content)
+
+    monkeypatch.setattr(training, "_write_stable", crash_before_evidence)
+    config = _config(Path("runs"))
+    with pytest.raises(RuntimeError, match="injected evidence"):
+        training.run_teacher_smoke(
+            config, repository_root=tmp_path, requested_device="cpu"
+        )
+    run_dir = next(path for path in (tmp_path / "runs").iterdir() if path.is_dir())
+    if corruption == "noncanonical_history":
+        history = json.loads((run_dir / "history.json").read_text(encoding="utf-8"))
+        (run_dir / "history.json").write_text(
+            json.dumps(history, indent=2) + "\n", encoding="utf-8"
+        )
+    else:
+        manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        manifest["unexpected"] = True
+        (run_dir / "run.json").write_text(
+            canonical_json(manifest) + "\n", encoding="utf-8"
+        )
+    monkeypatch.setattr(training, "_write_stable", original_write)
+
+    with pytest.raises(ValueError, match="canonical|schema|match|provenance"):
+        training.run_teacher_smoke(
+            config, repository_root=tmp_path, requested_device="cpu"
+        )
+    assert not (run_dir / "evidence.json").exists()
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [

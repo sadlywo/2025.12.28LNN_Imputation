@@ -10,6 +10,7 @@ from pathlib import Path
 import math
 import os
 import random
+import stat
 import tempfile
 from typing import Any
 
@@ -28,15 +29,24 @@ from validation_v2.data.normalization import RobustTrainScaler
 from validation_v2.data.oxiod import load_recording
 from validation_v2.data.splits import stratified_file_split
 from validation_v2.experiments.provenance import (
+    MANIFEST_FIELDS,
+    _validate_manifest,
     canonical_json,
     collect_provenance,
     git_worktree_identity,
 )
 from validation_v2.experiments.runner import discover_oxiod_pairs
-from validation_v2.experiments.train import train_one_run
+from validation_v2.experiments.train import select_best_checkpoint, train_one_run
 
 
 _BATCH_TENSORS = ("features", "target", "observed", "mask", "dt", "baseline")
+_CORE_RUN_FILES = frozenset({"run.json", "history.json", "best.pt", "checkpoint.json"})
+_COMPLETE_RUN_FILES = _CORE_RUN_FILES | {"evidence.json"}
+_CHECKPOINT_FIELDS = frozenset(
+    {"run_id", "best_epoch", "selection_split", "selection_metric", "checkpoint_sha256"}
+)
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_MAX_SMOKE_CHECKPOINT_BYTES = 256 * 1024 * 1024
 
 
 def _sha256_path(path: Path) -> str:
@@ -45,6 +55,68 @@ def _sha256_path(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _regular_non_reparse(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"missing smoke core artifact: {path.name}") from exc
+    if stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & _REPARSE_POINT
+    ) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"smoke core artifact must be a regular non-reparse file: {path.name}")
+
+
+def _canonical_json_file(path: Path) -> Any:
+    _regular_non_reparse(path)
+    try:
+        content = path.read_bytes()
+        value = json.loads(
+            content.decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {value}")
+            ),
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"invalid smoke core JSON: {path.name}") from exc
+    if content != (canonical_json(value) + "\n").encode("utf-8"):
+        raise ValueError(f"smoke core JSON is not canonical: {path.name}")
+    return value
+
+
+def _validate_recoverable_core(run_dir: Path, expected_manifest: dict[str, Any]) -> str:
+    """Validate the exact four-file checkpoint contract before sealing evidence."""
+    entries = {path.name for path in run_dir.iterdir()}
+    if entries not in (_CORE_RUN_FILES, _COMPLETE_RUN_FILES):
+        raise ValueError("partial or inconsistent smoke evidence cannot be resumed")
+    for name in _CORE_RUN_FILES:
+        _regular_non_reparse(run_dir / name)
+    if (run_dir / "best.pt").stat().st_size > _MAX_SMOKE_CHECKPOINT_BYTES:
+        raise ValueError("best.pt exceeds the smoke checkpoint size limit")
+    run_manifest = _canonical_json_file(run_dir / "run.json")
+    if not isinstance(run_manifest, dict) or set(run_manifest) != set(MANIFEST_FIELDS):
+        raise ValueError("run.json does not use the exact provenance schema")
+    _validate_manifest(run_manifest)
+    if run_manifest != expected_manifest:
+        raise ValueError("existing run.json does not match the requested smoke identity")
+    history = _canonical_json_file(run_dir / "history.json")
+    if not isinstance(history, list):
+        raise ValueError("history.json must contain a canonical list")
+    best_epoch = select_best_checkpoint(history)
+    checkpoint = _canonical_json_file(run_dir / "checkpoint.json")
+    if not isinstance(checkpoint, dict) or set(checkpoint) != _CHECKPOINT_FIELDS:
+        raise ValueError("checkpoint.json does not use the exact checkpoint schema")
+    checkpoint_sha = _sha256_path(run_dir / "best.pt")
+    if (
+        checkpoint["run_id"] != run_manifest["run_id"]
+        or checkpoint["best_epoch"] != best_epoch
+        or checkpoint["selection_split"] != "validation"
+        or checkpoint["selection_metric"] != "missing_rmse"
+        or checkpoint["checkpoint_sha256"] != checkpoint_sha
+    ):
+        raise ValueError("smoke core checkpoint identity is inconsistent")
+    return checkpoint_sha
 
 
 def _write_stable(path: Path, content: bytes) -> None:
@@ -445,24 +517,14 @@ def run_teacher_smoke(
         dirty_digest=identity["dirty_state_digest"],
     )
     run_dir = effective_output.resolve() / manifest["run_id"]
-    core_artifact_names = {"run.json", "history.json", "best.pt", "checkpoint.json"}
-    artifact_names = (*sorted(core_artifact_names), "evidence.json")
-    present_artifacts = {name for name in artifact_names if (run_dir / name).exists()}
-    complete_names = set(artifact_names)
-    recoverable_core = present_artifacts == core_artifact_names
-    if present_artifacts and present_artifacts not in (core_artifact_names, complete_names):
+    entries = {path.name for path in run_dir.iterdir()} if run_dir.is_dir() else set()
+    recoverable_core = entries == _CORE_RUN_FILES
+    if entries and entries not in (_CORE_RUN_FILES, _COMPLETE_RUN_FILES):
         raise ValueError("partial or inconsistent smoke evidence cannot be resumed")
-    completed_before = present_artifacts in (core_artifact_names, complete_names)
+    completed_before = entries in (_CORE_RUN_FILES, _COMPLETE_RUN_FILES)
     expected_checkpoint_sha256 = None
-    metadata_path = run_dir / "checkpoint.json"
-    if metadata_path.is_file():
-        try:
-            stored_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            expected_checkpoint_sha256 = stored_metadata["checkpoint_sha256"]
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
-            raise ValueError("partial or inconsistent checkpoint metadata") from error
-        if not isinstance(expected_checkpoint_sha256, str):
-            raise ValueError("partial or inconsistent checkpoint metadata")
+    if completed_before:
+        expected_checkpoint_sha256 = _validate_recoverable_core(run_dir, manifest)
 
     model = OfflineTeacher(
         31,

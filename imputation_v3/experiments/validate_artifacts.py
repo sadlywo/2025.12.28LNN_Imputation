@@ -109,19 +109,21 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 def _path_stamp(path: Path, *, maximum_bytes: int | None = None) -> tuple[int, int, int, int, str]:
     """Return a content-bound file identity while rejecting reparse traversal."""
     _assert_no_reparse(path)
-    try:
-        before = path.stat()
-    except OSError as exc:
-        raise ValueError(f"cannot stat artifact: {path}") from exc
-    if not path.is_file():
-        raise ValueError(f"artifact is not a regular file: {path}")
-    if maximum_bytes is not None and before.st_size > maximum_bytes:
-        raise ValueError(f"artifact exceeds its allowed size: {path.name}")
     digest = hashlib.sha256()
     try:
         with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"artifact is not a regular file: {path}")
+            if maximum_bytes is not None and before.st_size > maximum_bytes:
+                raise ValueError(f"artifact exceeds its allowed size: {path.name}")
+            total = 0
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                total += len(chunk)
+                if maximum_bytes is not None and total > maximum_bytes:
+                    raise ValueError(f"artifact exceeds its allowed size: {path.name}")
                 digest.update(chunk)
+            after_handle = os.fstat(handle.fileno())
     except OSError as exc:
         raise ValueError(f"cannot read artifact: {path}") from exc
     try:
@@ -129,10 +131,16 @@ def _path_stamp(path: Path, *, maximum_bytes: int | None = None) -> tuple[int, i
     except OSError as exc:
         raise ValueError(f"cannot restat artifact: {path}") from exc
     before_id = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    after_id = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if before_id != after_id:
+    handle_id = (
+        after_handle.st_dev,
+        after_handle.st_ino,
+        after_handle.st_size,
+        after_handle.st_mtime_ns,
+    )
+    path_id = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_id != handle_id or before_id != path_id:
         raise ValueError(f"artifact changed while it was being read: {path.name}")
-    return (*after_id, digest.hexdigest())
+    return (*path_id, digest.hexdigest())
 
 
 def _sha256(path: Path, *, maximum_bytes: int | None = None) -> str:
@@ -190,13 +198,45 @@ def _validate_json_depth(content: bytes, path: Path) -> None:
                 raise ValueError(f"{path.name} contains malformed JSON nesting")
 
 
-def _strict_canonical_json(path: Path) -> Any:
+def _read_bounded_bytes(path: Path, *, maximum_bytes: int, label: str) -> bytes:
+    """Capture one regular file without ever reading more than the declared cap."""
+    _assert_no_reparse(path)
     try:
-        if path.stat().st_size > _MAX_JSON_BYTES:
-            raise ValueError(f"{path.name} exceeds the maximum JSON size")
-        content = path.read_bytes()
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"{label} must be a regular file")
+            if before.st_size > maximum_bytes:
+                raise ValueError(f"{label} exceeds its maximum size")
+            content = handle.read(maximum_bytes + 1)
+            if len(content) > maximum_bytes:
+                raise ValueError(f"{label} exceeds its maximum size")
+            after_handle = os.fstat(handle.fileno())
+        after_path = path.stat()
     except OSError as exc:
         raise ValueError(f"missing or unreadable artifact: {path.name}") from exc
+    before_id = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    handle_id = (
+        after_handle.st_dev,
+        after_handle.st_ino,
+        after_handle.st_size,
+        after_handle.st_mtime_ns,
+    )
+    path_id = (
+        after_path.st_dev,
+        after_path.st_ino,
+        after_path.st_size,
+        after_path.st_mtime_ns,
+    )
+    if before_id != handle_id or before_id != path_id or len(content) != before.st_size:
+        raise ValueError(f"{label} changed while it was being read")
+    return content
+
+
+def _strict_canonical_json(path: Path) -> Any:
+    content = _read_bounded_bytes(
+        path, maximum_bytes=_MAX_JSON_BYTES, label=path.name
+    )
     _validate_json_depth(content, path)
 
     def reject_constant(value: str) -> None:
@@ -260,12 +300,9 @@ def _safe_descendant(root: Path, supplied: Path, *, area: Path | None = None) ->
 
 
 def _read_csv(path: Path, columns: tuple[str, ...] | list[str], name: str) -> pd.DataFrame:
-    try:
-        if path.stat().st_size > _MAX_CSV_BYTES:
-            raise ValueError(f"{name} exceeds the maximum CSV size")
-        content = path.read_bytes()
-    except OSError as exc:
-        raise ValueError(f"missing or unreadable artifact: {path.name}") from exc
+    content = _read_bounded_bytes(
+        path, maximum_bytes=_MAX_CSV_BYTES, label=name
+    )
     if not content or b"\r" in content or not content.endswith(b"\n"):
         raise ValueError(f"{name} must be canonical UTF-8 CSV with LF line endings")
     try:
