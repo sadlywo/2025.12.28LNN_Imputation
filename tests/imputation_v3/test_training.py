@@ -82,15 +82,15 @@ def _config(output_root: Path) -> TeacherConfig:
     )
 
 
-def _patch_smoke_data(monkeypatch, module, *, split_token: str = "base"):
+def _patch_smoke_data(monkeypatch, module, *, dataset_variant: str = "base"):
     import pandas as pd
 
     pairs = [
         {
             "recording_id": f"{split}/imu{index}",
             "scenario": "walk",
-            "imu_path": f"/{split_token}/{split}/imu{index}.csv",
-            "vicon_path": f"/{split_token}/{split}/vi{index}.csv",
+            "imu_path": f"/{dataset_variant}/{split}/imu{index}.csv",
+            "vicon_path": f"/{dataset_variant}/{split}/vi{index}.csv",
         }
         for split, index in (("train", 1), ("train", 2), ("validation", 3), ("test", 4))
     ]
@@ -103,7 +103,7 @@ def _patch_smoke_data(monkeypatch, module, *, split_token: str = "base"):
                 {
                     **item,
                     "split": assignments[item["recording_id"]],
-                    "imu_sha256": ("a" if split_token == "base" else "c") * 64,
+                    "imu_sha256": ("a" if dataset_variant == "base" else "c") * 64,
                     "vicon_sha256": "b" * 64,
                 }
                 for item in index
