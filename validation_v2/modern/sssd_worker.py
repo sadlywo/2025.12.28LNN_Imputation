@@ -140,6 +140,51 @@ def sample_sssd(
     return x.reshape(batch, n_samples, channels, length)
 
 
+def sample_sssd_batched(
+    denoiser: nn.Module,
+    observed: torch.Tensor,
+    mask: torch.Tensor,
+    schedule: dict[str, torch.Tensor | int],
+    *,
+    n_samples: int,
+    batch_size: int,
+    max_sample_chunk: int = 5,
+) -> torch.Tensor:
+    """Bound peak memory while preserving every requested independent draw."""
+
+    if batch_size <= 0 or max_sample_chunk < 2:
+        raise ValueError("batch_size must be positive and sample chunks at least two")
+    sample_chunks: list[int] = []
+    remaining = n_samples
+    while remaining:
+        chunk = min(max_sample_chunk, remaining)
+        if remaining - chunk == 1:
+            chunk -= 1
+        if chunk < 2:
+            raise ValueError("SSSD requires at least two samples")
+        sample_chunks.append(chunk)
+        remaining -= chunk
+    batches: list[torch.Tensor] = []
+    for start in range(0, observed.shape[0], batch_size):
+        stop = min(observed.shape[0], start + batch_size)
+        batches.append(
+            torch.cat(
+                [
+                    sample_sssd(
+                        denoiser,
+                        observed[start:stop],
+                        mask[start:stop],
+                        schedule,
+                        n_samples=chunk,
+                    )
+                    for chunk in sample_chunks
+                ],
+                dim=1,
+            )
+        )
+    return torch.cat(batches, dim=0)
+
+
 def _tensors(arrays: dict[str, np.ndarray], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     target = torch.as_tensor(arrays["X_ori"], dtype=torch.float32, device=device).permute(0, 2, 1)
     mask = torch.as_tensor(arrays["mask"], dtype=torch.float32, device=device).permute(0, 2, 1)
@@ -198,7 +243,14 @@ def train_task(task: dict[str, Any]) -> dict[str, object]:
             loss.backward()
             optimizer.step()
         model.eval()
-        samples = sample_sssd(model, val_observed, val_mask, schedule, n_samples=2).mean(dim=1)
+        samples = sample_sssd_batched(
+            model,
+            val_observed,
+            val_mask,
+            schedule,
+            n_samples=2,
+            batch_size=int(task["batch_size"]),
+        ).mean(dim=1)
         missing = val_mask == 0
         score = float(torch.sqrt(torch.mean((samples[missing] - val_target[missing]) ** 2)).cpu())
         if score < best:
@@ -230,7 +282,14 @@ def predict_task(task: dict[str, Any]) -> dict[str, object]:
     model.load_state_dict(payload["state_dict"])
     model.eval()
     _, observed, mask = _tensors(arrays, device)
-    generated = sample_sssd(model, observed, mask, diffusion_schedule(device), n_samples=int(task["n_sampling_times"]))
+    generated = sample_sssd_batched(
+        model,
+        observed,
+        mask,
+        diffusion_schedule(device),
+        n_samples=int(task["n_sampling_times"]),
+        batch_size=int(task["batch_size"]),
+    )
     samples = generated.permute(0, 1, 3, 2).cpu().numpy().astype(np.float32)
     return write_array_artifact(
         Path(task["output_artifact"]), "prediction",
@@ -291,4 +350,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["build_denoiser", "diffusion_loss", "diffusion_schedule", "main", "sample_sssd", "sssd_parameters"]
+__all__ = ["build_denoiser", "diffusion_loss", "diffusion_schedule", "main", "sample_sssd", "sample_sssd_batched", "sssd_parameters"]
