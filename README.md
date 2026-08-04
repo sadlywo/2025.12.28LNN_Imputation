@@ -1,5 +1,8 @@
 # CfC-IMU Imputation Project
 
+现代插补模型（BRITS、SAITS、CSDI、SSSD）与现有 Hybrid 的矩池云实验流程见
+[中文运行手册](docs/modern_imputation_matpool_runbook_zh.md)。
+
 基于 **Closed-form Continuous-time (CfC)** 神经网络的 IMU 数据补缺系统。
 
 ## 核心特性
