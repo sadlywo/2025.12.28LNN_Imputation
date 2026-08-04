@@ -1,0 +1,19 @@
+data_root: Oxford Dataset
+output_root: results/validation_v2/modern_tuning
+protocol: strict_file
+seeds: [2026]
+split_seed: 2026
+seq_len: 30
+batch_size: 32
+epochs: 100
+patience: 20
+device: cuda
+models: [brits, saits, csdi, sssd]
+rates: [0.3]
+topologies: [point]
+irregular_cases: []
+n_sampling_times: 5
+tuning_sampling_times: 5
+max_train_windows: 4096
+max_eval_samples: null
+trajectory_enabled: false

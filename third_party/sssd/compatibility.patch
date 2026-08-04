@@ -1,0 +1,3 @@
+# No tensor or architecture patch is applied at the pinned commit.
+# The MatPool prepare step verifies this file and the exact upstream commit;
+# future import/build compatibility changes must be recorded as a real diff.

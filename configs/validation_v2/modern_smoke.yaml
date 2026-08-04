@@ -1,0 +1,19 @@
+data_root: Oxford Dataset
+output_root: results/validation_v2/modern_smoke
+protocol: strict_file
+seeds: [2026]
+split_seed: 2026
+seq_len: 30
+batch_size: 4
+epochs: 1
+patience: 1
+device: auto
+models: [hybrid, brits, saits, csdi, sssd]
+rates: [0.3]
+topologies: [point]
+irregular_cases: []
+n_sampling_times: 2
+tuning_sampling_times: 2
+max_train_windows: 4
+max_eval_samples: 120
+trajectory_enabled: false

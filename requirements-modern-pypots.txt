@@ -1,0 +1,4 @@
+# Python 3.10; install from the CUDA 12.1 PyTorch index on MatPool.
+torch==2.3.1
+pypots==1.5
+numpy==1.26.4
