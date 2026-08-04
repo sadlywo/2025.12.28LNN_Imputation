@@ -1,0 +1,23 @@
+data_root: Oxford Dataset
+output_root: results/validation_v2/modern_stage_a
+protocol: strict_file
+seeds: [2026, 2027, 2028, 2029, 2030]
+split_seed: 2026
+seq_len: 30
+batch_size: 32
+epochs: 100
+patience: 20
+device: cuda
+models: [linear, locf, bilstm, bilnn, hybrid, brits, saits, csdi, sssd]
+rates: [0.1, 0.2, 0.3, 0.4]
+topologies: [point, block, channel]
+irregular_cases:
+  - method: interval_jitter
+    requested_irregularity: 0.2
+    value_topology: point
+    value_requested_fraction: 0.3
+n_sampling_times: 50
+tuning_sampling_times: 5
+max_train_windows: 4096
+max_eval_samples: null
+trajectory_enabled: true
