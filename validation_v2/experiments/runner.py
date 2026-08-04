@@ -68,6 +68,21 @@ class _Window:
     target: torch.Tensor
     mask: torch.Tensor
     dt: torch.Tensor
+    recording_index: int = -1
+    start: int = -1
+
+
+@dataclass(frozen=True)
+class ExternalDataPreparation:
+    """V2-owned split and normalization state for external model workers."""
+
+    manifest_rows: tuple[dict[str, str], ...]
+    recordings_by_split: dict[str, tuple[Recording, ...]]
+    scaler: RobustTrainScaler
+    split_content: bytes
+    split_hash: str
+    scaler_content: bytes
+    scaler_hash: str
 
 
 class _BaselineCheckpoint(nn.Module):
@@ -541,7 +556,7 @@ def _windows(
     }
     if topology not in generators:
         raise ValueError(f"unsupported missingness topology: {topology}")
-    for recording in recordings:
+    for recording_index, recording in enumerate(recordings):
         if len(prepared) >= maximum_windows:
             break
         maximum = seq_len * per_record
@@ -574,7 +589,14 @@ def _windows(
             mask = generators[topology](batch.target, rate, window_seed).mask
             feature = build_features(batch.target, mask, batch.dt)
             prepared.append(
-                _Window(feature.values, batch.target, mask, batch.dt)
+                _Window(
+                    feature.values,
+                    batch.target,
+                    mask,
+                    batch.dt,
+                    recording_index=recording_index,
+                    start=int(batch.index[0].item()),
+                )
             )
     result = prepared[:maximum_windows]
     if not result:
@@ -725,6 +747,108 @@ def _scaler_content(scaler: RobustTrainScaler, *, split_hash: str) -> bytes:
         "split_hash": split_hash,
     }
     return (canonical_json(value) + "\n").encode("utf-8")
+
+
+def prepare_external_data(
+    config: Mapping[str, Any],
+    *,
+    repository_root: Path,
+    protocol: str,
+    seed: int,
+) -> ExternalDataPreparation:
+    """Resolve splits and fit the train-only scaler once for external workers."""
+
+    data_root = Path(str(config.get("data_root")))
+    if not data_root.is_absolute():
+        data_root = repository_root / data_root
+    records_config = resolve_configured_records(
+        config,
+        data_root=data_root,
+        protocol=protocol,
+        training_seed=seed,
+    )
+    manifest_rows, loaded = _manifest_rows(records_config, data_root)
+    split_content = _split_content(manifest_rows)
+    split_hash = _sha256_bytes(split_content)
+    recordings_by_split = {
+        split: tuple(
+            loaded[row["recording_id"]]
+            for row in manifest_rows
+            if row["split"] == split
+        )
+        for split in ("train", "validation", "test")
+    }
+    train_recordings = recordings_by_split["train"]
+    scaler = RobustTrainScaler.fit(
+        train_recordings,
+        allowed_ids={recording.id for recording in train_recordings},
+    )
+    scaler_content = _scaler_content(scaler, split_hash=split_hash)
+    return ExternalDataPreparation(
+        manifest_rows=tuple(dict(row) for row in manifest_rows),
+        recordings_by_split=recordings_by_split,
+        scaler=scaler,
+        split_content=split_content,
+        split_hash=split_hash,
+        scaler_content=scaler_content,
+        scaler_hash=_sha256_bytes(scaler_content),
+    )
+
+
+def prepare_external_windows(
+    recordings: Sequence[Recording],
+    scaler: RobustTrainScaler,
+    *,
+    seq_len: int,
+    maximum_windows: int,
+    rate: float,
+    seed: int,
+    topology: str = "point",
+) -> tuple[dict[str, Any], ...]:
+    """Expose the exact V2 training windows without duplicating mask logic."""
+
+    return tuple(
+        {
+            "target": window.target,
+            "mask": window.mask,
+            "dt": window.dt,
+            "recording_index": window.recording_index,
+            "start": window.start,
+        }
+        for window in _windows(
+            recordings,
+            scaler,
+            seq_len=seq_len,
+            maximum_windows=maximum_windows,
+            rate=rate,
+            seed=seed,
+            topology=topology,
+        )
+    )
+
+
+def prepare_external_sequence(
+    recording: Recording,
+    scaler: RobustTrainScaler,
+    *,
+    maximum: int | None,
+    rate: float,
+    seed: int,
+    topology: str = "point",
+    requested_irregularity: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
+    """Expose V2's canonical normalized target, mask, dt, and physical time."""
+
+    _, target, mask, dt, time_s, _ = _prepared_sequence(
+        recording,
+        scaler,
+        maximum=maximum,
+        rate=rate,
+        seed=seed,
+        topology=topology,
+        requested_irregularity=requested_irregularity,
+    )
+    return target, mask, dt, time_s
 
 
 def _trajectory_rows(
@@ -1177,8 +1301,12 @@ def run_matrix(
 
 __all__ = [
     "ExecutionModel",
+    "ExternalDataPreparation",
     "build_execution_model",
     "discover_oxiod_pairs",
+    "prepare_external_data",
+    "prepare_external_sequence",
+    "prepare_external_windows",
     "resolve_protocol_records",
     "run_matrix",
     "run_smoke",
