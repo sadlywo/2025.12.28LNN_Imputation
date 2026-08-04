@@ -50,6 +50,7 @@ try {
     git -C $sssd archive --format=tar "--output=$sssdTar" HEAD
     if ($LASTEXITCODE -ne 0) { throw "SSSD git archive failed" }
     tar -xf $sssdTar -C $sssdDestination
+    "4d3b7a51c54b658945c0ba0bbb26e5ee1f763bed" | Set-Content -LiteralPath (Join-Path $sssdDestination ".pinned-commit") -Encoding ascii
 
     if ($IncludeData -and -not (Test-Path -LiteralPath (Join-Path $payload "Oxford Dataset") -PathType Container)) {
         throw "Oxford Dataset was not included in the exact Git archive"

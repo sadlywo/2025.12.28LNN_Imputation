@@ -34,6 +34,9 @@ SESSION="modern-imputation-${COMMIT:0:12}"
 LOG="$STATE/campaign.log"
 PY_MAIN="$ROOT/.venv-modern-pypots/bin/python"
 PY_SSSD="$ROOT/.venv-modern-sssd/bin/python"
+SSSD_SOURCE="$ROOT/third_party/sssd/source"
+SSSD_COMMIT="4d3b7a51c54b658945c0ba0bbb26e5ee1f763bed"
+SSSD_MARKER="$SSSD_SOURCE/.pinned-commit"
 
 require_clean() {
   [[ -z $(git status --porcelain --untracked-files=all -- . ':(exclude).modern-campaign' ':(exclude).venv-modern-pypots' ':(exclude).venv-modern-sssd' ':(exclude)third_party/sssd/source' ':(exclude)repository.bundle' ':(exclude)bootstrap.sh') ]] || {
@@ -57,17 +60,34 @@ prepare() {
   "$PY_MAIN" -m pip install --upgrade pip
   "$PY_MAIN" -m pip install -r requirements-modern-pypots.txt -r requirements-validation-v2.txt
   python3.10 -m venv "$ROOT/.venv-modern-sssd"
-  "$PY_SSSD" -m pip install --upgrade pip
+  # pytorch-lightning 1.8.2 has legacy metadata rejected by pip 24.1+.
+  "$PY_SSSD" -m pip install --upgrade "pip==24.0"
+  # CUDA 11.7 cuFFT fails on RTX 4090; use the official CUDA 11.8 wheel.
+  "$PY_SSSD" -m pip install --index-url https://download.pytorch.org/whl/cu118 "torch==2.0.1"
   "$PY_SSSD" -m pip install -r requirements-modern-sssd.txt
-  if [[ ! -d third_party/sssd/source/.git ]]; then
-    git clone https://github.com/AI4HealthUOL/SSSD.git third_party/sssd/source
+  if [[ -d "$SSSD_SOURCE/.git" ]]; then
+    git -C "$SSSD_SOURCE" fetch --depth 1 origin "$SSSD_COMMIT"
+    git -C "$SSSD_SOURCE" checkout --detach "$SSSD_COMMIT"
+    [[ $(git -C "$SSSD_SOURCE" rev-parse HEAD) == "$SSSD_COMMIT" ]]
+  elif [[ -f "$SSSD_MARKER" ]]; then
+    [[ $(tr -d '\r\n' < "$SSSD_MARKER") == "$SSSD_COMMIT" ]] || {
+      echo "packaged SSSD source marker does not match the pinned commit" >&2; exit 2;
+    }
+    [[ -f "$SSSD_SOURCE/src/imputers/SSSDS4Imputer.py" ]] || {
+      echo "packaged SSSD source is incomplete" >&2; exit 2;
+    }
+  else
+    if [[ -e "$SSSD_SOURCE" && -n $(find "$SSSD_SOURCE" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+      echo "unverified non-empty SSSD source directory: $SSSD_SOURCE" >&2; exit 2;
+    fi
+    git clone https://github.com/AI4HealthUOL/SSSD.git "$SSSD_SOURCE"
+    git -C "$SSSD_SOURCE" fetch --depth 1 origin "$SSSD_COMMIT"
+    git -C "$SSSD_SOURCE" checkout --detach "$SSSD_COMMIT"
+    [[ $(git -C "$SSSD_SOURCE" rev-parse HEAD) == "$SSSD_COMMIT" ]]
   fi
-  git -C third_party/sssd/source fetch --depth 1 origin 4d3b7a51c54b658945c0ba0bbb26e5ee1f763bed
-  git -C third_party/sssd/source checkout --detach 4d3b7a51c54b658945c0ba0bbb26e5ee1f763bed
-  [[ $(git -C third_party/sssd/source rev-parse HEAD) == 4d3b7a51c54b658945c0ba0bbb26e5ee1f763bed ]]
   "$PY_MAIN" -m pytest tests/validation_v2 tests/validation_v2/modern -q
   "$PY_MAIN" -m validation_v2.modern.pypots_worker preflight --output "$STATE/pypots-environment.json"
-  "$PY_SSSD" -m validation_v2.modern.sssd_worker preflight --source third_party/sssd/source --output "$STATE/sssd-environment.json"
+  "$PY_SSSD" -m validation_v2.modern.sssd_worker preflight --source "$SSSD_SOURCE" --output "$STATE/sssd-environment.json"
   printf '{"commit":"%s","config":"%s","status":"prepared"}\n' "$COMMIT" "$CONFIG" > "$STATE/prepared.json"
   echo "prepared $COMMIT"
 }
@@ -89,7 +109,7 @@ case "$COMMAND" in
   start)
     require_clean; [[ -f "$STATE/prepared.json" ]] || { echo "run prepare first" >&2; exit 2; }
     tmux has-session -t "$SESSION" 2>/dev/null && { echo "campaign session already active" >&2; exit 2; }
-    tmux new-session -d -s "$SESSION" "cd '$ROOT' && bash -lc 'scripts/run_modern_imputation_matpool.sh _run "$CONFIG"'"
+    tmux new-session -d -s "$SESSION" "cd '$ROOT' && bash -lc 'bash scripts/run_modern_imputation_matpool.sh _run \"$CONFIG\"'"
     echo "started $SESSION"
     ;;
   _run) pipeline run >>"$LOG" 2>&1 ;;

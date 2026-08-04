@@ -1,5 +1,6 @@
 # Minimal runtime extracted from the official SSSD environment (Python 3.10).
-torch==1.13.0
+# The MatPool launcher installs torch 2.0.1 from the official cu118 index.
+# CUDA 11.8 is required for reliable cuFFT execution on RTX 4090 (sm_89).
 numpy==1.23.5
 scipy==1.9.3
 einops==0.6.0
