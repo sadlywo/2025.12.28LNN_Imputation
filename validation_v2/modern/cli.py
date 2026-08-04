@@ -5,8 +5,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import sys
+import tarfile
 
 from .artifacts import canonical_json, read_array_artifact
 from .config import load_modern_config
@@ -69,10 +69,43 @@ def _validate(output: Path) -> dict[str, object]:
     return report
 
 
+def package_result_tree(source: Path, destination: Path, *, mode: str) -> dict[str, object]:
+    if mode not in {"summary", "full"}:
+        raise ValueError("result package mode must be summary or full")
+    source = Path(source).resolve()
+    excluded = {"checkpoints", "samples", "predictions"}
+    files: dict[str, str] = {}
+    selected: list[tuple[Path, str]] = []
+    for path in sorted(source.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"result packages reject symlinks: {path}")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(source).as_posix()
+        if path.name.startswith("modern-results-"):
+            continue
+        if mode == "summary" and relative.split("/", 1)[0] in excluded:
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        files[relative] = digest; selected.append((path, relative))
+    manifest: dict[str, object] = {"schema_version": 1, "mode": mode, "files": files}
+    manifest["manifest_hash"] = hashlib.sha256(canonical_json(manifest).encode()).hexdigest()
+    archive = Path(destination).with_name(Path(destination).name + f"-{mode}.tar.gz")
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "x:gz", format=tarfile.PAX_FORMAT) as handle:
+        for path, relative in selected:
+            info = handle.gettarinfo(str(path), arcname=relative)
+            info.mtime = 0; info.uid = info.gid = 0; info.uname = info.gname = ""
+            with path.open("rb") as stream:
+                handle.addfile(info, stream)
+    manifest["archive"] = str(archive)
+    manifest["archive_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+    _stable_json(archive.with_suffix(archive.suffix + ".manifest.json"), manifest)
+    return manifest
+
+
 def _package(output: Path, mode: str) -> dict[str, object]:
-    destination = output / f"modern-results-{mode}"
-    archive = Path(shutil.make_archive(str(destination), "zip", root_dir=output))
-    return {"status": "complete", "mode": mode, "archive": str(archive), "bytes": archive.stat().st_size}
+    return package_result_tree(output, output / "modern-results", mode=mode)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -104,4 +137,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["main"]
+__all__ = ["main", "package_result_tree"]
