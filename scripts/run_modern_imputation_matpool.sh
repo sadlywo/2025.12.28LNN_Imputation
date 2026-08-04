@@ -18,7 +18,13 @@ EOF
 [[ ${1:-} == --help || ${1:-} == -h ]] && { usage; exit 0; }
 COMMAND=${1:-}
 [[ -n "$COMMAND" ]] || { usage >&2; exit 2; }
-CONFIG=${2:-configs/validation_v2/modern_stage_a.yaml}
+if [[ $COMMAND == package-results ]]; then
+  PACKAGE_MODE=${2:-summary}
+  CONFIG=${3:-configs/validation_v2/modern_stage_a.yaml}
+else
+  PACKAGE_MODE=""
+  CONFIG=${2:-configs/validation_v2/modern_stage_a.yaml}
+fi
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 COMMIT=$(git rev-parse HEAD)
@@ -70,7 +76,11 @@ pipeline() {
   local action=$1
   "$PY_MAIN" -m validation_v2.modern.cli plan --config "$CONFIG" --output "$STATE/results"
   "$PY_MAIN" -m validation_v2.modern.cli export --config "$CONFIG" --output "$STATE/results"
+  if [[ ! -f "$STATE/results/selected_hyperparameters.json" ]]; then
+    "$PY_MAIN" -m validation_v2.modern.cli tune --config "$CONFIG" --output "$STATE/results" --pypots-python "$PY_MAIN" --sssd-python "$PY_SSSD"
+  fi
   "$PY_MAIN" -m validation_v2.modern.cli "$action" --config "$CONFIG" --output "$STATE/results" --pypots-python "$PY_MAIN" --sssd-python "$PY_SSSD"
+  "$PY_MAIN" -m validation_v2.modern.cli summarize --config "$CONFIG" --output "$STATE/results"
   "$PY_MAIN" -m validation_v2.modern.cli validate --config "$CONFIG" --output "$STATE/results"
 }
 
@@ -92,8 +102,8 @@ case "$COMMAND" in
   logs) touch "$LOG"; tail -n 200 -f "$LOG" ;;
   package-results)
     [[ -f "$STATE/results/validation-report.json" ]] || { echo "validated results required" >&2; exit 2; }
-    "$PY_MAIN" -m validation_v2.modern.cli package-results --config "$CONFIG" --output "$STATE/results" --mode summary
-    "$PY_MAIN" -m validation_v2.modern.cli package-results --config "$CONFIG" --output "$STATE/results" --mode full
+    [[ $PACKAGE_MODE == summary || $PACKAGE_MODE == full ]] || { echo "mode must be summary or full" >&2; exit 2; }
+    "$PY_MAIN" -m validation_v2.modern.cli package-results --config "$CONFIG" --output "$STATE/results" --mode "$PACKAGE_MODE"
     ;;
   *) usage >&2; exit 2 ;;
 esac

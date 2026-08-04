@@ -6,3 +6,5 @@ einops==0.6.0
 opt-einsum==3.3.0
 tqdm==4.65.0
 PyYAML==6.0
+wandb==0.13.7
+pytorch-lightning==1.8.2
