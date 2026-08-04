@@ -35,7 +35,7 @@ try {
     }
     if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
     tar -xf $sourceTar -C $payload
-    git bundle create (Join-Path $payload "repository.bundle") $commit
+    git bundle create (Join-Path $payload "repository.bundle") HEAD
     if ($LASTEXITCODE -ne 0) { throw "git bundle failed" }
 
     $sssd = Join-Path $stagingParent "sssd"
