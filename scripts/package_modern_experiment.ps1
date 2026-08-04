@@ -46,8 +46,10 @@ try {
     }
     $sssdDestination = Join-Path $payload "third_party\sssd\source"
     New-Item -ItemType Directory -Force -Path $sssdDestination | Out-Null
-    git -C $sssd archive --format=tar --output=(Join-Path $stagingParent "sssd.tar") HEAD
-    tar -xf (Join-Path $stagingParent "sssd.tar") -C $sssdDestination
+    $sssdTar = Join-Path $stagingParent "sssd.tar"
+    git -C $sssd archive --format=tar "--output=$sssdTar" HEAD
+    if ($LASTEXITCODE -ne 0) { throw "SSSD git archive failed" }
+    tar -xf $sssdTar -C $sssdDestination
 
     if ($IncludeData -and -not (Test-Path -LiteralPath (Join-Path $payload "Oxford Dataset") -PathType Container)) {
         throw "Oxford Dataset was not included in the exact Git archive"
@@ -61,7 +63,7 @@ git fetch -q repository.bundle $commit
 git reset --hard FETCH_HEAD
 test "`$(git rev-parse HEAD)" = "$commit"
 echo "Upload restored at $commit. Next: bash scripts/run_modern_imputation_matpool.sh prepare"
-"@ | Set-Content -LiteralPath (Join-Path $payload "bootstrap.sh") -Encoding utf8NoBOM
+"@ | Set-Content -LiteralPath (Join-Path $payload "bootstrap.sh") -Encoding ascii
 
     $archive = Join-Path $output ("modern-imputation-upload-" + $commit + ".tar.gz")
     if (Test-Path -LiteralPath $archive) { throw "Upload archive already exists: $archive" }
