@@ -1,0 +1,8 @@
+# Minimal runtime extracted from the official SSSD environment (Python 3.10).
+torch==1.13.0
+numpy==1.23.5
+scipy==1.9.3
+einops==0.6.0
+opt-einsum==3.3.0
+tqdm==4.65.0
+PyYAML==6.0

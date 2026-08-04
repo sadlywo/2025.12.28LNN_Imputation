@@ -1,0 +1,7 @@
+{
+  "name": "AI4HealthUOL/SSSD",
+  "url": "https://github.com/AI4HealthUOL/SSSD.git",
+  "commit": "4d3b7a51c54b658945c0ba0bbb26e5ee1f763bed",
+  "license": "MIT",
+  "source_subdirectory": "src"
+}
