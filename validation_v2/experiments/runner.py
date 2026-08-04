@@ -1063,8 +1063,21 @@ def run_smoke(
     if not isinstance(conditions, list) or not conditions:
         raise ValueError("execution condition list must be non-empty")
     training_condition = next(
-        (condition for condition in conditions if condition.get("case_type") == "missingness"),
-        None,
+        (
+            condition
+            for condition in conditions
+            if condition.get("case_type") == "missingness"
+            and condition.get("topology") == "point"
+            and float(condition.get("requested_fraction", -1.0)) == 0.3
+        ),
+        next(
+            (
+                condition
+                for condition in conditions
+                if condition.get("case_type") == "missingness"
+            ),
+            None,
+        ),
     )
     if training_condition is None:
         raise ValueError("each training group requires at least one missingness condition")

@@ -27,7 +27,12 @@ try {
     }
 
     $sourceTar = Join-Path $stagingParent "source.tar"
-    git archive --format=tar --output=$sourceTar $commit
+    if ($IncludeData) {
+        git archive --format=tar --output=$sourceTar $commit
+    }
+    else {
+        git archive --format=tar --output=$sourceTar $commit -- . ':(exclude)Oxford Dataset'
+    }
     if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
     tar -xf $sourceTar -C $payload
     git bundle create (Join-Path $payload "repository.bundle") $commit
@@ -44,16 +49,18 @@ try {
     git -C $sssd archive --format=tar --output=(Join-Path $stagingParent "sssd.tar") HEAD
     tar -xf (Join-Path $stagingParent "sssd.tar") -C $sssdDestination
 
-    if ($IncludeData) {
-        $data = Join-Path $repository "Oxford Dataset"
-        if (-not (Test-Path -LiteralPath $data -PathType Container)) { throw "Oxford Dataset is missing" }
-        Copy-Item -LiteralPath $data -Destination (Join-Path $payload "Oxford Dataset") -Recurse
+    if ($IncludeData -and -not (Test-Path -LiteralPath (Join-Path $payload "Oxford Dataset") -PathType Container)) {
+        throw "Oxford Dataset was not included in the exact Git archive"
     }
     @"
 #!/usr/bin/env bash
 set -Eeuo pipefail
+git init -q
 git bundle verify repository.bundle
-echo "Upload extracted successfully. Next: bash scripts/run_modern_imputation_matpool.sh prepare"
+git fetch -q repository.bundle $commit
+git reset --hard FETCH_HEAD
+test "`$(git rev-parse HEAD)" = "$commit"
+echo "Upload restored at $commit. Next: bash scripts/run_modern_imputation_matpool.sh prepare"
 "@ | Set-Content -LiteralPath (Join-Path $payload "bootstrap.sh") -Encoding utf8NoBOM
 
     $archive = Join-Path $output ("modern-imputation-upload-" + $commit + ".tar.gz")

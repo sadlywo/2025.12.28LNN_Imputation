@@ -155,6 +155,8 @@ def _run_modern(config_path: Path, output: Path, pypots_python: Path, sssd_pytho
     rows: list[dict[str, object]] = []
     for seed in config.seeds:
         dataset = output / "datasets" / str(seed)
+        scaler = json.loads((dataset / "scaler.json").read_text(encoding="utf-8"))
+        scale = np.asarray(scaler["scale"], dtype=np.float64)
         dataset_manifest = json.loads((dataset / "dataset_manifest.json").read_text(encoding="utf-8"))
         for model in ("brits", "saits", "csdi", "sssd"):
             configuration = lock["selected"][model]
@@ -187,13 +189,18 @@ def _run_modern(config_path: Path, output: Path, pypots_python: Path, sssd_pytho
                 mask = np.rint(_stitch_static(data["mask"], starts, length)).astype(np.uint8)
                 condition = data_meta["metadata"]["condition"]; recording = data_meta["metadata"]["recording_id"]
                 mean = samples.mean(axis=0); missing = mask == 0
-                metrics = {"missing_rmse": float(np.sqrt(np.mean((mean[missing] - target[missing]) ** 2)))}
+                error = mean - target
+                metrics = {
+                    "reconstruction_normalized": float(np.sqrt(np.mean(error[missing] ** 2))),
+                    "reconstruction_physical": float(np.sqrt(np.mean((error * scale[None, :])[missing] ** 2))),
+                }
                 if model in {"csdi", "sssd"}:
                     coverage, width = interval_metrics(samples, target, mask, level=0.95)
                     metrics.update(crps=empirical_crps(samples, target, mask), coverage_95=coverage, width_95=width)
                 for metric, value in metrics.items():
                     rows.append({"model": model, "seed": seed, "recording_id": recording,
                         "condition_id": condition["condition_id"], "metric": metric, "value": value,
+                        "checkpoint_sha256": pred_meta["metadata"]["checkpoint_sha256"],
                         "dataset_artifact_id": data_meta["artifact_id"], "prediction_artifact_id": pred_meta["artifact_id"]})
     metrics_path = output / "modern_per_record_metrics.csv"
     with metrics_path.open("x", newline="", encoding="utf-8") as handle:
@@ -233,15 +240,41 @@ def _run_all(config_path: Path, output: Path, pypots_python: Path, sssd_python: 
 
 
 def _summarize(output: Path) -> dict[str, object]:
+    existing = output / "summary" / "summary.json"
+    if existing.is_file():
+        return {"status": "complete", "rows": len(json.loads(existing.read_text(encoding="utf-8")))}
     metrics_path = output / "modern_per_record_metrics.csv"
     if not metrics_path.is_file():
         raise ValueError("modern metrics are missing")
     with metrics_path.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
+    for reference_path in sorted((output / "reference").glob("*/per_record_metrics.csv")):
+        with reference_path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                topology = row["topology"]
+                condition_id = (
+                    "irregular-interval-jitter-point-30pct"
+                    if topology.startswith("irregular:")
+                    else f"{topology}-{int(round(float(row['requested_fraction']) * 100)):02d}pct"
+                )
+                rows.append({
+                    "model": row["model"], "seed": row["seed"],
+                    "recording_id": row["recording_id"], "condition_id": condition_id,
+                    "metric": row["metric"], "value": row["value"],
+                    "checkpoint_sha256": row["checkpoint_sha256"],
+                    "dataset_artifact_id": "", "prediction_artifact_id": "",
+                })
+    if not rows:
+        raise ValueError("no reference or modern metric rows were found")
     groups: dict[tuple[str, str, str], list[float]] = {}
     for row in rows:
         groups.setdefault((row["model"], row["condition_id"], row["metric"]), []).append(float(row["value"]))
     summary_dir = output / "summary"; summary_dir.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["model", "seed", "recording_id", "condition_id", "metric", "value",
+                  "checkpoint_sha256", "dataset_artifact_id", "prediction_artifact_id"]
+    with (summary_dir / "unified_per_record_metrics.csv").open("x", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader(); writer.writerows(rows)
     summary_rows = [{"model": key[0], "condition_id": key[1], "metric": key[2],
                      "mean": float(np.mean(values)), "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
                      "n": len(values)} for key, values in sorted(groups.items())]

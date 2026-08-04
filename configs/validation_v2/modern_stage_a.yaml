@@ -20,4 +20,4 @@ n_sampling_times: 50
 tuning_sampling_times: 5
 max_train_windows: 4096
 max_eval_samples: null
-trajectory_enabled: true
+trajectory_enabled: false

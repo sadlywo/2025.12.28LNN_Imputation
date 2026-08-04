@@ -36,7 +36,7 @@ PY_MAIN="$ROOT/.venv-modern-pypots/bin/python"
 PY_SSSD="$ROOT/.venv-modern-sssd/bin/python"
 
 require_clean() {
-  [[ -z $(git status --porcelain --untracked-files=all -- . ':(exclude).modern-campaign' ':(exclude).venv-modern-pypots' ':(exclude).venv-modern-sssd' ':(exclude)third_party/sssd/source') ]] || {
+  [[ -z $(git status --porcelain --untracked-files=all -- . ':(exclude).modern-campaign' ':(exclude).venv-modern-pypots' ':(exclude).venv-modern-sssd' ':(exclude)third_party/sssd/source' ':(exclude)repository.bundle' ':(exclude)bootstrap.sh') ]] || {
     echo "worktree must be clean before campaign operations" >&2; exit 2;
   }
 }
