@@ -147,6 +147,13 @@ def _prepare_xy(x: np.ndarray, y: np.ndarray, max_points: int = 1500):
     return x[::stride], y[::stride]
 
 
+def _prepare_txy(t: np.ndarray, x: np.ndarray, y: np.ndarray, max_points: int = 1500):
+    if len(x) <= max_points:
+        return t, x, y
+    stride = max(1, int(np.ceil(len(x) / max_points)))
+    return t[::stride], x[::stride], y[::stride]
+
+
 def plot_first_vi_trajectories(items: List[Tuple[str, Path]], save_path: Path):
     n = len(items)
     n_cols = min(4, max(1, n))
@@ -234,8 +241,7 @@ def plot_speed_colored_trajectories(items: List[Tuple[str, Path]], save_path: Pa
     y_max = -np.inf
     for scenario_name, vi_path in items:
         t, x, y = _read_vi_txy(vi_path)
-        x, y = _prepare_xy(x, y, max_points=1800)
-        t = t[: len(x)]
+        t, x, y = _prepare_txy(t, x, y, max_points=1800)
         feat = _compute_trajectory_features(t, x, y)
         speed = feat["speed"]
         prepared.append((scenario_name, x, y, speed))
