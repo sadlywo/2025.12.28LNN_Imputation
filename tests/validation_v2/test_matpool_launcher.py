@@ -211,7 +211,13 @@ def _tracked_release_utf8_text_paths() -> tuple[Path, ...]:
         relative_path = Path(encoded_path.decode("utf-8", errors="strict"))
         if not _tracked_release_text_path_is_in_scope(relative_path):
             continue
-        raw = REPO_ROOT.joinpath(relative_path).read_bytes()
+        worktree_path = REPO_ROOT.joinpath(relative_path)
+        if not worktree_path.is_file():
+            # A tracked file can be intentionally removed in the working tree
+            # before its deletion is staged; it is not part of the release
+            # text that can be scanned from this checkout.
+            continue
+        raw = worktree_path.read_bytes()
         if b"\0" in raw:
             raise AssertionError(
                 (relative_path, "tracked release text contains a NUL byte")
@@ -313,9 +319,13 @@ def test_credential_scanner_source_contains_no_leak_instance() -> None:
 
 
 def _bash() -> str:
-    git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
-    if git_bash.is_file():
-        return str(git_bash)
+    candidates = [Path(r"C:\Program Files\Git\bin\bash.exe")]
+    git = shutil.which("git")
+    if git:
+        candidates.insert(0, Path(git).resolve().parents[1] / "bin" / "bash.exe")
+    for git_bash in candidates:
+        if git_bash.is_file():
+            return str(git_bash)
     executable = shutil.which("bash")
     assert executable is not None, "Bash is required to test the MatPool launcher"
     return executable
@@ -614,7 +624,7 @@ def test_start_forwards_exact_commit_full_unique_suffix_and_default_workers(
     assert state["schema_version"] == 1
     assert state["commit"] == commit
     assert state["session"] == f"validation-v2-{commit[:12]}-{suffix}"
-    assert state["max_workers"] == 4
+    assert state["max_workers"] == 2
     assert state["skip_dependency_install"] is False
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", str(state["created_at"]))
     for key in (
@@ -645,7 +655,7 @@ def test_start_forwards_exact_commit_full_unique_suffix_and_default_workers(
     assert f"<{commit}>" in invocation
     assert "<full>" in invocation
     assert f"<{suffix}>" in invocation
-    assert "<4>" in invocation
+    assert "<2>" in invocation
     assert "--skip-dependency-install" not in invocation
 
 
@@ -1262,7 +1272,7 @@ def test_status_is_read_only_and_reports_active_state_and_paths(tmp_path: Path) 
     assert commit in completed.stdout
     assert str(state["campaign_suffix"]) in completed.stdout
     assert str(state["session"]) in completed.stdout
-    assert "max_workers: 4" in completed.stdout
+    assert "max_workers: 2" in completed.stdout
     for key in ("audit_dir", "shards_root", "final_root", "log_path", "exit_status_path"):
         assert str(state[key]) in completed.stdout
     assert completed.stdout.count("fake generic runner output") <= 1

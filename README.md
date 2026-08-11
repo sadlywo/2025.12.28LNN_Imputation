@@ -1,146 +1,123 @@
-# CfC-IMU Imputation Project
+# IMU Missing-Data Imputation (`validation_v2`)
 
-现代插补模型（BRITS、SAITS、CSDI、SSSD）与现有 Hybrid 的矩池云实验流程见
-[中文运行手册](docs/modern_imputation_matpool_runbook_zh.md)。
+本仓库现在以 `validation_v2` 和正式物理损失重构为唯一主开发路径。旧版根目录训练、demo、
+消融和可视化脚本已经整体归档到 `legacy/pre_validation_v2/`，不会再与当前入口混用。
 
-基于 **Closed-form Continuous-time (CfC)** 神经网络的 IMU 数据补缺系统。
+## 当前方案
 
-## 核心特性
+- 任务：对 IMU 六通道时序缺失值进行插补，并评估信号误差、姿态/速度/位置物理误差和轨迹误差。
+- 缺失协议：保留 point、block、channel 及原有缺失比例；另有 `interval_jitter` 不规则时间实验。
+- 主模型：当前矩阵中的 `hybrid`（BiLNN/BiLSTM hybrid）。
+- 目标函数：缺失位置重建损失 + 基于 SO(3) 旋转、速度、位置的物理损失。
+- 安全约束：坐标系、单位和 IMU/Vicon 外参未验证前，只允许 `lambda_physics=0`；非零物理权重会自动拒绝运行。
+- 数据集：Oxford Inertial Odometry Dataset、EuRoC MAV Vicon Room 1/2 和 IDOL Building 1/2/3；三者通过统一 adapter contract 接入。
 
-### 1. CfC 优化架构
-- ✅ **连续时间建模**：保留真实时间间隔（不规则采样）
-- ✅ **物理先验嵌入**：分离的陀螺仪/加速度计处理头
-- ✅ **不确定性估计**：自适应损失权重
+完整设计和改动范围见 [PHYSICS_LOSS_REFACTOR_REPORT.md](PHYSICS_LOSS_REFACTOR_REPORT.md)，
+新数据集字段约定见 [docs/physics_loss_refactor_dataset_contract.md](docs/physics_loss_refactor_dataset_contract.md)。
 
-### 2. 创新设计
-- **MAD 归一化**：比 Z-score 更鲁棒的归一化方法
-- **自适应损失函数**：
-  - 加权重建损失（基于不确定性）
-  - 时间一致性约束
-  - 平滑度正则化
-- **多模式评估**：random/block/channel 缺失模式
+## 环境
 
-### 3. 简化架构
-- ❌ 移除手动速度积分（CfC 自带 ODE solver）
-- ❌ 移除复杂的物理损失（让网络学习物理规律）
-- ✅ 专注于 CfC 的核心优势
+本地建议使用独立 Python 3.10 环境：
 
-## 项目结构
-
-```
-├── config.py          # 配置文件（数据/模型/训练）
-├── dataset.py         # CfC 优化的数据集
-├── models.py          # 物理先验模型 + 自适应损失
-├── train.py           # 训练流程
-├── main.py            # CLI 入口
-└── Oxford Dataset/    # 数据集目录
-    ├── handbag/
-    ├── iPhone 5/
-    └── pocket/
+```powershell
+conda create -n lnn-imputation python=3.10 -y
+conda activate lnn-imputation
+python -m pip install -r requirements.txt
 ```
 
-## 快速开始
+`requirements.txt` 只指向当前 `validation_v2` 的锁定依赖。PyPOTS/SSSD 等可选现代 baseline
+仍分别使用 `requirements-modern-pypots.txt` 和 `requirements-modern-sssd.txt`。
 
-### 基础训练
-```bash
-python main.py --root_dir "Oxford Dataset" --epochs 50 --hidden_units 64
+RTX 5090 服务器使用 PyTorch 2.11.0 的 CUDA 12.8 构建。正式 MatPool 入口默认两个
+GPU worker，每个 shard 进程通过 `CUDA_VISIBLE_DEVICES` 固定到一张卡，不使用 DDP。
+
+## 当前运行入口
+
+所有命令均从仓库根目录执行。
+
+1. 先检查实验矩阵，不训练：
+
+```powershell
+python run.py matrix --config physics_refactor_smoke.yaml --dry-run
 ```
 
-### 自定义参数
-```bash
-python main.py \
-    --root_dir "Oxford Dataset" \
-    --seq_len 50 \
-    --mask_rate 0.3 \
-    --missing_mode random \
-    --batch_size 16 \
-    --epochs 50 \
-    --lr 1e-3 \
-    --hidden_units 64 \
-    --w_recon 1.0 \
-    --w_consistency 0.5 \
-    --w_smooth 0.1
+2. 执行单组合 smoke test：
+
+```powershell
+python run.py smoke --config physics_refactor_smoke.yaml --device cpu
 ```
 
-## 参数说明
+3. 执行当前配置的完整矩阵：
 
-### 数据参数
-- `--root_dir`: 数据集根目录
-- `--seq_len`: 序列长度（默认 50）
-- `--mask_rate`: 缺失率 0-1（默认 0.3）
-- `--missing_mode`: 缺失模式 random/block/channel
-
-### 模型参数
-- `--hidden_units`: CfC 隐藏单元数（默认 64）
-
-### 训练参数
-- `--epochs`: 训练轮数（默认 50）
-- `--lr`: 学习率（默认 1e-3）
-- `--batch_size`: 批大小（默认 16）
-- `--device`: cuda/cpu
-
-### 损失权重
-- `--w_recon`: 重建损失（默认 1.0）
-- `--w_consistency`: 时间一致性（默认 0.5）
-- `--w_smooth`: 平滑度（默认 0.1）
-
-## 输出文件
-
-- `best_model.pt`: 最佳模型权重
-- `training_results.pt`: 训练历史和多模式评估结果
-
-## ONNX 导出
-
-使用 `Change_pt_to_onnx.py` 可以将 `best_model.pt` 导出为 ONNX，并自动根据权重结构识别模型类型（CfC/Physics/GRU/Transformer）。
-
-```bash
-python Change_pt_to_onnx.py --checkpoint best_model.pt --output best_model.onnx
+```powershell
+python run.py matrix --config physics_refactor_smoke.yaml --device cuda
 ```
 
-如需手动指定模型类型或导出参数：
+当前 YAML 是结构和短流程验证配置（1 epoch、受限窗口数）。正式训练前应复制该配置，增加
+`epochs`、训练窗口与种子数量，并保持缺失协议及物理字段不变。
 
-```bash
-python Change_pt_to_onnx.py \
-  --checkpoint best_model.pt \
-  --output best_model.onnx \
-  --model-name transformer \
-  --hidden-units 64 \
-  --seq-len 50
+4. 在启用非零物理权重前诊断 IMU/Vicon 机械化约定：
+
+```powershell
+python scripts/diagnose_imu_vicon_mechanization.py
 ```
 
-## 核心改进
+诊断输出位于 `results/physics_loss_refactor/v1/diagnostics/`。人工确认坐标系、单位和固定外参后，
+方可把配置中的 `frame_validation_status` 改为 `validated`。
 
-### vs 原始版本
+5. 查看或执行物理权重消融：
 
-| 方面 | 原版本 | 新版本 |
-| --- | --- | --- |
-| 时间处理 | 固定间隔 | **保留真实间隔** |
-| 归一化 | Z-score | **MAD（更鲁棒）** |
-| 物理约束 | 手动积分层 | **CfC 内置 ODE** |
-| 损失函数 | 多项物理损失 | **自适应不确定性加权** |
-| 架构 | 单一输出头 | **分离 gyro/acc 头** |
-| 代码复杂度 | 高 | **低（简化 40%）** |
-
-## 依赖
-
-```bash
-pip install torch onnx numpy pandas tqdm ncps
+```powershell
+python scripts/run_physics_lambda_ablation.py --dry-run
+python scripts/run_physics_lambda_ablation.py --device cuda
 ```
 
-## 理论基础
+初始化并核验 EuRoC/IDOL 本地数据：
 
-CfC 的核心优势：
+```powershell
+python scripts/initialize_external_datasets.py
+```
 
-1. **连续时间动力系统**：天然处理不规则采样
-2. **闭式解**：数值稳定性好
-3. **长期依赖建模**：优于 LSTM/GRU
+该命令会验证 IDOL 官方 MD5、逐条读取全部 130 个 Feather 文件，并从 EuRoC 的 6 个
+序列包中只初始化 IMU、ground truth 和传感器 YAML（不重复解压相机图像）。结果清单写入
+`datasets/manifests/external_datasets.json`。
 
-物理先验设计：
+初始化后可分别检查两个 adapter 的实验矩阵：
 
-- 陀螺仪（角速度）和加速度计（线性加速度）物理特性不同
-- 分离处理头更符合物理直觉
-- 不确定性估计帮助模型识别难以预测的区域
+```powershell
+python run.py matrix --config euroc_adapter_smoke.yaml --dry-run
+python run.py matrix --config idol_adapter_smoke.yaml --dry-run
+```
 
-## License
+## 目录边界
 
-MIT
+```text
+configs/validation_v2/             当前实验配置
+datasets/                          EuRoC/IDOL 等新增数据集（原始数据不进 Git）
+docs/                              当前运行手册与数据契约
+legacy/pre_validation_v2/          旧版脚本、旧公共模块和旧依赖
+results/legacy_archive/            旧结果范围索引
+results/physics_loss_refactor/      新方案唯一结果目录
+scripts/                            当前诊断、消融和服务器运行工具
+tests/validation_v2/                当前测试
+validation_v2/                      当前数据、模型、损失、训练和评估代码
+run.py                              当前统一入口
+```
+
+## 数据目录
+
+下载后的 EuRoC MAV 与 IDOL 原始文件放在：
+
+```text
+datasets/raw/euroc_mav/archives/
+datasets/raw/euroc_mav/extracted/
+datasets/raw/idol/archives/
+datasets/raw/idol/extracted/
+```
+
+原始文件、解压数据、缓存和中间处理结果均被 Git 忽略；仅代码、数据契约和校验清单应提交。
+
+## 旧版复现
+
+旧脚本没有删除。需要复现旧实验时，请阅读
+[legacy/pre_validation_v2/README.md](legacy/pre_validation_v2/README.md)。新功能和新实验不要再修改旧目录。

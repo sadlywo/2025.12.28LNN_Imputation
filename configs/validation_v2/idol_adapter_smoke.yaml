@@ -1,0 +1,60 @@
+data_root: datasets/raw/idol/archives
+dataset_name: idol
+output_root: results/physics_loss_refactor/v1/runs/idol_adapter_smoke
+selection_split: validation
+seeds: [2026]
+split_seed: 2026
+seq_len: 30
+batch_size: 4
+epochs: 1
+device: auto
+require_clean_git: false
+models: [hybrid]
+protocols: [strict_file]
+topologies: [point, block, channel]
+rates: [0.1, 0.2, 0.3, 0.4]
+objective: physics_informed
+physics:
+  lambda_physics: 0.0
+  sigma_rotation_rad: 0.1
+  sigma_velocity_mps: 0.5
+  sigma_position_m: 0.5
+  acceleration_mode: specific_force
+  acceleration_unit: m/s^2
+  frame_validation_status: diagnostic_only_not_validated
+physics_diagnostics_enabled: true
+kinematic_ablation:
+  name: kinematic_ablation
+  enabled: false
+trajectory_enabled: false
+irregular_sampling_is_value_missing: false
+irregular_cases:
+  - method: interval_jitter
+    requested_irregularity: 0.1
+    value_topology: point
+    value_requested_fraction: 0.3
+  - method: interval_jitter
+    requested_irregularity: 0.2
+    value_topology: point
+    value_requested_fraction: 0.3
+  - method: interval_jitter
+    requested_irregularity: 0.4
+    value_topology: point
+    value_requested_fraction: 0.3
+max_train_windows: 4
+max_eval_samples: 120
+hidden_size: 4
+learning_rate: 0.001
+recordings:
+  - scenario: building1
+    split: train
+    imu: building1/train/0.feather
+    vicon: building1/train/0.feather
+  - scenario: building1
+    split: validation
+    imu: building1/known/0.feather
+    vicon: building1/known/0.feather
+  - scenario: building1
+    split: test
+    imu: building1/unknown/0.feather
+    vicon: building1/unknown/0.feather

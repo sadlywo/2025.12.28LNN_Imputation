@@ -174,8 +174,8 @@ def test_full_record_diagnostic_uses_only_user_acceleration_and_reports_delta():
     imu_time = np.linspace(0.0, 1.0, 101)
     complete = np.zeros((101, 6))
     imputed = complete.copy()
-    complete[:, 3] = 2.0 / 9.81
-    imputed[:, 3] = 1.0 / 9.81
+    complete[:, 3] = 2.0 / 9.80665
+    imputed[:, 3] = 1.0 / 9.80665
     # Huge gyro values must not enter translational integration.
     complete[:, :3] = 1e6
     imputed[:, :3] = -1e6
@@ -215,7 +215,7 @@ def test_full_record_diagnostic_default_velocity_matches_analytic_ground_truth()
 
     time_s = np.linspace(0.0, 1.0, 101)
     imu = np.zeros((101, 6))
-    imu[:, 3] = 2.0 / 9.81
+    imu[:, 3] = 2.0 / 9.80665
     position_m = np.column_stack([np.square(time_s), np.zeros((101, 2))])
     quaternion_xyzw = np.tile([0.0, 0.0, 0.0, 1.0], (101, 1))
     metadata = {
@@ -241,6 +241,42 @@ def test_full_record_diagnostic_default_velocity_matches_analytic_ground_truth()
         assert metrics["ate_rmse_m"] == pytest.approx(0.0, abs=1e-12)
         assert metrics["endpoint_drift_m"] == pytest.approx(0.0, abs=1e-12)
         assert metrics["velocity_rmse_mps"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_full_record_diagnostic_specific_force_restores_gravity():
+    from validation_v2.evaluation.trajectory import (
+        measured_attitude_full_record_diagnostic,
+    )
+
+    time_s = np.linspace(0.0, 1.0, 101)
+    imu = np.zeros((101, 6))
+    imu[:, 5] = 9.80665
+    position_m = np.zeros((101, 3))
+    quaternion_xyzw = np.tile([0.0, 0.0, 0.0, 1.0], (101, 1))
+    metadata = {
+        **FRAME_METADATA,
+        "imu_acceleration_unit": "m/s^2",
+        "user_acceleration_semantics": "specific_force",
+        "position_unit": "m",
+        "time_unit": "s",
+    }
+
+    result = measured_attitude_full_record_diagnostic(
+        imu,
+        imu.copy(),
+        time_s,
+        time_s,
+        position_m,
+        quaternion_xyzw,
+        frame_metadata=metadata,
+        acceleration_unit="m/s^2",
+        acceleration_mode="specific_force",
+        initial_velocity_mps=np.zeros(3),
+        rpe_interval=10,
+    )
+
+    assert result.complete_metrics["endpoint_drift_m"] == pytest.approx(0.0, abs=1e-12)
+    assert result.complete_metrics["velocity_rmse_mps"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_diagnostic_result_defensively_freezes_metric_mappings():

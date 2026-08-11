@@ -21,9 +21,13 @@ METRICS = REPO_ROOT / "scripts" / "collect_validation_v2_stage_metrics.py"
 
 
 def _bash() -> str:
-    git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
-    if git_bash.is_file():
-        return str(git_bash)
+    candidates = [Path(r"C:\Program Files\Git\bin\bash.exe")]
+    git = shutil.which("git")
+    if git:
+        candidates.insert(0, Path(git).resolve().parents[1] / "bin" / "bash.exe")
+    for git_bash in candidates:
+        if git_bash.is_file():
+            return str(git_bash)
     bash = shutil.which("bash")
     assert bash is not None, "Bash is required to test the server runner"
     return bash
@@ -195,7 +199,7 @@ def test_runner_help_declares_full_and_preflight_modes() -> None:
     assert "--commit COMMIT" in completed.stdout
     assert "--skip-dependency-install" in completed.stdout
     assert "--max-workers 1|2|4|8" in completed.stdout
-    assert "default: 8" in completed.stdout
+    assert "default: 2" in completed.stdout
     assert "sharded-v2-py310/py311/py312" in completed.stdout
 
 
@@ -505,15 +509,15 @@ def test_runner_skip_dependency_install_requires_an_existing_venv(tmp_path: Path
     assert log.read_text(encoding="utf-8").splitlines() == _fake_python_probe_log()
 
 
-def test_runner_uses_local_venv_and_explicit_cuda121_torch_index() -> None:
+def test_runner_uses_local_venv_and_explicit_cuda128_torch_index() -> None:
     source = RUNNER.read_text(encoding="utf-8")
 
     assert ".venv-server" in source
     assert "PYTHON3_BIN" in source
     assert "-m venv" in source
-    assert "https://download.pytorch.org/whl/cu121" in source
-    assert "torch==2.3.1" in source
-    assert 'torch.__version__ == "2.3.1+cu121"' in source
+    assert "https://download.pytorch.org/whl/cu128" in source
+    assert "torch==2.11.0" in source
+    assert 'torch.__version__ == "2.11.0+cu128"' in source
     assert "/root/miniconda3" not in source
     assert "conda activate" not in source
     assert "pinn_imu" not in source
@@ -522,7 +526,7 @@ def test_runner_uses_local_venv_and_explicit_cuda121_torch_index() -> None:
 def test_runner_full_mode_calls_formal_workflow() -> None:
     source = RUNNER.read_text(encoding="utf-8")
 
-    assert "MAX_WORKERS=8" in source
+    assert "MAX_WORKERS=2" in source
     assert 'run_formal_campaign "$MODE"' in source
     for token in (
         "test_linux_rename_noreplace_survives_real_directory_race",
@@ -726,10 +730,12 @@ def _run_fake_runtime(
     *,
     gpu_name: str,
     gpu_memory_bytes: int = 24 * 1024**3,
+    gpu_count: int = 1,
+    compute_capability: tuple[int, int] = (8, 9),
     python_implementation: str = "CPython",
     python_version: tuple[int, int] = (3, 12),
-    torch_version: str = "2.3.1+cu121",
-    torch_cuda: str = "12.1",
+    torch_version: str = "2.11.0+cu128",
+    torch_cuda: str = "12.8",
     cuda_available: bool = True,
     nvidia_smi_available: bool = True,
     nvidia_smi_returncode: int = 0,
@@ -739,6 +745,7 @@ def _run_fake_runtime(
     fake_modules = tmp_path / "fake-modules"
     fake_modules.mkdir()
     (fake_modules / "torch.py").write_text(
+        "import json\n"
         "import os\n"
         "from types import SimpleNamespace\n"
         "__version__ = os.environ['FAKE_TORCH_VERSION']\n"
@@ -747,12 +754,16 @@ def _run_fake_runtime(
         "    @staticmethod\n"
         "    def is_available(): return os.environ['FAKE_CUDA_AVAILABLE'] == '1'\n"
         "    @staticmethod\n"
-        "    def get_device_name(index): return os.environ['FAKE_GPU_NAME']\n"
+        "    def device_count(): return int(os.environ['FAKE_GPU_COUNT'])\n"
+        "    @staticmethod\n"
+        "    def get_device_name(index):\n"
+        "        return json.loads(os.environ['FAKE_GPU_NAMES'])[index]\n"
         "    @staticmethod\n"
         "    def get_device_properties(index):\n"
         "        return SimpleNamespace(total_memory=int(os.environ['FAKE_GPU_MEMORY']))\n"
         "    @staticmethod\n"
-        "    def get_device_capability(index): return (8, 9)\n"
+        "    def get_device_capability(index):\n"
+        "        return tuple(json.loads(os.environ['FAKE_COMPUTE_CAPABILITY']))\n"
         "cuda = _Cuda()\n",
         encoding="utf-8",
     )
@@ -785,8 +796,10 @@ def _run_fake_runtime(
     environment = os.environ.copy()
     environment.update(
         {
-            "FAKE_GPU_NAME": gpu_name,
+            "FAKE_GPU_NAMES": json.dumps([gpu_name] * gpu_count),
+            "FAKE_GPU_COUNT": str(gpu_count),
             "FAKE_GPU_MEMORY": str(gpu_memory_bytes),
+            "FAKE_COMPUTE_CAPABILITY": json.dumps(compute_capability),
             "FAKE_TORCH_VERSION": torch_version,
             "FAKE_TORCH_CUDA": torch_cuda,
             "FAKE_CUDA_AVAILABLE": "1" if cuda_available else "0",
@@ -856,8 +869,8 @@ def test_runner_venv_runtime_rejects_unsupported_python_under_optimization(
 @pytest.mark.parametrize(
     "runtime_overrides",
     [
-        {"torch_version": "2.3.1"},
-        {"torch_cuda": "12.4"},
+        {"torch_version": "2.11.0"},
+        {"torch_cuda": "12.6"},
         {"cuda_available": False},
     ],
 )
@@ -927,22 +940,53 @@ def test_runner_runtime_rejects_invalid_nvidia_smi_results_without_manifest(
 
 
 @pytest.mark.parametrize(
-    "gpu_name", ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090 D"]
+    "gpu_name,compute_capability",
+    [
+        ("NVIDIA GeForce RTX 4090", (8, 9)),
+        ("NVIDIA GeForce RTX 4090 D", (8, 9)),
+        ("NVIDIA GeForce RTX 5090", (12, 0)),
+    ],
 )
-def test_runner_runtime_accepts_4090_variants_and_publishes_provenance(
-    tmp_path: Path, gpu_name: str
+def test_runner_runtime_accepts_supported_gpu_variants_and_publishes_provenance(
+    tmp_path: Path, gpu_name: str, compute_capability: tuple[int, int]
 ) -> None:
-    completed, output, nvidia_log = _run_fake_runtime(tmp_path, gpu_name=gpu_name)
+    completed, output, nvidia_log = _run_fake_runtime(
+        tmp_path,
+        gpu_name=gpu_name,
+        compute_capability=compute_capability,
+    )
 
     assert completed.returncode == 0, completed.stderr
     manifest = json.loads(output.read_text(encoding="utf-8"))
     assert manifest["gpu_0"] == gpu_name
     assert manifest["gpu_memory_bytes"] == 24 * 1024**3
-    assert manifest["compute_capability"] == [8, 9]
+    assert manifest["gpu_count"] == 1
+    assert manifest["gpu_names"] == [gpu_name]
+    assert manifest["gpu_memory_bytes_all"] == [24 * 1024**3]
+    assert manifest["compute_capability"] == list(compute_capability)
+    assert manifest["compute_capabilities"] == [list(compute_capability)]
     assert manifest["driver_version"] == "555.42"
     assert manifest["cpu_affinity_count"] == 4
     assert manifest["host_memory_bytes"] == 32 * 1024**3
     assert "--query-gpu=driver_version" in nvidia_log.read_text(encoding="utf-8")
+
+
+def test_runner_runtime_audits_two_visible_5090_devices(tmp_path: Path) -> None:
+    gpu_name = "NVIDIA GeForce RTX 5090"
+    completed, output, _ = _run_fake_runtime(
+        tmp_path,
+        gpu_name=gpu_name,
+        gpu_count=2,
+        gpu_memory_bytes=32 * 1024**3,
+        compute_capability=(12, 0),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+    assert manifest["gpu_count"] == 2
+    assert manifest["gpu_names"] == [gpu_name, gpu_name]
+    assert manifest["gpu_memory_bytes_all"] == [32 * 1024**3, 32 * 1024**3]
+    assert manifest["compute_capabilities"] == [[12, 0], [12, 0]]
 
 
 @pytest.mark.parametrize(
@@ -1481,6 +1525,52 @@ def test_launch_shard_reserves_ownership_before_a_second_launch(tmp_path: Path) 
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_launch_shard_pins_workers_round_robin_to_visible_gpus(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_bash_executable(bin_dir / "pgrep", "exit 1\n")
+    fake_python = tmp_path / "fake-python"
+    invocation_log = tmp_path / "python.log"
+    _write_bash_executable(
+        fake_python,
+        'printf "%s|%s\\n" "${CUDA_VISIBLE_DEVICES:-missing}" "$*" '
+        '>> "$FAKE_PYTHON_LOG"\nsleep 30\n',
+    )
+    audit_dir = tmp_path / "audit"
+    shards_root = tmp_path / "shards"
+    audit_dir.mkdir()
+    shards_root.mkdir()
+    config = tmp_path / "config.yaml"
+    plan = tmp_path / "plan.json"
+    config.write_text("{}\n", encoding="utf-8")
+    plan.write_text("{}\n", encoding="utf-8")
+
+    completed = _run_helper_bash(
+        'export PATH="$1:$PATH" PYTHON_BIN="$2" AUDIT_DIR="$3" SHARDS_ROOT="$4" '
+        'CONFIG="$5" PLAN="$6" FAKE_PYTHON_LOG="$7" VALIDATION_V2_GPU_COUNT=2; '
+        'source "$8"; launch_shard 001; '
+        'for attempt in 1 2 3 4 5; do test -s "$FAKE_PYTHON_LOG" && break; sleep 0.1; done; '
+        'grep -F "1|-m validation_v2.cli shard" "$FAKE_PYTHON_LOG"; '
+        'kill "$(cat "$AUDIT_DIR/shard-001.pid")" 2>/dev/null || true; exit 0',
+        bin_dir, fake_python, audit_dir, shards_root, config, plan, invocation_log, HELPERS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_launch_shard_rejects_invalid_visible_gpu_count(tmp_path: Path) -> None:
+    fake_python = tmp_path / "fake-python"
+    _write_bash_executable(fake_python, "exit 97\n")
+    completed = _run_helper_bash(
+        'export PYTHON_BIN="$1" VALIDATION_V2_GPU_COUNT=0; '
+        'source "$2"; launch_shard 000',
+        fake_python, HELPERS,
+    )
+
+    assert completed.returncode == 2
+    assert "invalid VALIDATION_V2_GPU_COUNT" in completed.stderr
 
 
 def test_gpu_sampler_waits_for_a_valid_row_before_returning(tmp_path: Path) -> None:

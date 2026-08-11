@@ -1,15 +1,25 @@
 # Validation v2 服务器正式验证操作手册（MatPool）
 
 本手册是论文级 `server_full` 正式验证的当前中文运维入口。支持环境为 Linux、
-通用 CPython 3.10–3.12，以及 RTX 4090 系列 GPU（RTX 4090 或 RTX 4090D）。
-各 Python 小版本均使用锁定的 `torch==2.3.1+cu121` 与同一组验证依赖；
-Python 3.12 和 RTX 4090D 都不是唯一要求。
+通用 CPython 3.10–3.12，以及一张或多张 RTX 4090、4090D 或 5090 GPU。
+各 Python 小版本均使用锁定的 `torch==2.11.0+cu128` 与同一组验证依赖。
+当前矩池云目标配置是两张 RTX 5090；单张 RTX 4090 仍可用于预检和单 worker 执行。
 
 底层通用运行器负责科学执行合同：校验精确提交与干净工作树，执行完整预检，生成
 不可变的 8-shard 计划，训练全部分片，再严格合并、验证并汇总五个随机种子。
 MatPool 启动器只是该合同的后台运维封装，不会跳过测试、计划或完成检查。
 
 ## 1. clone 后直接启动
+
+首次进入服务器时，只克隆当前开发分支；数据集和生成结果不会通过 Git 下载：
+
+```bash
+mkdir -p /root/workspace
+cd /root/workspace
+git clone --depth 1 --branch codex/physics-loss-refactor \
+  git@github.com:sadlywo/2025.12.28LNN_Imputation.git lnn-imputation
+cd /root/workspace/lnn-imputation
+```
 
 仓库已经 clone 到服务器后，必须在任何 `start` 之前绑定本次审阅通过的 40 位 commit。
 下面的 HEAD 相等断言和干净工作树门禁不可省略；启动器还会再次执行相同检查。
@@ -21,7 +31,7 @@ shard 进程当作计费已经终止的证据。
 
 ```bash
 set -Eeuo pipefail
-cd /2025.12.28LNN_Imputation
+cd /root/workspace/lnn-imputation
 VALIDATED_COMMIT="<40-HEX-VALIDATED-COMMIT>"
 git checkout --detach "$VALIDATED_COMMIT"
 test "$(git rev-parse HEAD)" = "$VALIDATED_COMMIT"
@@ -34,10 +44,10 @@ bash scripts/run_validation_v2_matpool.sh logs
 `start` 创建后台 tmux session 后即返回。tmux 中会先执行完整 preflight，成功后才
 开始训练，因此启动命令返回 0 不代表预检或正式验证已经完成。完整运行可能持续数日。
 
-默认最大同时 worker 数为 4，但完整计划仍会运行全部 8 个分片；这个参数只限制并发，
-不会减少覆盖范围。必须先审阅 4-worker 阶段的显存、吞吐、PID、marker 与审计证据，
-确认余量后才能显式选择 8 worker。再次执行主代码块中的 exact-commit 与干净工作树
-门禁后，使用 `bash scripts/run_validation_v2_matpool.sh start --max-workers 8`。
+默认最大同时 worker 数为 2，但完整计划仍会运行全部 8 个分片；这个参数只限制并发，
+不会减少覆盖范围。每个 shard 进程通过 `CUDA_VISIBLE_DEVICES` 轮转绑定到独立 GPU，
+因此两张卡各运行一个 worker。worker 数不能超过当前可见 GPU 数；单卡 4090 主机请使用
+`bash scripts/run_validation_v2_matpool.sh start --max-workers 1`。
 
 ## 2. 状态、日志与证据位置
 
@@ -67,7 +77,7 @@ campaign seal、日志或分片根目录，也不要向未核验身份的进程�
 ```bash
 DIRECT_SUFFIX="formal-$(date -u +%Y%m%dT%H%M%SZ)"
 bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
-  --campaign-suffix "$DIRECT_SUFFIX" --max-workers 4
+  --campaign-suffix "$DIRECT_SUFFIX" --max-workers 2
 ```
 
 路径 B：先做诊断预检，再启动 formal full。预检会创建不可变 campaign seal，
@@ -82,7 +92,7 @@ bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode
 FORMAL_SUFFIX="formal-$(date -u +%Y%m%dT%H%M%SZ)"
 test "$PREFLIGHT_SUFFIX" != "$FORMAL_SUFFIX"
 bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
-  --campaign-suffix "$FORMAL_SUFFIX" --max-workers 4 --skip-dependency-install
+  --campaign-suffix "$FORMAL_SUFFIX" --max-workers 2 --skip-dependency-install
 ```
 
 依赖重用不会跳过精确提交、干净工作树、运行时、完整 pytest、计划、训练、合并或验证。

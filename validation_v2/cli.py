@@ -6,27 +6,10 @@ import argparse
 from collections.abc import Mapping, Sequence
 import os
 from pathlib import Path
+import stat
 import sys
 
 import yaml
-
-from validation_v2.experiments.matrix import enumerate_matrix
-from validation_v2.experiments.provenance import (
-    canonical_json,
-    git_worktree_identity,
-    runtime_fingerprint,
-)
-from validation_v2.experiments.runner import run_matrix, run_smoke
-from validation_v2.experiments.sharding import (
-    build_shard_plan,
-    execute_shard,
-    load_shard_plan,
-    merge_shards,
-    write_shard_plan,
-)
-from validation_v2.experiments.summarize import summarize_runs
-
-
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIRECTORY = _REPOSITORY_ROOT / "configs" / "validation_v2"
 
@@ -57,6 +40,9 @@ def _repository_path(value: Path) -> Path:
 
 
 def _write_matrix(config_path: str, *, dry_run: bool) -> None:
+    from validation_v2.experiments.matrix import enumerate_matrix
+    from validation_v2.experiments.provenance import canonical_json
+
     combinations = enumerate_matrix(_mapping_config(config_path))
     print(
         canonical_json(
@@ -111,10 +97,27 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        if arguments.command == "shard-plan":
+            output = _repository_path(arguments.output)
+            if os.path.lexists(output):
+                metadata = os.lstat(output)
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError(
+                        f"shard plan output must be an unlinked regular file: {output}"
+                    )
+
+        from validation_v2.experiments.provenance import (
+            canonical_json,
+            git_worktree_identity,
+            runtime_fingerprint,
+        )
+
         if arguments.command == "matrix":
             if arguments.dry_run:
                 _write_matrix(arguments.config, dry_run=True)
             else:
+                from validation_v2.experiments.runner import run_matrix
+
                 report = run_matrix(
                     _mapping_config(arguments.config),
                     repository_root=Path(__file__).resolve().parents[1],
@@ -125,6 +128,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(canonical_json(report))
             return 0
         if arguments.command == "smoke":
+            from validation_v2.experiments.runner import run_smoke
+
             report = run_smoke(
                 _mapping_config(arguments.config),
                 repository_root=Path(__file__).resolve().parents[1],
@@ -134,6 +139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(canonical_json(report))
             return 0
         if arguments.command == "summarize":
+            from validation_v2.experiments.summarize import summarize_runs
+
             marker_path = arguments.root / "matrix_execution.json"
             if marker_path.is_file():
                 marker = yaml.safe_load(marker_path.read_text(encoding="utf-8"))
@@ -167,6 +174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime = runtime_fingerprint()
             output = _repository_path(arguments.output)
             if os.path.lexists(output):
+                from validation_v2.experiments.sharding import load_shard_plan
+
                 plan = load_shard_plan(
                     output,
                     config=config,
@@ -180,6 +189,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "shard plan already exists with different shard_count"
                     )
             else:
+                from validation_v2.experiments.sharding import (
+                    build_shard_plan,
+                    write_shard_plan,
+                )
+
                 plan = build_shard_plan(
                     config,
                     shard_count=arguments.shard_count,
@@ -192,6 +206,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(canonical_json(plan))
             return 0
         if arguments.command == "shard":
+            from validation_v2.experiments.sharding import execute_shard, load_shard_plan
+
             config = _mapping_config(arguments.config)
             identity = git_worktree_identity(_REPOSITORY_ROOT)
             runtime = runtime_fingerprint()
@@ -214,6 +230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(canonical_json(report))
             return 0
         if arguments.command == "merge-shards":
+            from validation_v2.experiments.sharding import merge_shards
+
             report = merge_shards(
                 config_path=_config_path(arguments.config),
                 plan_path=_repository_path(arguments.plan),

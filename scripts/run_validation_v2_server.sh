@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Execute the immutable Validation v2 campaign on a supported Linux RTX 4090 host.
+# Execute the immutable Validation v2 campaign on supported Linux RTX 4090/5090 hosts.
 
 set -Eeuo pipefail
 
@@ -15,7 +15,7 @@ Required:
 Options:
   --repo PATH                 Repository root (default: directory containing this script/..).
   --campaign-suffix NAME      New campaign suffix (default: sharded-v2-py310/py311/py312).
-  --max-workers 1|2|4|8       Maximum concurrent workers for the formal campaign (default: 8).
+  --max-workers 1|2|4|8       Maximum concurrent GPU workers (default: 2 for two GPUs).
   --skip-dependency-install   Reuse an already-provisioned .venv-server, but still verify it.
   --help                      Show this help and exit.
 EOF
@@ -47,7 +47,7 @@ MODE=""
 CAMPAIGN_SUFFIX=""
 CAMPAIGN_SUFFIX_EXPLICIT=0
 SKIP_DEPENDENCY_INSTALL=0
-MAX_WORKERS=8
+MAX_WORKERS=2
 
 while (($#)); do
   case "$1" in
@@ -192,7 +192,7 @@ fi
 install_dependencies() {
   (
     "$PYTHON_BIN" -m pip install --upgrade pip
-    "$PYTHON_BIN" -m pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.3.1
+    "$PYTHON_BIN" -m pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.11.0
     "$PYTHON_BIN" -m pip install -r "$REPO/requirements-validation-v2.txt"
   )
 }
@@ -233,21 +233,41 @@ def require(condition, message):
 
 require(platform.python_implementation() == "CPython", platform.python_implementation())
 require(sys.version_info[:2] in ((3, 10), (3, 11), (3, 12)), sys.version)
-require(torch.__version__ == "2.3.1+cu121", torch.__version__)
+require(torch.__version__ == "2.11.0+cu128", torch.__version__)
 require(torch.cuda.is_available(), "CUDA is unavailable")
-require(torch.version.cuda == "12.1", torch.version.cuda)
-name = torch.cuda.get_device_name(0)
-require("4090" in name.upper(), name)
-gpu_memory_bytes = int(torch.cuda.get_device_properties(0).total_memory)
-require(
-    gpu_memory_bytes >= 23 * 1024**3,
-    "GPU memory is below 23 GiB: {}".format(gpu_memory_bytes),
-)
-compute_capability = torch.cuda.get_device_capability(0)
-require(
-    isinstance(compute_capability, (tuple, list)) and len(compute_capability) == 2,
-    "invalid compute capability: {!r}".format(compute_capability),
-)
+require(torch.version.cuda == "12.8", torch.version.cuda)
+gpu_count = int(torch.cuda.device_count())
+require(gpu_count >= 1, "no CUDA devices are visible")
+gpu_names = [torch.cuda.get_device_name(index) for index in range(gpu_count)]
+gpu_memory_values = [
+    int(torch.cuda.get_device_properties(index).total_memory)
+    for index in range(gpu_count)
+]
+compute_capabilities = [
+    torch.cuda.get_device_capability(index) for index in range(gpu_count)
+]
+for index, (name, gpu_memory_bytes, compute_capability) in enumerate(
+    zip(gpu_names, gpu_memory_values, compute_capabilities)
+):
+    normalized_name = name.upper()
+    require(
+        "4090" in normalized_name or "5090" in normalized_name,
+        "unsupported GPU {}: {}".format(index, name),
+    )
+    require(
+        gpu_memory_bytes >= 23 * 1024**3,
+        "GPU {} memory is below 23 GiB: {}".format(index, gpu_memory_bytes),
+    )
+    require(
+        isinstance(compute_capability, (tuple, list))
+        and len(compute_capability) == 2,
+        "invalid compute capability for GPU {}: {!r}".format(
+            index, compute_capability
+        ),
+    )
+name = gpu_names[0]
+gpu_memory_bytes = gpu_memory_values[0]
+compute_capability = compute_capabilities[0]
 try:
     nvidia_smi = shutil.which("nvidia-smi")
     require(nvidia_smi is not None, "nvidia-smi is unavailable")
@@ -295,6 +315,10 @@ with open(sys.argv[1], "x", encoding="utf-8") as handle:
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,
             "cuda_available": torch.cuda.is_available(),
+            "gpu_count": gpu_count,
+            "gpu_names": gpu_names,
+            "gpu_memory_bytes_all": gpu_memory_values,
+            "compute_capabilities": compute_capabilities,
             "gpu_0": name,
             "gpu_memory_bytes": gpu_memory_bytes,
             "compute_capability": compute_capability,
@@ -312,6 +336,14 @@ PY
 
 run_preflight() {
   verify_runtime
+  VALIDATION_V2_GPU_COUNT="$($PYTHON_BIN -c 'import torch; print(torch.cuda.device_count())')"
+  [[ "$VALIDATION_V2_GPU_COUNT" =~ ^[1-9][0-9]*$ ]] \
+    || die "invalid visible GPU count: $VALIDATION_V2_GPU_COUNT"
+  if [[ "$MODE" == full ]] && (( MAX_WORKERS > VALIDATION_V2_GPU_COUNT )); then
+    die "--max-workers=$MAX_WORKERS exceeds visible GPU count=$VALIDATION_V2_GPU_COUNT"
+  fi
+  export VALIDATION_V2_GPU_COUNT
+
   "$PYTHON_BIN" -m pytest -q \
     tests/validation_v2/test_sharding.py::test_linux_rename_noreplace_survives_real_directory_race \
     -rs | tee "$PREFLIGHT_DIR/linux-renameat2.txt"

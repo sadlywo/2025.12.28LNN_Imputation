@@ -37,8 +37,14 @@ def _plan(config_path: Path, output: Path) -> dict[str, object]:
         {"topology": topology, "requested_fraction": rate}
         for topology in config.topologies for rate in config.rates
     ]
-    if config.irregular_cases:
-        conditions.append({"topology": "irregular:interval_jitter+point", "requested_fraction": 0.3})
+    for case in config.irregular_case_specs:
+        conditions.append(
+            {
+                "topology": f"irregular:interval_jitter+{case['value_topology']}",
+                "requested_fraction": case["value_requested_fraction"],
+                "requested_irregularity": case["requested_irregularity"],
+            }
+        )
     tasks = []
     for seed in config.seeds:
         for model in config.models:
@@ -216,15 +222,15 @@ def _run_references(config_path: Path, output: Path) -> dict[str, object]:
     if not reference_models:
         return {"status": "skipped"}
     v2_config = {
-        "data_root": config.data_root, "output_root": str(output / "reference"),
+        "data_root": config.data_root, "dataset_name": config.dataset_name,
+        "output_root": str(output / "reference"),
         "selection_split": "validation", "seeds": list(config.seeds), "split_seed": config.split_seed,
         "seq_len": config.seq_len, "batch_size": config.batch_size, "epochs": config.epochs,
         "device": config.device, "require_clean_git": False, "models": reference_models,
         "protocols": [config.protocol], "topologies": list(config.topologies), "rates": list(config.rates),
         "objective": "reconstruction_only", "kinematic_ablation": {"name": "kinematic_ablation", "enabled": False},
         "trajectory_enabled": config.trajectory_enabled, "irregular_sampling_is_value_missing": False,
-        "irregular_cases": ([{"method": "interval_jitter", "requested_irregularity": 0.2,
-            "value_topology": "point", "value_requested_fraction": 0.3}] if config.irregular_cases else []),
+        "irregular_cases": [dict(case) for case in config.irregular_case_specs],
         "max_train_windows": config.max_train_windows, "max_eval_samples": config.max_eval_samples,
         "hidden_size": 32, "learning_rate": 0.001,
     }

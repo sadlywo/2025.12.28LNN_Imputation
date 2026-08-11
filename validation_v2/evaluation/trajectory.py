@@ -202,11 +202,16 @@ def trajectory_metrics(
     return result
 
 
-def _diagnostic_metadata(frame_metadata: Mapping[str, object]) -> None:
+def _diagnostic_metadata(
+    frame_metadata: Mapping[str, object],
+    *,
+    acceleration_unit: str,
+    acceleration_mode: str,
+) -> None:
     validate_attitude_metadata(frame_metadata)
     required = {
-        "imu_acceleration_unit": "G",
-        "user_acceleration_semantics": "gravity_removed",
+        "imu_acceleration_unit": acceleration_unit,
+        "user_acceleration_semantics": acceleration_mode,
         "position_unit": "m",
         "time_unit": "s",
     }
@@ -226,18 +231,29 @@ def measured_attitude_full_record_diagnostic(
     frame_metadata: Mapping[str, object],
     initial_velocity_mps: np.ndarray | None = None,
     rpe_interval: int = 1,
+    acceleration_unit: str = "G",
+    acceleration_mode: str = "gravity_removed",
 ) -> DiagnosticResult:
     """Evaluate complete and imputed IMU over the entire Vicon-overlap record.
 
-    Only columns 3:6 (gravity-removed user acceleration in G) are used.  Vicon
-    attitude and position are evaluation-only metadata and never model inputs.
+    Only columns 3:6 are used. Acceleration may be gravity-removed values or
+    raw specific force, in G or m/s^2. Vicon attitude and position are
+    evaluation-only metadata and never model inputs.
     Measured xyzw attitude is SLERPed to the IMU overlap clock and applied
     directly; ``euler_order='xyz'`` is a validated framework declaration, not a
     request for an unnecessary quaternion-to-Euler conversion.  If ``v0`` is
     omitted it is estimated once from the first synchronized GT position pair.
     """
 
-    _diagnostic_metadata(frame_metadata)
+    if acceleration_unit not in {"G", "m/s^2"}:
+        raise ValueError("acceleration_unit must be 'G' or 'm/s^2'")
+    if acceleration_mode not in {"gravity_removed", "gravity_compensated", "specific_force"}:
+        raise ValueError("unsupported acceleration_mode")
+    _diagnostic_metadata(
+        frame_metadata,
+        acceleration_unit=acceleration_unit,
+        acceleration_mode=acceleration_mode,
+    )
     complete = np.asarray(complete_imu_six, dtype=np.float64)
     imputed = np.asarray(imputed_imu_six, dtype=np.float64)
     imu_time = np.asarray(imu_time_s, dtype=np.float64)
@@ -264,8 +280,9 @@ def measured_attitude_full_record_diagnostic(
         query_time,
         frame_metadata=frame_metadata,
     )
-    complete_acceleration_body = complete[overlap, 3:6] * 9.81
-    imputed_acceleration_body = imputed[overlap, 3:6] * 9.81
+    scale = 9.80665 if acceleration_unit == "G" else 1.0
+    complete_acceleration_body = complete[overlap, 3:6] * scale
+    imputed_acceleration_body = imputed[overlap, 3:6] * scale
     complete_acceleration_world = rotate_body_to_world(
         complete_acceleration_body,
         synced.quaternion_xyzw,
@@ -278,6 +295,10 @@ def measured_attitude_full_record_diagnostic(
         mapping="body_to_reference",
         frame_metadata=frame_metadata,
     )
+    if acceleration_mode == "specific_force":
+        gravity_world = np.array([0.0, 0.0, -9.80665])
+        complete_acceleration_world = complete_acceleration_world + gravity_world
+        imputed_acceleration_world = imputed_acceleration_world + gravity_world
     dt = np.empty_like(query_time)
     dt[0] = 0.0
     dt[1:] = np.diff(query_time)

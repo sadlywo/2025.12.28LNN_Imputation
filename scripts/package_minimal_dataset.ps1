@@ -111,7 +111,8 @@ $manifest = [ordered]@{
     }
     server_initialization = @(
         "Extract this archive from the repository root.",
-        "Unzip building1.zip, building2.zip, and building3.zip into datasets/raw/idol/archives/.",
+        "Keep the IDOL building ZIP files under datasets/raw/idol/archives; the adapter reads them directly.",
+        "Use the pre-initialized EuRoC subset under datasets/processed/euroc_mav.",
         "Do not require the full EuRoC camera or ROS-bag payloads."
     )
 }

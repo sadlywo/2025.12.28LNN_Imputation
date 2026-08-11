@@ -6,6 +6,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
 from validation_v2.types import Recording
 
@@ -130,3 +131,69 @@ class RobustTrainScaler:
         """Undo :meth:`transform` without mutating the caller's array."""
         array = self._validated_values(values)
         return array * self.scale_ + self.center_
+
+    def transform_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        """Normalize a tensor's final six-channel axis without leaving PyTorch."""
+
+        if not isinstance(values, torch.Tensor) or values.shape[-1:] != self.center_.shape:
+            raise ValueError("values final dimension must match scaler channels")
+        if not values.is_floating_point() or not torch.isfinite(values).all():
+            raise ValueError("values must be a finite floating tensor")
+        center = torch.tensor(self.center_, dtype=values.dtype, device=values.device)
+        scale = torch.tensor(self.scale_, dtype=values.dtype, device=values.device)
+        return (values - center) / scale
+
+    def inverse_transform_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        """Recover physical dataset units while preserving autograd and device."""
+
+        if not isinstance(values, torch.Tensor) or values.shape[-1:] != self.center_.shape:
+            raise ValueError("values final dimension must match scaler channels")
+        if not values.is_floating_point() or not torch.isfinite(values).all():
+            raise ValueError("values must be a finite floating tensor")
+        center = torch.tensor(self.center_, dtype=values.dtype, device=values.device)
+        scale = torch.tensor(self.scale_, dtype=values.dtype, device=values.device)
+        return values * scale + center
+
+
+def denormalize_imu_tensor(
+    normalized: torch.Tensor,
+    center: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Denormalize ``[...,6]`` IMU values using train-fitted median/MAD stats."""
+
+    if not all(isinstance(value, torch.Tensor) for value in (normalized, center, scale)):
+        raise TypeError("normalized, center, and scale must be torch tensors")
+    if normalized.shape[-1:] != (6,) or center.shape[-1:] != (6,) or scale.shape[-1:] != (6,):
+        raise ValueError("IMU values and normalization stats must end in six channels")
+    if center.device != normalized.device or scale.device != normalized.device:
+        raise ValueError("normalization stats must share the IMU device")
+    if center.dtype != normalized.dtype or scale.dtype != normalized.dtype:
+        raise ValueError("normalization stats must share the IMU dtype")
+    if not torch.isfinite(center).all() or not torch.isfinite(scale).all() or torch.any(scale <= 0):
+        raise ValueError("normalization stats must be finite with positive scale")
+    return normalized * scale + center
+
+
+def imu_dataset_units_to_si(values: torch.Tensor, *, acceleration_unit: str) -> torch.Tensor:
+    """Convert six-channel IMU from dataset units to rad/s and m/s².
+
+    Gyroscope channels are already rad/s.  OxIOD ``user_acc`` is stored in G.
+    EuRoC MAV and IDOL adapters declare accelerometer values in m/s².
+    """
+
+    if not isinstance(values, torch.Tensor) or values.shape[-1:] != (6,):
+        raise ValueError("values must be a torch tensor ending in six channels")
+    if acceleration_unit not in {"G", "m/s^2"}:
+        raise ValueError("acceleration_unit must be 'G' or 'm/s^2'")
+    gyro, acceleration = values[..., :3], values[..., 3:]
+    if acceleration_unit == "G":
+        acceleration = acceleration * values.new_tensor(9.80665)
+    return torch.cat((gyro, acceleration), dim=-1)
+
+
+__all__ = [
+    "RobustTrainScaler",
+    "denormalize_imu_tensor",
+    "imu_dataset_units_to_si",
+]

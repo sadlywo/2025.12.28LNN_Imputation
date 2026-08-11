@@ -8,11 +8,11 @@ diagnostic only.
 
 ## Current supported execution path
 
-The supported runtime is Linux with generic CPython 3.10–3.12 and an RTX 4090
-series GPU (RTX 4090 or RTX 4090D). Every supported Python minor uses the same
-locked CUDA build, `torch==2.3.1+cu121`, and the same validation dependency
-lock. Python 3.12 and RTX 4090D are supported configurations, not exclusive
-requirements.
+The supported runtime is Linux with generic CPython 3.10–3.12 and one or more
+RTX 4090/4090D/5090 GPUs. Every supported Python minor uses the same locked
+CUDA build, `torch==2.11.0+cu128`, and the same validation dependency lock.
+The current MatPool target is two RTX 5090 GPUs; one RTX 4090-class GPU remains
+valid for preflight and single-worker execution.
 
 The generic runner is the executable scientific contract. Given an exact
 40-character commit, it checks the clean worktree, performs the complete
@@ -24,6 +24,17 @@ five seeds. The MatPool launcher below is the current operator wrapper around
 that generic runner; it does not replace or weaken any of these checks.
 
 ### MatPool: shortest clean-checkout operation
+
+For a fresh server, clone only the current development branch and avoid pulling
+the ignored datasets and generated result artifacts through Git:
+
+```bash
+mkdir -p /root/workspace
+cd /root/workspace
+git clone --depth 1 --branch codex/physics-loss-refactor \
+  git@github.com:sadlywo/2025.12.28LNN_Imputation.git lnn-imputation
+cd /root/workspace/lnn-imputation
+```
 
 From an already cloned repository, bind the reviewed 40-character commit before
 any `start`. The explicit equality and clean-worktree gates below are mandatory;
@@ -38,7 +49,7 @@ not evidence that billing has ended.
 
 ```bash
 set -Eeuo pipefail
-cd /2025.12.28LNN_Imputation
+cd /root/workspace/lnn-imputation
 VALIDATED_COMMIT="<40-HEX-VALIDATED-COMMIT>"
 git checkout --detach "$VALIDATED_COMMIT"
 test "$(git rev-parse HEAD)" = "$VALIDATED_COMMIT"
@@ -64,12 +75,12 @@ log, audit directory, shard roots, and exit-status evidence. Diagnose the first
 preflight or runner error from `logs` and `status`; do not delete a campaign
 seal, kill an unverified PID, or overwrite an existing root to force a retry.
 
-The MatPool default max-workers value is 4, but the complete plan still runs
-all 8 shards; the limit controls concurrency, not campaign coverage. Only after
-reviewing the four-worker GPU-memory, throughput, PID, marker, and audit
-evidence may an operator opt in to eight concurrent workers. After repeating
-the exact-commit and clean-worktree gate in the main block, use
-`bash scripts/run_validation_v2_matpool.sh start --max-workers 8`.
+The MatPool default max-workers value is 2 for the two-GPU target, but the
+complete plan still runs all 8 shards; the limit controls concurrency, not
+campaign coverage. Each shard process is pinned round-robin with
+`CUDA_VISIBLE_DEVICES`, so the two concurrent workers use separate GPUs. Do not
+set a worker count above the number of visible GPUs. For a one-GPU 4090 host,
+use `bash scripts/run_validation_v2_matpool.sh start --max-workers 1`.
 
 ### Generic runner and dependency reuse
 
@@ -83,7 +94,7 @@ Path A — direct full, without a separate preflight invocation:
 ```bash
 DIRECT_SUFFIX="formal-$(date -u +%Y%m%dT%H%M%SZ)"
 bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
-  --campaign-suffix "$DIRECT_SUFFIX" --max-workers 4
+  --campaign-suffix "$DIRECT_SUFFIX" --max-workers 2
 ```
 
 Path B — diagnostic preflight followed by full. Preflight creates an immutable
@@ -99,7 +110,7 @@ bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode
 FORMAL_SUFFIX="formal-$(date -u +%Y%m%dT%H%M%SZ)"
 test "$PREFLIGHT_SUFFIX" != "$FORMAL_SUFFIX"
 bash scripts/run_validation_v2_server.sh --commit "$(git rev-parse HEAD)" --mode full \
-  --campaign-suffix "$FORMAL_SUFFIX" --max-workers 4 --skip-dependency-install
+  --campaign-suffix "$FORMAL_SUFFIX" --max-workers 2 --skip-dependency-install
 ```
 
 The reuse option never skips Git, runtime, test, plan, or full training checks.

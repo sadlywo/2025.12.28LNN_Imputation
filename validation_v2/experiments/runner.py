@@ -14,7 +14,6 @@ import csv
 import hashlib
 import json
 import random
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +24,7 @@ import pandas as pd
 import torch
 from torch import nn
 
+from validation_v2.data.adapters import get_dataset_adapter
 from validation_v2.data.features import build_features
 from validation_v2.data.masking import (
     channel_outage,
@@ -33,9 +33,11 @@ from validation_v2.data.masking import (
     point_missing,
 )
 from validation_v2.data.normalization import RobustTrainScaler
-from validation_v2.data.oxiod import IMU_CHANNEL_NAMES, load_recording
+from validation_v2.data.oxiod import IMU_CHANNEL_NAMES
 from validation_v2.data.windows import make_windows
 from validation_v2.evaluation.reconstruction import reconstruction_metrics
+from validation_v2.evaluation.physics import physics_endpoint_diagnostics
+from validation_v2.evaluation.synchronization import synchronize_vicon_to_imu
 from validation_v2.evaluation.trajectory import measured_attitude_full_record_diagnostic
 from validation_v2.experiments.evaluate import evaluate_test_once
 from validation_v2.experiments.groups import (
@@ -58,6 +60,10 @@ from validation_v2.models.baselines import (
 from validation_v2.models.bilnn import BidirectionalCfC
 from validation_v2.models.bilstm import BiLSTMImputer
 from validation_v2.models.hybrid import HybridImputer, complete_signal
+from validation_v2.objectives.physics_informed import (
+    IMUPhysicsInformedLoss,
+    PhysicsLossConfig,
+)
 from validation_v2.objectives.reconstruction import missing_mse, missing_rmse
 from validation_v2.types import Recording
 
@@ -70,6 +76,11 @@ class _Window:
     dt: torch.Tensor
     recording_index: int = -1
     start: int = -1
+    vicon_position_m: torch.Tensor | None = None
+    vicon_rotation_body_to_world: torch.Tensor | None = None
+    vicon_velocity_mps: torch.Tensor | None = None
+    normalization_center: torch.Tensor | None = None
+    normalization_scale: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -116,7 +127,7 @@ class ExecutionModel(nn.Module):
         else:
             raise ValueError(f"unsupported model: {name}")
 
-    def predict(
+    def predict_raw(
         self,
         features: torch.Tensor,
         mask: torch.Tensor,
@@ -134,24 +145,30 @@ class ExecutionModel(nn.Module):
             return locf(observed, mask, empty_series_fill=0.0)
         reverse_dt = reverse_aligned_dt(dt)
         if selected_model == "bilstm":
-            return complete_signal(observed, mask, self.core(features))
+            return self.core(features)
         if selected_model == "bilnn":
-            return complete_signal(
-                observed, mask, self.core(features, dt, reverse_dt)
-            )
+            return self.core(features, dt, reverse_dt)
         components = self.core.forward_components(
             features, dt, reverse_dt, observed, mask
         )
         if selected_model == "hybrid":
-            return components.completed
+            return components.raw
         if selected_model == "equal_average":
-            return equal_average(
-                observed, mask, components.lnn, components.lstm
-            )
+            return 0.5 * (components.lnn + components.lstm)
         gate = float(selected_model.removeprefix("fixed_gate_"))
-        return fixed_gate(
-            observed, mask, components.lnn, components.lstm, gate
-        )
+        return gate * components.lnn + (1.0 - gate) * components.lstm
+
+    def predict(
+        self,
+        features: torch.Tensor,
+        mask: torch.Tensor,
+        dt: torch.Tensor,
+        reported_model: str | None = None,
+    ) -> torch.Tensor:
+        """Return a completed signal while keeping the raw head deployable."""
+
+        raw = self.predict_raw(features, mask, dt, reported_model=reported_model)
+        return complete_signal(features[..., :6], mask, raw)
 
 
 def build_execution_model(model_name: str, hidden_size: int) -> ExecutionModel:
@@ -260,35 +277,18 @@ def _scenario_name(directory_name: str) -> str:
 def discover_oxiod_pairs(data_root: Path | str) -> list[dict[str, str]]:
     """Discover exact imuN/viN pairs in the real Oxford Dataset tree."""
 
-    root = Path(data_root).resolve()
-    if not root.is_dir():
-        raise ValueError(f"data_root is not a directory: {root}")
-    pairs: list[dict[str, str]] = []
-    for directory in sorted((item for item in root.iterdir() if item.is_dir()), key=lambda p: p.name):
-        imu_by_index = {
-            int(match.group(1)): path
-            for path in directory.glob("imu*.csv")
-            if (match := re.fullmatch(r"imu(\d+)\.csv", path.name))
-        }
-        vicon_by_index = {
-            int(match.group(1)): path
-            for path in directory.glob("vi*.csv")
-            if (match := re.fullmatch(r"vi(\d+)\.csv", path.name))
-        }
-        if set(imu_by_index) != set(vicon_by_index):
-            raise ValueError(f"unpaired IMU/Vicon files in {directory}")
-        for index in sorted(imu_by_index):
-            pairs.append(
-                {
-                    "recording_id": f"{directory.name}/imu{index}",
-                    "scenario": _scenario_name(directory.name),
-                    "imu_path": str(imu_by_index[index].resolve()),
-                    "vicon_path": str(vicon_by_index[index].resolve()),
-                }
-            )
-    if not pairs:
-        raise ValueError(f"no imuN.csv/viN.csv pairs found under {root}")
-    return pairs
+    return [dict(item) for item in get_dataset_adapter("oxiod").discover(Path(data_root))]
+
+
+def discover_dataset_pairs(
+    data_root: Path | str, *, dataset_name: str = "oxiod"
+) -> list[dict[str, str]]:
+    """Discover recordings through the configured dataset adapter."""
+
+    return [
+        dict(item)
+        for item in get_dataset_adapter(dataset_name).discover(Path(data_root))
+    ]
 
 
 def resolve_protocol_records(
@@ -365,8 +365,11 @@ def resolve_configured_records(
     split_seed = config.get("split_seed", 2026)
     if isinstance(split_seed, bool) or not isinstance(split_seed, int):
         raise ValueError("split_seed must be an integer")
+    dataset_name = str(config.get("dataset_name", "oxiod"))
     return resolve_protocol_records(
-        discover_oxiod_pairs(data_root), protocol, seed=split_seed
+        discover_dataset_pairs(data_root, dataset_name=dataset_name),
+        protocol,
+        seed=split_seed,
     )
 
 
@@ -561,6 +564,32 @@ def _windows(
             break
         maximum = seq_len * per_record
         time_s, physical = _slice_recording(recording, maximum)
+        synchronized = synchronize_vicon_to_imu(
+            recording.vicon_time_s,
+            recording.vicon_position_m,
+            recording.vicon_quaternion_xyzw,
+            time_s,
+            frame_metadata={
+                "quaternion_order": "xyzw",
+                "quaternion_frame": "body_to_reference",
+                "euler_order": "xyz",
+            },
+        )
+        vicon_position = torch.from_numpy(
+            synchronized.position_m.astype(np.float32, copy=False)
+        )
+        vicon_rotation = torch.from_numpy(
+            synchronized.rotation_body_to_world.astype(np.float32, copy=False)
+        )
+        vicon_velocity = torch.from_numpy(
+            synchronized.velocity_world_mps.astype(np.float32, copy=False)
+        )
+        normalization_center = torch.from_numpy(
+            scaler.center_.astype(np.float32, copy=True)
+        )
+        normalization_scale = torch.from_numpy(
+            scaler.scale_.astype(np.float32, copy=True)
+        )
         target = torch.from_numpy(scaler.transform(physical).astype(np.float32))
         dt = _dt(time_s)
         batches = make_windows(
@@ -588,6 +617,7 @@ def _windows(
             )
             mask = generators[topology](batch.target, rate, window_seed).mask
             feature = build_features(batch.target, mask, batch.dt)
+            positions = batch.index.to(dtype=torch.long)
             prepared.append(
                 _Window(
                     feature.values,
@@ -596,6 +626,11 @@ def _windows(
                     batch.dt,
                     recording_index=recording_index,
                     start=int(batch.index[0].item()),
+                    vicon_position_m=vicon_position[positions],
+                    vicon_rotation_body_to_world=vicon_rotation[positions],
+                    vicon_velocity_mps=vicon_velocity[positions],
+                    normalization_center=normalization_center,
+                    normalization_scale=normalization_scale,
                 )
             )
     result = prepared[:maximum_windows]
@@ -608,12 +643,39 @@ def _batches(windows: Sequence[_Window], batch_size: int) -> list[_Window]:
     result: list[_Window] = []
     for start in range(0, len(windows), batch_size):
         group = windows[start : start + batch_size]
+        optional_names = (
+            "vicon_position_m",
+            "vicon_rotation_body_to_world",
+            "vicon_velocity_mps",
+            "normalization_center",
+            "normalization_scale",
+        )
+        if any(
+            any(getattr(item, name) is None for item in group)
+            for name in optional_names
+        ):
+            raise ValueError("training windows require complete physics metadata")
         result.append(
             _Window(
                 torch.stack([item.features for item in group]),
                 torch.stack([item.target for item in group]),
                 torch.stack([item.mask for item in group]),
                 torch.stack([item.dt for item in group]),
+                vicon_position_m=torch.stack(
+                    [item.vicon_position_m for item in group]  # type: ignore[list-item]
+                ),
+                vicon_rotation_body_to_world=torch.stack(
+                    [item.vicon_rotation_body_to_world for item in group]  # type: ignore[list-item]
+                ),
+                vicon_velocity_mps=torch.stack(
+                    [item.vicon_velocity_mps for item in group]  # type: ignore[list-item]
+                ),
+                normalization_center=torch.stack(
+                    [item.normalization_center for item in group]  # type: ignore[list-item]
+                ),
+                normalization_scale=torch.stack(
+                    [item.normalization_scale for item in group]  # type: ignore[list-item]
+                ),
             )
         )
     return result
@@ -629,38 +691,151 @@ def _prediction(
     batch: _Window,
     *,
     reported_model: str | None = None,
+    raw: bool = False,
 ) -> torch.Tensor:
     del model_name
-    return model.predict(
-        batch.features, batch.mask, batch.dt, reported_model=reported_model
+    method = model.predict_raw if raw else model.predict
+    return method(batch.features, batch.mask, batch.dt, reported_model=reported_model)
+
+
+def _device_window(source: _Window, device: torch.device) -> _Window:
+    def move(value: torch.Tensor | None) -> torch.Tensor | None:
+        return None if value is None else value.to(device)
+
+    return _Window(
+        source.features.to(device),
+        source.target.to(device),
+        source.mask.to(device),
+        source.dt.to(device),
+        source.recording_index,
+        source.start,
+        move(source.vicon_position_m),
+        move(source.vicon_rotation_body_to_world),
+        move(source.vicon_velocity_mps),
+        move(source.normalization_center),
+        move(source.normalization_scale),
     )
 
 
-def _epoch_callbacks(model_name: str, device: torch.device):
+def _physics_loss_config(value: Mapping[str, Any] | None) -> PhysicsLossConfig:
+    if not isinstance(value, Mapping):
+        raise ValueError("physics_informed objective requires a physics mapping")
+    required = {
+        "lambda_physics",
+        "sigma_rotation_rad",
+        "sigma_velocity_mps",
+        "sigma_position_m",
+        "acceleration_mode",
+        "acceleration_unit",
+        "frame_validation_status",
+    }
+    missing = sorted(required - set(value))
+    if missing:
+        raise ValueError(f"physics config missing keys: {', '.join(missing)}")
+    lambda_physics = float(value["lambda_physics"])
+    if lambda_physics > 0.0 and value["frame_validation_status"] != "validated":
+        raise ValueError(
+            "non-zero physics loss is gated until clean-IMU/Vicon frame validation is marked validated"
+        )
+    return PhysicsLossConfig(
+        lambda_physics=lambda_physics,
+        sigma_rotation_rad=float(value["sigma_rotation_rad"]),
+        sigma_velocity_mps=float(value["sigma_velocity_mps"]),
+        sigma_position_m=float(value["sigma_position_m"]),
+        acceleration_mode=str(value["acceleration_mode"]),
+        acceleration_unit=str(value["acceleration_unit"]),
+    )
+
+
+def _require_physics_window(batch: _Window) -> None:
+    names = (
+        "vicon_position_m",
+        "vicon_rotation_body_to_world",
+        "vicon_velocity_mps",
+        "normalization_center",
+        "normalization_scale",
+    )
+    missing = [name for name in names if getattr(batch, name) is None]
+    if missing:
+        raise ValueError(f"physics batch missing fields: {', '.join(missing)}")
+
+
+def _endpoint_components(components: Mapping[str, torch.Tensor]) -> dict[str, float]:
+    return {
+        name: float(value.detach().cpu())
+        for name, value in components.items()
+        if name != "total"
+    }
+
+
+def _epoch_callbacks(
+    model_name: str,
+    device: torch.device,
+    *,
+    objective: str = "reconstruction_only",
+    physics: Mapping[str, Any] | None = None,
+):
+    if objective not in {"reconstruction_only", "physics_informed"}:
+        raise ValueError(f"unsupported training objective: {objective}")
+    criterion = (
+        IMUPhysicsInformedLoss(_physics_loss_config(physics))
+        if objective == "physics_informed"
+        else None
+    )
+
+    def loss_and_metrics(model: nn.Module, batch: _Window):
+        raw = _prediction(model_name, model, batch, raw=True)
+        if criterion is None:
+            loss = missing_mse(raw, batch.target, batch.mask)
+            return loss, {"signal": float(loss.detach().cpu()), "physics": 0.0}, raw
+        _require_physics_window(batch)
+        completed = complete_signal(batch.target, batch.mask, raw)
+        loss, components = criterion(
+            prediction=raw,
+            target=batch.target,
+            mask=batch.mask,
+            completed=completed,
+            dt=batch.dt,
+            normalization_center=batch.normalization_center,  # type: ignore[arg-type]
+            normalization_scale=batch.normalization_scale,  # type: ignore[arg-type]
+            vicon_position_m=batch.vicon_position_m,  # type: ignore[arg-type]
+            vicon_rotation_body_to_world=batch.vicon_rotation_body_to_world,  # type: ignore[arg-type]
+            vicon_velocity_mps=batch.vicon_velocity_mps,  # type: ignore[arg-type]
+        )
+        return loss, _endpoint_components(components), raw
+
     def train_epoch(
         model: nn.Module, optimizer: torch.optim.Optimizer, loader: Sequence[_Window], epoch: int
     ) -> Mapping[str, float]:
         del epoch
         model.train()
         errors: list[float] = []
+        logged: dict[str, list[float]] = {}
+        gradient_norms: list[float] = []
         for source in loader:
-            batch = _Window(
-                source.features.to(device),
-                source.target.to(device),
-                source.mask.to(device),
-                source.dt.to(device),
-            )
+            batch = _device_window(source, device)
             if model_name in {"linear", "locf"}:
                 with torch.no_grad():
                     value = missing_rmse(_prediction(model_name, model, batch), batch.target, batch.mask)
             else:
                 optimizer.zero_grad(set_to_none=True)
-                loss = missing_mse(_prediction(model_name, model, batch), batch.target, batch.mask)
+                loss, components, raw = loss_and_metrics(model, batch)
                 loss.backward()
+                squared = torch.zeros((), device=device)
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        squared = squared + parameter.grad.detach().square().sum()
+                gradient_norms.append(float(torch.sqrt(squared).cpu()))
                 optimizer.step()
-                value = torch.sqrt(loss.detach())
+                value = missing_rmse(raw.detach(), batch.target, batch.mask)
+                for name, component in components.items():
+                    logged.setdefault(name, []).append(component)
             errors.append(float(value.detach().cpu()))
-        return {"missing_rmse": float(np.mean(errors))}
+        result = {"missing_rmse": float(np.mean(errors))}
+        result.update({name: float(np.mean(values)) for name, values in logged.items()})
+        if gradient_norms:
+            result["gradient_norm"] = float(np.mean(gradient_norms))
+        return result
 
     def evaluate_epoch(
         model: nn.Module, loader: Sequence[_Window], epoch: int
@@ -668,30 +843,32 @@ def _epoch_callbacks(model_name: str, device: torch.device):
         del epoch
         model.eval()
         errors: list[float] = []
+        logged: dict[str, list[float]] = {}
         with torch.no_grad():
             for source in loader:
-                batch = _Window(
-                    source.features.to(device),
-                    source.target.to(device),
-                    source.mask.to(device),
-                    source.dt.to(device),
-                )
-                value = missing_rmse(
-                    _prediction(model_name, model, batch), batch.target, batch.mask
-                )
+                batch = _device_window(source, device)
+                raw = _prediction(model_name, model, batch, raw=True)
+                value = missing_rmse(raw, batch.target, batch.mask)
+                if criterion is not None:
+                    _, components, _ = loss_and_metrics(model, batch)
+                    for name, component in components.items():
+                        logged.setdefault(name, []).append(component)
                 errors.append(float(value.cpu()))
-        return {"missing_rmse": float(np.mean(errors))}
+        result = {"missing_rmse": float(np.mean(errors))}
+        result.update({name: float(np.mean(values)) for name, values in logged.items()})
+        return result
 
     return train_epoch, evaluate_epoch
 
 
 def _manifest_rows(
-    records: Sequence[Mapping[str, Any]], data_root: Path
+    records: Sequence[Mapping[str, Any]], data_root: Path, *, dataset_name: str = "oxiod"
 ) -> tuple[list[dict[str, str]], dict[str, Recording]]:
     rows: list[dict[str, str]] = []
     loaded: dict[str, Recording] = {}
     seen_sources: set[Path] = set()
     seen_ids: set[str] = set()
+    adapter = get_dataset_adapter(dataset_name)
     for item in records:
         if not isinstance(item, Mapping):
             raise ValueError("recordings entries must be mappings")
@@ -703,7 +880,7 @@ def _manifest_rows(
         if imu_path in seen_sources or vicon_path in seen_sources:
             raise ValueError("train/validation/test source files must be disjoint")
         seen_sources.update((imu_path, vicon_path))
-        recording = load_recording(imu_path, vicon_path)
+        recording = adapter.load(imu_path, vicon_path)
         if recording.id in seen_ids:
             raise ValueError("train/validation/test recording ids must be disjoint")
         seen_ids.add(recording.id)
@@ -738,11 +915,16 @@ def _split_content(rows: Sequence[Mapping[str, str]]) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
-def _scaler_content(scaler: RobustTrainScaler, *, split_hash: str) -> bytes:
+def _scaler_content(
+    scaler: RobustTrainScaler,
+    *,
+    split_hash: str,
+    channel_order: Sequence[str] = IMU_CHANNEL_NAMES,
+) -> bytes:
     value = {
         "center": scaler.center_.tolist(),
         "scale": scaler.scale_.tolist(),
-        "channel_order": list(IMU_CHANNEL_NAMES),
+        "channel_order": list(channel_order),
         "training_ids": list(scaler.training_ids),
         "split_hash": split_hash,
     }
@@ -767,7 +949,11 @@ def prepare_external_data(
         protocol=protocol,
         training_seed=seed,
     )
-    manifest_rows, loaded = _manifest_rows(records_config, data_root)
+    manifest_rows, loaded = _manifest_rows(
+        records_config,
+        data_root,
+        dataset_name=str(config.get("dataset_name", "oxiod")),
+    )
     split_content = _split_content(manifest_rows)
     split_hash = _sha256_bytes(split_content)
     recordings_by_split = {
@@ -783,7 +969,12 @@ def prepare_external_data(
         train_recordings,
         allowed_ids={recording.id for recording in train_recordings},
     )
-    scaler_content = _scaler_content(scaler, split_hash=split_hash)
+    adapter = get_dataset_adapter(str(config.get("dataset_name", "oxiod")))
+    scaler_content = _scaler_content(
+        scaler,
+        split_hash=split_hash,
+        channel_order=adapter.channel_names,
+    )
     return ExternalDataPreparation(
         manifest_rows=tuple(dict(row) for row in manifest_rows),
         recordings_by_split=recordings_by_split,
@@ -857,7 +1048,14 @@ def _trajectory_rows(
     complete_physical: np.ndarray,
     time_s: np.ndarray,
     recording: Recording,
+    acceleration_unit: str,
+    acceleration_mode: str,
 ) -> Mapping[str, float]:
+    diagnostic_mode = (
+        "gravity_removed"
+        if acceleration_mode == "gravity_compensated"
+        else acceleration_mode
+    )
     diagnostic = measured_attitude_full_record_diagnostic(
         complete_physical,
         prediction_physical,
@@ -869,11 +1067,13 @@ def _trajectory_rows(
             "quaternion_order": "xyzw",
             "quaternion_frame": "body_to_reference",
             "euler_order": "xyz",
-            "imu_acceleration_unit": "G",
-            "user_acceleration_semantics": "gravity_removed",
+            "imu_acceleration_unit": acceleration_unit,
+            "user_acceleration_semantics": diagnostic_mode,
             "position_unit": "m",
             "time_unit": "s",
         },
+        acceleration_unit=acceleration_unit,
+        acceleration_mode=diagnostic_mode,
     )
     names = ("ate_rmse_m", "rpe_rmse_m", "endpoint_drift_m", "velocity_rmse_mps")
     result = {name: float(diagnostic.imputed_metrics[name]) for name in names}
@@ -895,6 +1095,9 @@ def _evaluate_record(
     conditions: Sequence[Mapping[str, Any]],
     seed: int,
     trajectory_enabled: bool,
+    physics_diagnostics_enabled: bool,
+    acceleration_unit: str,
+    acceleration_mode: str,
     seq_len: int,
     batch_size: int,
 ):
@@ -905,6 +1108,18 @@ def _evaluate_record(
         model.load_state_dict(state)
         model.to(device).eval()
         rows: list[dict[str, Any]] = []
+        irregular_condition_count = len(
+            {
+                (
+                    condition.get("irregular_method"),
+                    condition.get("requested_irregularity"),
+                    condition.get("value_topology"),
+                    condition.get("value_requested_fraction"),
+                )
+                for condition in conditions
+                if condition.get("case_type", "missingness") == "irregular"
+            }
+        )
         for condition in conditions:
             reported_model = str(condition.get("model", model_name))
             is_irregular = condition.get("case_type", "missingness") == "irregular"
@@ -915,6 +1130,10 @@ def _evaluate_record(
                 rate = float(condition.get("value_requested_fraction"))
                 irregularity = float(condition.get("requested_irregularity"))
                 topology_label = f"irregular:interval_jitter+{topology}"
+                if irregular_condition_count > 1:
+                    topology_label = (
+                        f"irregular:interval_jitter@{irregularity:g}+{topology}"
+                    )
             else:
                 topology = str(condition["topology"])
                 rate = float(condition["requested_fraction"])
@@ -960,6 +1179,36 @@ def _evaluate_record(
                         complete_physical=scaler.inverse_transform(target_values),
                         time_s=time_s,
                         recording=recording,
+                        acceleration_unit=acceleration_unit,
+                        acceleration_mode=acceleration_mode,
+                    )
+                )
+            if physics_diagnostics_enabled:
+                synchronized = synchronize_vicon_to_imu(
+                    recording.vicon_time_s,
+                    recording.vicon_position_m,
+                    recording.vicon_quaternion_xyzw,
+                    time_s,
+                    frame_metadata={
+                        "quaternion_order": "xyzw",
+                        "quaternion_frame": "body_to_reference",
+                        "euler_order": "xyz",
+                    },
+                )
+                dt_values = np.empty_like(time_s, dtype=np.float64)
+                dt_values[1:] = np.diff(time_s)
+                dt_values[0] = dt_values[1]
+                metric_values.update(
+                    physics_endpoint_diagnostics(
+                        scaler.inverse_transform(prediction),
+                        scaler.inverse_transform(target_values),
+                        mask_values,
+                        dt_values,
+                        synchronized.position_m,
+                        synchronized.rotation_body_to_world,
+                        synchronized.velocity_world_mps,
+                        acceleration_unit=acceleration_unit,
+                        acceleration_mode=acceleration_mode,
                     )
                 )
             base = {
@@ -1083,11 +1332,42 @@ def run_smoke(
         raise ValueError("each training group requires at least one missingness condition")
     rate = float(training_condition["requested_fraction"])
     topology = str(training_condition["topology"])
-    if config.get("objective") != "reconstruction_only":
-        raise ValueError("smoke primary objective must be reconstruction_only")
+    objective = str(config.get("objective", "reconstruction_only"))
+    if objective not in {"reconstruction_only", "physics_informed"}:
+        raise ValueError("unsupported smoke objective")
+    if objective == "physics_informed" and any(
+        model in {"linear", "locf"} for model in models
+    ):
+        raise ValueError("parameter-free baselines cannot optimize physics_informed loss")
     if bool(config.get("kinematic_ablation", {}).get("enabled", False)):
         raise ValueError("kinematic_ablation must be disabled for smoke")
     trajectory_enabled = bool(config.get("trajectory_enabled", False))
+    physics_mapping = config.get("physics")
+    physics_diagnostics_enabled = objective == "physics_informed" or bool(
+        config.get("physics_diagnostics_enabled", False)
+    )
+    dataset_name = str(config.get("dataset_name", "oxiod"))
+    adapter = get_dataset_adapter(dataset_name)
+    acceleration_unit = (
+        str(physics_mapping.get("acceleration_unit", adapter.semantics.acceleration_unit))
+        if isinstance(physics_mapping, Mapping)
+        else adapter.semantics.acceleration_unit
+    )
+    acceleration_mode = (
+        str(physics_mapping.get("acceleration_mode", adapter.semantics.acceleration_mode))
+        if isinstance(physics_mapping, Mapping)
+        else adapter.semantics.acceleration_mode
+    )
+    if acceleration_unit != adapter.semantics.acceleration_unit:
+        raise ValueError(
+            f"physics acceleration_unit={acceleration_unit!r} conflicts with "
+            f"{dataset_name} adapter semantics {adapter.semantics.acceleration_unit!r}"
+        )
+    if acceleration_mode != adapter.semantics.acceleration_mode:
+        raise ValueError(
+            f"physics acceleration_mode={acceleration_mode!r} conflicts with "
+            f"{dataset_name} adapter semantics {adapter.semantics.acceleration_mode!r}"
+        )
     device = _device(requested_device or str(config.get("device", "auto")))
     _set_seed(seed)
 
@@ -1105,7 +1385,11 @@ def run_smoke(
         protocol=str(training_condition.get("protocol", "strict_file")),
         training_seed=seed,
     )
-    manifest_rows, loaded = _manifest_rows(records_config, data_root)
+    manifest_rows, loaded = _manifest_rows(
+        records_config,
+        data_root,
+        dataset_name=dataset_name,
+    )
     split_content = _split_content(manifest_rows)
     split_hash = _sha256_bytes(split_content)
     grouped_execution = bool(config.get("_skip_descriptive_summary", False))
@@ -1120,7 +1404,11 @@ def run_smoke(
     scaler = RobustTrainScaler.fit(
         by_split["train"], allowed_ids={recording.id for recording in by_split["train"]}
     )
-    scaler_content = _scaler_content(scaler, split_hash=split_hash)
+    scaler_content = _scaler_content(
+        scaler,
+        split_hash=split_hash,
+        channel_order=adapter.channel_names,
+    )
     scaler_hash = _sha256_bytes(scaler_content)
     scaler_name = f"scaler-{scaler_hash}.json" if grouped_execution else "scaler.json"
     _write_stable(destination / scaler_name, scaler_content)
@@ -1178,7 +1466,12 @@ def run_smoke(
         optimizer = torch.optim.Adam(
             model.parameters(), lr=float(config.get("learning_rate", 0.001))
         )
-        train_epoch, validation_epoch = _epoch_callbacks(model_name, device)
+        train_epoch, validation_epoch = _epoch_callbacks(
+            model_name,
+            device,
+            objective=objective,
+            physics=config.get("physics"),
+        )
         if (run_dir / "checkpoint.json").is_file():
             metadata = json.loads(
                 (run_dir / "checkpoint.json").read_text(encoding="utf-8")
@@ -1216,6 +1509,9 @@ def run_smoke(
                     conditions=conditions,
                     seed=seed,
                     trajectory_enabled=trajectory_enabled,
+                    physics_diagnostics_enabled=physics_diagnostics_enabled,
+                    acceleration_unit=acceleration_unit,
+                    acceleration_mode=acceleration_mode,
                     seq_len=seq_len,
                     batch_size=batch_size,
                 ),
@@ -1317,6 +1613,7 @@ __all__ = [
     "ExternalDataPreparation",
     "build_execution_model",
     "discover_oxiod_pairs",
+    "discover_dataset_pairs",
     "prepare_external_data",
     "prepare_external_sequence",
     "prepare_external_windows",

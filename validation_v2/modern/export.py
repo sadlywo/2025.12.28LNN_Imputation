@@ -168,14 +168,20 @@ def export_modern_dataset(
         for topology in config.topologies
         for rate in config.rates
     ]
-    if config.irregular_cases:
+    for case in config.irregular_case_specs:
+        irregularity = float(case["requested_irregularity"])
+        value_topology = str(case["value_topology"])
+        value_fraction = float(case["value_requested_fraction"])
         conditions.append(
             {
-                "condition_id": "irregular-interval-jitter-point-30pct",
+                "condition_id": (
+                    f"irregular-interval-jitter-{int(round(irregularity * 100)):02d}pct-"
+                    f"{value_topology}-{int(round(value_fraction * 100)):02d}pct"
+                ),
                 "case_type": "irregular",
-                "topology": "point",
-                "requested_fraction": 0.3,
-                "requested_irregularity": 0.2,
+                "topology": value_topology,
+                "requested_fraction": value_fraction,
+                "requested_irregularity": irregularity,
             }
         )
 

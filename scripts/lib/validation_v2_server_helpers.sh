@@ -82,6 +82,12 @@ launch_shard() {
     echo "shard index outside formal plan: $shard" >&2
     return 2
   fi
+  local gpu_count="${VALIDATION_V2_GPU_COUNT:-1}"
+  if ! [[ "$gpu_count" =~ ^[1-9][0-9]*$ ]]; then
+    echo "invalid VALIDATION_V2_GPU_COUNT: $gpu_count" >&2
+    return 2
+  fi
+  local gpu_index=$((index % gpu_count))
   if test -z "${CONFIG-}" -o ! -r "${CONFIG-}"; then
     echo "CONFIG is missing or unreadable: ${CONFIG-}" >&2
     return 2
@@ -137,7 +143,7 @@ launch_shard() {
     rmdir "$reservation" 2>/dev/null || true
     return 2
   fi
-  nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+  nohup env CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDA_VISIBLE_DEVICES="$gpu_index" \
     "$PYTHON_BIN" -m validation_v2.cli shard \
     --config "$CONFIG" --plan "$PLAN" --shard-index "$index" \
     --output-root "$output_root" --device cuda \

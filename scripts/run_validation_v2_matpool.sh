@@ -539,7 +539,7 @@ STATE_FILE="$STATE_DIR/current.json"
 START_LOCK_DIR="$STATE_DIR/start.lock"
 START_LOCK_HELD=0
 GENERIC_RUNNER="$REPO/scripts/run_validation_v2_server.sh"
-MAX_WORKERS=4
+MAX_WORKERS=2
 SKIP_DEPENDENCY_INSTALL=false
 
 [[ "$#" -gt 0 ]] || die 'command is required; use --help for usage'

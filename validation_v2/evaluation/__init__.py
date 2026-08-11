@@ -1,6 +1,7 @@
 """Physical-coordinate reconstruction and full-record trajectory evaluation."""
 
 from .reconstruction import reconstruction_metrics
+from .physics import physics_endpoint_diagnostics
 from .synchronization import SynchronizedVicon, synchronize_vicon_to_imu
 from .trajectory import (
     DiagnosticResult,
@@ -17,6 +18,7 @@ __all__ = [
     "Trajectory",
     "integrate_acceleration",
     "measured_attitude_full_record_diagnostic",
+    "physics_endpoint_diagnostics",
     "reconstruction_metrics",
     "rotate_body_to_world",
     "synchronize_vicon_to_imu",

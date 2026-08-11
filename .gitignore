@@ -1,14 +1,27 @@
 .worktrees/
 .venv-server/
-results/validation_v2/
-results/physics_loss_refactor/v1/diagnostics/*.json
-results/physics_loss_refactor/v1/diagnostics/*.md
-results/physics_loss_refactor/v1/runs/
+.venv-modern-pypots/
+.venv-modern-sssd/
 __pycache__/
 .pytest_cache/
 .validation-v2-matpool/
+.modern-campaign/
 .superpowers/
 .DS_Store
+
+# Generated experiment outputs stay local or on persistent cloud storage.
+/results/*
+!/results/README.md
+!/results/legacy_archive/
+!/results/physics_loss_refactor/
+/results/legacy_archive/*
+!/results/legacy_archive/README.md
+/results/physics_loss_refactor/*
+!/results/physics_loss_refactor/README.md
+
+# Keep one publication figure tree with filenames that do not use underscores.
+/figures/three_dataset_trajectories/
+/figures/ThreeDatasetTrajectories/*.tiff
 
 # Local datasets: keep documentation/manifests, never commit raw payloads.
 /Oxford Dataset/

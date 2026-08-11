@@ -1,3 +1,0 @@
-model,input_dim,best_epoch,best_val_rmse_missing,parameters,state_dict_size_mb,checkpoint_file_size_mb,avg_forward_ms_per_batch,throughput_samples_per_sec,train_time_sec,checkpoint_path,device
-GRU_43d,43,20,0.354397524331595,92364,0.3523406982421875,0.35653209686279297,0.2960694953799248,108082.73226168299,687.0536818504333,results/train_43d_gru_transformer/best_model_GRU_43d_20260326_131911.pt,cuda
-Transformer_43d,43,18,0.3969589339887694,428108,1.6331024169921875,1.6462116241455078,0.6708788871765137,47698.62431455611,951.1081848144531,results/train_43d_gru_transformer/best_model_Transformer_43d_20260326_131911.pt,cuda

@@ -49,3 +49,22 @@ powershell -ExecutionPolicy Bypass -File scripts/package_minimal_dataset.ps1
 
 The generated archive, SHA-256 checksum, and JSON package manifest are written
 under `transfer/`, which is intentionally ignored by Git.
+
+After uploading the archive and its `.sha256` sidecar to a Linux server,
+restore it from the cloned repository root:
+
+```bash
+cd /root/workspace/lnn-imputation
+DATA_BUNDLE_DIR=/path/to/uploaded-bundle
+(cd "$DATA_BUNDLE_DIR" && \
+  sha256sum -c lnn-imputation-data-minimal-v1.tar.zst.sha256)
+tar --use-compress-program=unzstd \
+  -xf "$DATA_BUNDLE_DIR/lnn-imputation-data-minimal-v1.tar.zst" -C .
+
+python run.py smoke --config euroc_adapter_smoke.yaml --device cuda
+python run.py smoke --config idol_adapter_smoke.yaml --device cuda
+```
+
+The IDOL adapter reads the three ZIP files directly. The bundle already
+contains the initialized EuRoC sensor/ground-truth subset, so the full EuRoC
+camera archives are not required on the server.

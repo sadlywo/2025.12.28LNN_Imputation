@@ -16,16 +16,29 @@ def _frozen_array(value: np.ndarray) -> np.ndarray:
 
 @dataclass(frozen=True, init=False, repr=False, eq=False)
 class SynchronizedVicon:
-    """Vicon pose sampled exactly at the returned query timestamps."""
+    """Vicon pose/velocity sampled exactly at the returned IMU timestamps."""
 
     _time_s: np.ndarray = field(repr=False)
     _position_m: np.ndarray = field(repr=False)
     _quaternion_xyzw: np.ndarray = field(repr=False)
+    _rotation_body_to_world: np.ndarray = field(repr=False)
+    _velocity_world_mps: np.ndarray = field(repr=False)
 
-    def __init__(self, time_s: np.ndarray, position_m: np.ndarray, quaternion_xyzw: np.ndarray) -> None:
+    def __init__(
+        self,
+        time_s: np.ndarray,
+        position_m: np.ndarray,
+        quaternion_xyzw: np.ndarray,
+        rotation_body_to_world: np.ndarray,
+        velocity_world_mps: np.ndarray,
+    ) -> None:
         object.__setattr__(self, "_time_s", _frozen_array(time_s))
         object.__setattr__(self, "_position_m", _frozen_array(position_m))
         object.__setattr__(self, "_quaternion_xyzw", _frozen_array(quaternion_xyzw))
+        object.__setattr__(
+            self, "_rotation_body_to_world", _frozen_array(rotation_body_to_world)
+        )
+        object.__setattr__(self, "_velocity_world_mps", _frozen_array(velocity_world_mps))
 
     @property
     def time_s(self) -> np.ndarray:
@@ -38,6 +51,37 @@ class SynchronizedVicon:
     @property
     def quaternion_xyzw(self) -> np.ndarray:
         return self._quaternion_xyzw.copy()
+
+    @property
+    def rotation_body_to_world(self) -> np.ndarray:
+        return self._rotation_body_to_world.copy()
+
+    @property
+    def velocity_world_mps(self) -> np.ndarray:
+        return self._velocity_world_mps.copy()
+
+
+def position_velocity(position_m: np.ndarray, time_s: np.ndarray) -> np.ndarray:
+    """Differentiate aligned position with central interior differences."""
+
+    position = np.asarray(position_m, dtype=np.float64)
+    time = np.asarray(time_s, dtype=np.float64)
+    if position.ndim != 2 or position.shape[1] != 3 or time.shape != (len(position),):
+        raise ValueError("position/time must have shapes (T,3) and (T,)")
+    if len(position) < 1 or not np.all(np.isfinite(position)):
+        raise ValueError("position requires at least one finite sample")
+    if not np.all(np.isfinite(time)) or np.any(np.diff(time) <= 0):
+        raise ValueError("time must be finite, increasing seconds")
+    if len(position) == 1:
+        return np.zeros_like(position)
+    velocity = np.empty_like(position)
+    velocity[0] = (position[1] - position[0]) / (time[1] - time[0])
+    velocity[-1] = (position[-1] - position[-2]) / (time[-1] - time[-2])
+    if len(position) > 2:
+        velocity[1:-1] = (position[2:] - position[:-2]) / (
+            time[2:] - time[:-2]
+        )[:, None]
+    return velocity
 
 
 def validate_attitude_metadata(frame_metadata: Mapping[str, object]) -> None:
@@ -99,8 +143,16 @@ def synchronize_vicon_to_imu(
         raise ValueError("source_quaternion_xyzw must have shape (N, 4)")
     if not np.all(np.isfinite(position)) or not np.all(np.isfinite(quaternion)):
         raise ValueError("source pose must contain only finite values")
-    if not np.allclose(np.linalg.norm(quaternion, axis=1), 1.0, atol=1e-6, rtol=0.0):
-        raise ValueError("source_quaternion_xyzw must contain unit quaternions")
+    norms = np.linalg.norm(quaternion, axis=1, keepdims=True)
+    if np.any(norms <= np.finfo(np.float64).eps):
+        raise ValueError("source_quaternion_xyzw must have positive norms")
+    quaternion = quaternion / norms
+    # q and -q are the same attitude.  Enforce a continuous shortest-path
+    # representation before SLERP so source sign jumps cannot create artifacts.
+    quaternion = quaternion.copy()
+    for index in range(1, len(quaternion)):
+        if np.dot(quaternion[index - 1], quaternion[index]) < 0:
+            quaternion[index] *= -1.0
 
     interpolated_position = np.column_stack(
         [np.interp(query_time, source_time, position[:, axis]) for axis in range(3)]
@@ -108,4 +160,19 @@ def synchronize_vicon_to_imu(
     rotations = Slerp(source_time, Rotation.from_quat(quaternion))(query_time)
     interpolated_quaternion = rotations.as_quat()
     interpolated_quaternion /= np.linalg.norm(interpolated_quaternion, axis=1, keepdims=True)
-    return SynchronizedVicon(query_time, interpolated_position, interpolated_quaternion)
+    velocity = position_velocity(interpolated_position, query_time)
+    return SynchronizedVicon(
+        query_time,
+        interpolated_position,
+        interpolated_quaternion,
+        rotations.as_matrix(),
+        velocity,
+    )
+
+
+__all__ = [
+    "SynchronizedVicon",
+    "position_velocity",
+    "synchronize_vicon_to_imu",
+    "validate_attitude_metadata",
+]

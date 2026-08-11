@@ -10,7 +10,7 @@ REFERENCE_MODELS = ("linear", "locf", "bilstm", "bilnn", "hybrid")
 MODERN_MODELS = ("brits", "saits", "csdi", "sssd")
 ALL_MODELS = REFERENCE_MODELS + MODERN_MODELS
 
-_KEYS = {
+_REQUIRED_KEYS = {
     "data_root",
     "output_root",
     "protocol",
@@ -31,6 +31,8 @@ _KEYS = {
     "max_eval_samples",
     "trajectory_enabled",
 }
+_OPTIONAL_KEYS = {"dataset_name"}
+_KEYS = _REQUIRED_KEYS | _OPTIONAL_KEYS
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,8 @@ class ModernConfig:
     max_train_windows: int
     max_eval_samples: int | None
     trajectory_enabled: bool
+    dataset_name: str = "oxiod"
+    irregular_case_specs: tuple[dict[str, object], ...] = ()
 
 
 def load_modern_config(path: Path | str) -> ModernConfig:
@@ -66,7 +70,7 @@ def load_modern_config(path: Path | str) -> ModernConfig:
     unknown = sorted(set(raw) - _KEYS)
     if unknown:
         raise ValueError(f"unknown config keys: {', '.join(unknown)}")
-    missing = sorted(_KEYS - set(raw))
+    missing = sorted(_REQUIRED_KEYS - set(raw))
     if missing:
         raise ValueError(f"missing config keys: {', '.join(missing)}")
 
@@ -93,6 +97,8 @@ def load_modern_config(path: Path | str) -> ModernConfig:
             None if max_eval_samples is None else int(max_eval_samples)
         ),
         trajectory_enabled=bool(raw["trajectory_enabled"]),
+        dataset_name=str(raw.get("dataset_name", "oxiod")),
+        irregular_case_specs=tuple(dict(item) for item in raw["irregular_cases"]),
     )
 
     if config.protocol != "strict_file" or config.seq_len != 30:
@@ -105,6 +111,15 @@ def load_modern_config(path: Path | str) -> ModernConfig:
         raise ValueError("unsupported missingness topology")
     if any(rate <= 0.0 or rate >= 1.0 for rate in config.rates):
         raise ValueError("missingness rates must be between 0 and 1")
+    for case in config.irregular_case_specs:
+        if case.get("method") != "interval_jitter":
+            raise ValueError("modern irregular cases require interval_jitter")
+        irregularity = float(case.get("requested_irregularity", -1.0))
+        value_rate = float(case.get("value_requested_fraction", -1.0))
+        if not 0.0 < irregularity < 1.0 or not 0.0 < value_rate < 1.0:
+            raise ValueError("irregularity and value missing fraction must be in (0,1)")
+        if case.get("value_topology") not in {"point", "block", "channel"}:
+            raise ValueError("unsupported irregular-case value topology")
     if min(
         config.batch_size,
         config.epochs,

@@ -32,8 +32,8 @@ def test_server_runbook_uses_the_delivered_validation_branch() -> None:
         encoding="utf-8"
     )
 
-    assert "git checkout codex/validation-v2" in runbook
-    assert "git pull --ff-only origin codex/validation-v2" in runbook
+    assert "--branch codex/physics-loss-refactor" in runbook
+    assert "sadlywo/2025.12.28LNN_Imputation.git" in runbook
     assert "validation-v2-server" not in runbook
 
 
@@ -60,9 +60,9 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
 
     for runbook in (english, chinese):
         assert "CPython 3.10" in runbook and "3.12" in runbook
-        assert "torch==2.3.1+cu121" in runbook
+        assert "torch==2.11.0+cu128" in runbook
         assert all(command in runbook for command in matpool_commands)
-        assert "--max-workers 8" in runbook
+        assert "--max-workers 2" in runbook
         assert "--skip-dependency-install" in runbook
         assert generic_preflight in runbook
         assert generic_full in runbook
@@ -76,7 +76,7 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
         matpool_start = next(
             block
             for block in bash_blocks
-            if "cd /2025.12.28LNN_Imputation" in block
+            if "cd /root/workspace/lnn-imputation" in block
             and "run_validation_v2_matpool.sh start" in block
         )
         assert [
@@ -129,7 +129,7 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
     chinese_current = chinese.split("## 历史资料", 1)[0]
     for current in (english_current, chinese_current):
         assert re.search(
-            r"(?:default|默认).{0,40}(4|four).{0,100}(8|eight|八).{0,30}(?:shards|分片)",
+            r"(?:default|默认).{0,50}(2|two|两).{0,120}(8|eight|八).{0,30}(?:shards|分片)",
             current,
             re.I | re.S,
         )
@@ -137,14 +137,14 @@ def test_server_runbooks_document_the_current_matpool_operations_contract() -> N
         assert not re.search(r"(?:only|唯一).{0,30}Python 3\.12", current, re.I | re.S)
         assert not re.search(r"(?:4090D-only|仅支持.{0,20}4090D)", current, re.I | re.S)
 
-    assert re.search(r"RTX 4090\s+series", english_current)
-    assert re.search(r"RTX 4090\s+系列", chinese_current)
-    assert re.search(r"not exclusive\s+requirements", english_current)
-    assert "不是唯一要求" in chinese_current
-    assert "cd /2025.12.28LNN_Imputation" in english
+    assert "RTX 4090/4090D/5090" in english_current
+    assert "RTX 4090、4090D 或 5090" in chinese_current
+    assert "two RTX 5090" in english_current
+    assert "两张 RTX 5090" in chinese_current
+    assert "cd /root/workspace/lnn-imputation" in english
     assert re.search(r"exact\s+(?:40-character\s+)?commit", english)
     assert "preflight" in english and "full" in english
-    assert "/2025.12.28LNN_Imputation" in chinese
+    assert "/root/workspace/lnn-imputation" in chinese
     assert "预检" in chinese and "完成判据" in chinese and "失败诊断" in chinese
     assert "pinn_imu" not in chinese
     assert "network_turbo" not in chinese
@@ -209,8 +209,12 @@ def _runbook_bash_function(runbook: str, name: str) -> str:
 
 
 def _run_bash(tmp_path: Path, source: str, *, timeout: float = 10) -> subprocess.CompletedProcess:
-    git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
-    bash = str(git_bash) if git_bash.is_file() else shutil.which("bash")
+    candidates = [Path(r"C:\Program Files\Git\bin\bash.exe")]
+    git = shutil.which("git")
+    if git:
+        candidates.insert(0, Path(git).resolve().parents[1] / "bin" / "bash.exe")
+    git_bash = next((path for path in candidates if path.is_file()), None)
+    bash = str(git_bash) if git_bash is not None else shutil.which("bash")
     assert bash is not None
     script = tmp_path / "runbook-contract.sh"
     script.write_bytes(source.encode("utf-8"))
@@ -222,6 +226,7 @@ def _run_bash(tmp_path: Path, source: str, *, timeout: float = 10) -> subprocess
             str(timeout), script.as_posix(),
         ],
         cwd=tmp_path, env=environment, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
         timeout=timeout + 5, check=False,
     )
 
@@ -243,7 +248,7 @@ def test_matpool_runbook_gate_failure_never_calls_start(
     block = next(
         candidate
         for candidate in re.findall(r"```bash\n(.*?)\n```", current, re.DOTALL)
-        if "cd /2025.12.28LNN_Imputation" in candidate
+        if "cd /root/workspace/lnn-imputation" in candidate
         and "run_validation_v2_matpool.sh start" in candidate
     )
     start_command = "bash scripts/run_validation_v2_matpool.sh start"
