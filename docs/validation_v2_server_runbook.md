@@ -8,6 +8,13 @@ diagnostic only.
 
 ## Current supported execution path
 
+> **Migration gate:** `configs/validation_v2/server_full.yaml` still describes
+> the legacy OxIOD-only formal matrix. The runner and two-GPU operations below
+> are validated, but that configuration does not yet satisfy the requested
+> joint OxIOD + EuRoC MAV + IDOL training protocol. Do not spend a paid formal
+> campaign on it as the final three-dataset paper result; use it only for
+> runner diagnostics until the joint campaign configuration is delivered.
+
 The supported runtime is Linux with generic CPython 3.10–3.12 and one or more
 RTX 4090/4090D/5090 GPUs. Every supported Python minor uses the same locked
 CUDA build, `torch==2.11.0+cu128`, and the same validation dependency lock.
