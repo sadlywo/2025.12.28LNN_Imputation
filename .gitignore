@@ -1,7 +1,20 @@
 .worktrees/
 .venv-server/
 results/validation_v2/
+results/physics_loss_refactor/v1/diagnostics/*.json
+results/physics_loss_refactor/v1/diagnostics/*.md
+results/physics_loss_refactor/v1/runs/
 __pycache__/
 .pytest_cache/
 .validation-v2-matpool/
 .superpowers/
+.DS_Store
+
+# Local datasets: keep documentation/manifests, never commit raw payloads.
+/Oxford Dataset/
+datasets/raw/
+datasets/processed/
+datasets/cache/
+
+# Reproducible cloud-transfer packages are generated locally.
+/transfer/
