@@ -606,6 +606,7 @@ def _run_formal_campaign_contract(
             "PLAN": "plan.json",
             "MAX_WORKERS": str(max_workers),
             "VALIDATION_V2_DIRECT_PARALLEL": "1" if direct_parallel else "0",
+            "SHARDS_LAUNCHED": "0",
             "STAGE2_RC": str(stage2_rc),
             "STAGE4_RC": str(stage4_rc),
             "STAGE8_RC": str(stage8_rc),

@@ -430,6 +430,7 @@ run_formal_campaign() {
     local direct_rc=0
     date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/direct-parallel-start.txt"
     start_managed_sampler direct-parallel
+    SHARDS_LAUNCHED=1
     run_queue "$MAX_WORKERS" 000 001 002 003 004 005 006 007 || direct_rc=$?
     stop_managed_sampler direct-parallel
     (( direct_rc == 0 )) || return "$direct_rc"
