@@ -554,6 +554,7 @@ def _run_formal_campaign_contract(
     tmp_path: Path,
     max_workers: int,
     *,
+    direct_parallel: bool = False,
     stage2_rc: int = 0,
     stage4_rc: int = 0,
     stage8_rc: int = 0,
@@ -604,6 +605,7 @@ def _run_formal_campaign_contract(
             "CONFIG": "config.yaml",
             "PLAN": "plan.json",
             "MAX_WORKERS": str(max_workers),
+            "VALIDATION_V2_DIRECT_PARALLEL": "1" if direct_parallel else "0",
             "STAGE2_RC": str(stage2_rc),
             "STAGE4_RC": str(stage4_rc),
             "STAGE8_RC": str(stage8_rc),
@@ -614,6 +616,23 @@ def _run_formal_campaign_contract(
     )
     assert completed.returncode == expected_rc, completed.stderr
     return log.read_text(encoding="utf-8").splitlines()
+
+
+def test_formal_campaign_can_start_all_matpool_workers_immediately(
+    tmp_path: Path,
+) -> None:
+    events = _run_formal_campaign_contract(
+        tmp_path,
+        2,
+        direct_parallel=True,
+    )
+
+    assert events == [
+        "start direct-parallel",
+        "queue 2 000 001 002 003 004 005 006 007",
+        "stop direct-parallel",
+        "wait-all 000 001 002 003 004 005 006 007",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -419,19 +419,35 @@ run_formal_campaign() {
   local requested_mode="$1"
   [[ "$requested_mode" == full ]] || return 0
 
-  start_managed_sampler baseline-1worker
-  launch_formal_shard 000
-  wait_until_groups 000 2
-  local baseline_start
-  baseline_start="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["started_at"])' "$SHARDS_ROOT/000/shard_execution.json")"
-  wait_stage_metrics baseline-1worker "$baseline_start" "" \
-    "$AUDIT_DIR/baseline-1worker.json" 2 000
-  stop_managed_sampler baseline-1worker
-
-  if (( MAX_WORKERS == 1 )); then
-    wait_shard 000
-    run_queue 1 001 002 003 004 005 006 007
+  # MatPool hosts are provisioned with a known, fixed GPU count.  Their launcher
+  # opts into direct sharding so that small recurrent models and CPU-heavy
+  # evaluation do not leave the second GPU idle behind the rollout benchmark.
+  # The staged rollout remains the fail-closed default for generic hosts.
+  local direct_parallel="${VALIDATION_V2_DIRECT_PARALLEL:-0}"
+  [[ "$direct_parallel" == 0 || "$direct_parallel" == 1 ]] \
+    || { echo 'VALIDATION_V2_DIRECT_PARALLEL must be 0 or 1' >&2; return 2; }
+  if (( direct_parallel )); then
+    local direct_rc=0
+    date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/direct-parallel-start.txt"
+    start_managed_sampler direct-parallel
+    run_queue "$MAX_WORKERS" 000 001 002 003 004 005 006 007 || direct_rc=$?
+    stop_managed_sampler direct-parallel
+    (( direct_rc == 0 )) || return "$direct_rc"
   else
+
+    start_managed_sampler baseline-1worker
+    launch_formal_shard 000
+    wait_until_groups 000 2
+    local baseline_start
+    baseline_start="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["started_at"])' "$SHARDS_ROOT/000/shard_execution.json")"
+    wait_stage_metrics baseline-1worker "$baseline_start" "" \
+      "$AUDIT_DIR/baseline-1worker.json" 2 000
+    stop_managed_sampler baseline-1worker
+
+    if (( MAX_WORKERS == 1 )); then
+      wait_shard 000
+      run_queue 1 001 002 003 004 005 006 007
+    else
     date -u +%Y-%m-%dT%H:%M:%S+00:00 | tee "$AUDIT_DIR/stage-2worker-start.txt"
     local stage2_start stage2_rc
     stage2_start="$(cat "$AUDIT_DIR/stage-2worker-start.txt")"
@@ -512,6 +528,7 @@ run_formal_campaign() {
           *) echo "unexpected eight-worker monitor status: $stage8_rc" >&2; return 3 ;;
         esac
       fi
+    fi
     fi
   fi
 

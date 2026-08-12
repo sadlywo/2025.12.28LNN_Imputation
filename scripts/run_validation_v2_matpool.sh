@@ -358,6 +358,7 @@ write_command_file() {
     printf '%s\n' 'umask 077'
     printf 'cd -- %q\n' "$REPO"
     printf '%s\n' 'set +e'
+    printf '%s\n' 'export VALIDATION_V2_DIRECT_PARALLEL=1'
     printf '%q ' "$GENERIC_RUNNER" --commit "$COMMIT" --mode full \
       --campaign-suffix "$CAMPAIGN_SUFFIX" --max-workers "$MAX_WORKERS"
     if [[ "$SKIP_DEPENDENCY_INSTALL" == true ]]; then
