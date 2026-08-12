@@ -106,7 +106,7 @@ def _tune(config_path: Path, output: Path, pypots_python: Path, sssd_python: Pat
     validation_base = dataset / "validation"
     validation_arrays, validation_manifest = read_array_artifact(validation_base, expected_kind="dataset")
     results: dict[str, list[dict[str, object]]] = {}
-    for model in ("brits", "saits", "csdi", "sssd"):
+    for model in (model for model in config.models if model in {"brits", "saits", "csdi", "sssd"}):
         results[model] = []
         for candidate in candidates(model):
             work = output / "tuning" / model / str(candidate["configuration_id"])
@@ -162,9 +162,8 @@ def _run_modern(config_path: Path, output: Path, pypots_python: Path, sssd_pytho
     for seed in config.seeds:
         dataset = output / "datasets" / str(seed)
         scaler = json.loads((dataset / "scaler.json").read_text(encoding="utf-8"))
-        scale = np.asarray(scaler["scale"], dtype=np.float64)
         dataset_manifest = json.loads((dataset / "dataset_manifest.json").read_text(encoding="utf-8"))
-        for model in ("brits", "saits", "csdi", "sssd"):
+        for model in (model for model in config.models if model in {"brits", "saits", "csdi", "sssd"}):
             configuration = lock["selected"][model]
             work = output / "formal" / str(seed) / model
             work.mkdir(parents=True, exist_ok=True)
@@ -194,6 +193,13 @@ def _run_modern(config_path: Path, output: Path, pypots_python: Path, sssd_pytho
                 target = _stitch_static(data["X_ori"], starts, length)
                 mask = np.rint(_stitch_static(data["mask"], starts, length)).astype(np.uint8)
                 condition = data_meta["metadata"]["condition"]; recording = data_meta["metadata"]["recording_id"]
+                recording_dataset = data_meta["metadata"]["dataset"]
+                scale_payload = (
+                    scaler["datasets"][recording_dataset]
+                    if scaler.get("schema_version") == 2
+                    else scaler
+                )
+                scale = np.asarray(scale_payload["scale"], dtype=np.float64)
                 mean = samples.mean(axis=0); missing = mask == 0
                 error = mean - target
                 metrics = {
@@ -204,7 +210,7 @@ def _run_modern(config_path: Path, output: Path, pypots_python: Path, sssd_pytho
                     coverage, width = interval_metrics(samples, target, mask, level=0.95)
                     metrics.update(crps=empirical_crps(samples, target, mask), coverage_95=coverage, width_95=width)
                 for metric, value in metrics.items():
-                    rows.append({"model": model, "seed": seed, "recording_id": recording,
+                    rows.append({"model": model, "seed": seed, "dataset": recording_dataset, "recording_id": recording,
                         "condition_id": condition["condition_id"], "metric": metric, "value": value,
                         "checkpoint_sha256": pred_meta["metadata"]["checkpoint_sha256"],
                         "dataset_artifact_id": data_meta["artifact_id"], "prediction_artifact_id": pred_meta["artifact_id"]})
@@ -221,8 +227,13 @@ def _run_references(config_path: Path, output: Path) -> dict[str, object]:
     reference_models = [model for model in config.models if model in {"linear", "locf", "bilstm", "bilnn", "hybrid"}]
     if not reference_models:
         return {"status": "skipped"}
+    data_config = (
+        {"datasets": [dict(item) for item in config.datasets]}
+        if config.datasets
+        else {"data_root": config.data_root, "dataset_name": config.dataset_name}
+    )
     v2_config = {
-        "data_root": config.data_root, "dataset_name": config.dataset_name,
+        **data_config, "split_ratios": list(config.split_ratios),
         "output_root": str(output / "reference"),
         "selection_split": "validation", "seeds": list(config.seeds), "split_seed": config.split_seed,
         "seq_len": config.seq_len, "batch_size": config.batch_size, "epochs": config.epochs,

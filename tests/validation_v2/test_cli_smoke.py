@@ -805,8 +805,8 @@ def test_server_runbook_pins_the_offline_linux_shard_plan_contract():
     assert ".venv-server" in runbook
     assert "shard-plan" in runbook
     assert "--shard-count 8" in runbook
-    assert "total_groups" in runbook and "175" in runbook
-    assert "total_cells" in runbook and "4095" in runbook
+    assert "total_groups" in runbook and "25" in runbook
+    assert "total_cells" in runbook and "585" in runbook
     assert "shard_count" in runbook and "8" in runbook
     assert "test_linux_rename_noreplace_survives_real_directory_race" in runbook
     assert "1 passed" in runbook and "skipped" in runbook
@@ -911,8 +911,8 @@ def test_shard_plan_writes_formal_server_plan_as_one_canonical_json_line(
     }
     assert plan["device"] == "cuda"
     assert plan["shard_count"] == 8
-    assert plan["total_groups"] == 175
-    assert plan["total_cells"] == 4095
+    assert plan["total_groups"] == 25
+    assert plan["total_cells"] == 585
     assert len(plan["plan_sha256"]) == 64
 
 
@@ -1154,7 +1154,7 @@ def test_server_matrix_dry_run_is_byte_stable_and_complete():
     assert all(item["value_requested_fraction"] == 0.3 for item in irregular)
 
 
-def test_server_config_declares_real_scenarios_and_bounded_execution_inputs():
+def test_server_config_declares_joint_datasets_and_bounded_execution_inputs():
     config = yaml.safe_load(
         (REPO_ROOT / "configs" / "validation_v2" / "server_full.yaml").read_text(
             encoding="utf-8"
@@ -1168,15 +1168,11 @@ def test_server_config_declares_real_scenarios_and_bounded_execution_inputs():
 
     assert config["require_clean_git"] is True
     assert smoke_config["require_clean_git"] is False
-    assert config["protocols"] == [
-        "strict_file",
-        "scenario_holdout:handbag",
-        "scenario_holdout:handheld",
-        "scenario_holdout:running",
-        "scenario_holdout:slow_walking",
-        "scenario_holdout:trolley",
-        "scenario_holdout:user-2",
+    assert config["protocols"] == ["strict_file"]
+    assert [item["name"] for item in config["datasets"]] == [
+        "oxiod", "euroc_mav", "idol"
     ]
+    assert config["split_ratios"] == [0.8, 0.1, 0.1]
     assert config["irregular_cases"] == [
         {
             "method": "interval_jitter",

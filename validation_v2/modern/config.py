@@ -11,7 +11,6 @@ MODERN_MODELS = ("brits", "saits", "csdi", "sssd")
 ALL_MODELS = REFERENCE_MODELS + MODERN_MODELS
 
 _REQUIRED_KEYS = {
-    "data_root",
     "output_root",
     "protocol",
     "seeds",
@@ -31,13 +30,13 @@ _REQUIRED_KEYS = {
     "max_eval_samples",
     "trajectory_enabled",
 }
-_OPTIONAL_KEYS = {"dataset_name"}
+_OPTIONAL_KEYS = {"data_root", "dataset_name", "datasets", "split_ratios"}
 _KEYS = _REQUIRED_KEYS | _OPTIONAL_KEYS
 
 
 @dataclass(frozen=True)
 class ModernConfig:
-    data_root: str
+    data_root: str | None
     output_root: str
     protocol: str
     seeds: tuple[int, ...]
@@ -57,6 +56,8 @@ class ModernConfig:
     max_eval_samples: int | None
     trajectory_enabled: bool
     dataset_name: str = "oxiod"
+    datasets: tuple[dict[str, str], ...] = ()
+    split_ratios: tuple[float, float, float] = (0.7, 0.15, 0.15)
     irregular_case_specs: tuple[dict[str, object], ...] = ()
 
 
@@ -76,7 +77,7 @@ def load_modern_config(path: Path | str) -> ModernConfig:
 
     max_eval_samples = raw["max_eval_samples"]
     config = ModernConfig(
-        data_root=str(raw["data_root"]),
+        data_root=(None if raw.get("data_root") is None else str(raw["data_root"])),
         output_root=str(raw["output_root"]),
         protocol=str(raw["protocol"]),
         seeds=tuple(int(seed) for seed in raw["seeds"]),
@@ -98,11 +99,28 @@ def load_modern_config(path: Path | str) -> ModernConfig:
         ),
         trajectory_enabled=bool(raw["trajectory_enabled"]),
         dataset_name=str(raw.get("dataset_name", "oxiod")),
+        datasets=tuple(dict(item) for item in raw.get("datasets", ())),
+        split_ratios=tuple(float(value) for value in raw.get("split_ratios", (0.7, 0.15, 0.15))),
         irregular_case_specs=tuple(dict(item) for item in raw["irregular_cases"]),
     )
 
     if config.protocol != "strict_file" or config.seq_len != 30:
         raise ValueError("modern stage A requires strict_file and seq_len 30")
+    if (config.data_root is None) == (not config.datasets):
+        raise ValueError("configure exactly one of data_root or datasets")
+    if config.datasets:
+        if raw.get("dataset_name") is not None:
+            raise ValueError("datasets cannot be combined with dataset_name")
+        if any(set(item) != {"name", "data_root"} for item in config.datasets):
+            raise ValueError("each dataset requires exactly name and data_root")
+        if len({item["name"] for item in config.datasets}) != len(config.datasets):
+            raise ValueError("dataset names must be unique")
+    if (
+        len(config.split_ratios) != 3
+        or any(value <= 0.0 for value in config.split_ratios)
+        or abs(sum(config.split_ratios) - 1.0) > 1e-9
+    ):
+        raise ValueError("split_ratios must be positive and sum to one")
     if not config.seeds or not config.models or not config.rates or not config.topologies:
         raise ValueError("seeds, models, rates, and topologies must not be empty")
     if any(model not in ALL_MODELS for model in config.models):

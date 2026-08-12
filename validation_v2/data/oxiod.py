@@ -252,6 +252,7 @@ def load_recording(imu_path: Path, vicon_path: Path) -> Recording:
 
     metadata = MappingProxyType(
         {
+            "dataset": "oxiod",
             "imu_path": str(imu_path),
             "vicon_path": str(vicon_path),
             "imu_time_unit": "s",

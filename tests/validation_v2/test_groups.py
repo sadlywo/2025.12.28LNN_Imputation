@@ -34,18 +34,18 @@ def test_server_matrix_enumerates_expected_training_groups():
     combinations = enumerate_matrix(config)
     groups = enumerate_training_groups(config)
 
-    assert len(combinations) == 4095
+    assert len(combinations) == 585
     assert isinstance(groups, tuple)
-    assert len(groups) == 175
-    assert [group.group_index for group in groups] == list(range(175))
+    assert len(groups) == 25
+    assert [group.group_index for group in groups] == list(range(25))
     assert Counter(group.training_family for group in groups) == {
-        "linear": 35,
-        "locf": 35,
-        "bilstm": 35,
-        "bilnn": 35,
-        "hybrid_shared": 35,
+        "linear": 5,
+        "locf": 5,
+        "bilstm": 5,
+        "bilnn": 5,
+        "hybrid_shared": 5,
     }
-    assert sum(len(group.conditions) for group in groups) == 4095
+    assert sum(len(group.conditions) for group in groups) == 585
 
 
 def test_group_ids_are_stable_content_hashes_and_groups_are_frozen():

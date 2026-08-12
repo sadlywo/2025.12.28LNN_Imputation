@@ -1,4 +1,11 @@
-data_root: Oxford Dataset
+datasets:
+  - name: oxiod
+    data_root: Oxford Dataset
+  - name: euroc_mav
+    data_root: datasets/processed/euroc_mav
+  - name: idol
+    data_root: datasets/raw/idol/archives
+split_ratios: [0.8, 0.1, 0.1]
 output_root: results/validation_v2/server_full
 selection_split: validation
 seeds: [2026, 2027, 2028, 2029, 2030]
@@ -20,12 +27,6 @@ models:
   - fixed_gate_1
 protocols:
   - strict_file
-  - scenario_holdout:handbag
-  - scenario_holdout:handheld
-  - scenario_holdout:running
-  - scenario_holdout:slow_walking
-  - scenario_holdout:trolley
-  - scenario_holdout:user-2
 rates: [0.1, 0.2, 0.3, 0.4]
 topologies: [point, block, channel]
 irregular_cases:

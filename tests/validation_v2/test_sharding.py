@@ -1194,8 +1194,8 @@ def test_server_plan_has_expected_counts_and_round_robin_assignment():
         "platform",
     }
     assert plan["shard_count"] == 8
-    assert plan["total_groups"] == 175
-    assert plan["total_cells"] == 4095
+    assert plan["total_groups"] == 25
+    assert plan["total_cells"] == 585
     assert len(plan["shards"]) == 8
     for shard_index, shard in enumerate(plan["shards"]):
         expected = list(range(shard_index, len(groups), 8))

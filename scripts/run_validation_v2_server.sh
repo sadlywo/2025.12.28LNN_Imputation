@@ -360,10 +360,10 @@ import json
 import sys
 
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-if len(lines) != 4096:
-    raise SystemExit("matrix dry-run must contain 4096 JSONL records: {}".format(len(lines)))
-if json.loads(lines[0]).get("combination_count") != 4095:
-    raise SystemExit("matrix dry-run must report 4095 combinations")
+if len(lines) != 586:
+    raise SystemExit("matrix dry-run must contain 586 JSONL records: {}".format(len(lines)))
+if json.loads(lines[0]).get("combination_count") != 585:
+    raise SystemExit("matrix dry-run must report 585 combinations")
 PY
 
   "$PYTHON_BIN" -m validation_v2.cli shard-plan \
@@ -376,7 +376,7 @@ import sys
 plan = json.load(open(sys.argv[1], encoding="utf-8"))
 if plan.get("schema_version") != 2:
     raise SystemExit("unexpected shard plan schema")
-if plan.get("total_groups") != 175 or plan.get("total_cells") != 4095:
+if plan.get("total_groups") != 25 or plan.get("total_cells") != 585:
     raise SystemExit("unexpected formal shard plan totals")
 if plan.get("shard_count") != 8 or plan.get("dirty_state_digest") != "":
     raise SystemExit("shard plan is not a clean formal eight-shard plan")
@@ -384,7 +384,7 @@ try:
     group_counts = [len(shard["group_ids"]) for shard in plan["shards"]]
 except (KeyError, TypeError):
     raise SystemExit("shard plan has invalid shard group identifiers")
-if group_counts != [22, 22, 22, 22, 22, 22, 22, 21]:
+if group_counts != [4, 3, 3, 3, 3, 3, 3, 3]:
     raise SystemExit("unexpected formal shard distribution")
 PY
 }

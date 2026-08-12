@@ -19,8 +19,8 @@ def test_cli_plan_emits_reference_and_modern_tasks(tmp_path: Path):
     assert '"hybrid"' in text and '"brits"' in text and '"sssd"' in text
 
 
-def test_formal_plan_has_45_training_tasks_and_13_conditions(tmp_path: Path):
+def test_formal_plan_has_35_initial_tasks_and_13_conditions(tmp_path: Path):
     assert main(["plan", "--config", "configs/validation_v2/modern_stage_a.yaml", "--output", str(tmp_path)]) == 0
     plan = json.loads((tmp_path / "campaign-plan.json").read_text(encoding="utf-8"))
-    assert len(plan["tasks"]) == 45
+    assert len(plan["tasks"]) == 35
     assert len(plan["conditions"]) == 13

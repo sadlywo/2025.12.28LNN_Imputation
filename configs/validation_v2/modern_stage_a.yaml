@@ -1,4 +1,11 @@
-data_root: Oxford Dataset
+datasets:
+  - name: oxiod
+    data_root: Oxford Dataset
+  - name: euroc_mav
+    data_root: datasets/processed/euroc_mav
+  - name: idol
+    data_root: datasets/raw/idol/archives
+split_ratios: [0.8, 0.1, 0.1]
 output_root: results/validation_v2/modern_stage_a
 protocol: strict_file
 seeds: [2026, 2027, 2028, 2029, 2030]
@@ -8,7 +15,7 @@ batch_size: 32
 epochs: 100
 patience: 20
 device: cuda
-models: [linear, locf, bilstm, bilnn, hybrid, brits, saits, csdi, sssd]
+models: [linear, locf, bilstm, bilnn, hybrid, brits, saits]
 rates: [0.1, 0.2, 0.3, 0.4]
 topologies: [point, block, channel]
 irregular_cases:

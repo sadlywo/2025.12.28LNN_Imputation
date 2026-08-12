@@ -129,7 +129,7 @@ def export_modern_dataset(
     for split in ("train", "validation"):
         windows = prepare_external_windows(
             prepared.recordings_by_split[split],
-            prepared.scaler,
+            prepared.scalers,
             seq_len=config.seq_len,
             maximum_windows=config.max_train_windows,
             rate=0.3,
@@ -190,7 +190,7 @@ def export_modern_dataset(
         for recording in prepared.recordings_by_split["test"]:
             target, mask, dt, time_s = prepare_external_sequence(
                 recording,
-                prepared.scaler,
+                prepared.scalers,
                 maximum=config.max_eval_samples,
                 rate=float(condition["requested_fraction"]),
                 seed=seed,
@@ -212,6 +212,7 @@ def export_modern_dataset(
                     "seed": seed,
                     "split": "test",
                     "recording_id": recording.id,
+                    "dataset": recording.metadata["dataset"],
                     "condition": condition,
                     "split_hash": prepared.split_hash,
                     "scaler_hash": prepared.scaler_hash,

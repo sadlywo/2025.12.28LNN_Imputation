@@ -110,8 +110,8 @@ def select_candidate(
     return selected
 
 
-def _plan_hash() -> str:
-    plan = {model: list(candidates(model)) for model in MODERN_MODELS}
+def _plan_hash(models: Sequence[str] = MODERN_MODELS) -> str:
+    plan = {model: list(candidates(model)) for model in models}
     return hashlib.sha256(canonical_json(plan).encode("utf-8")).hexdigest()
 
 
@@ -119,10 +119,11 @@ def write_selection_lock(
     path: Path,
     results: Mapping[str, Sequence[Mapping[str, object]]],
 ) -> dict[str, object]:
-    if set(results) != set(MODERN_MODELS):
-        raise ValueError("tuning results must contain exactly four modern models")
+    selected_models = tuple(model for model in MODERN_MODELS if model in results)
+    if not selected_models or set(results) != set(selected_models):
+        raise ValueError("tuning results must contain supported modern models")
     normalized_results = {
-        model: [dict(row) for row in results[model]] for model in MODERN_MODELS
+        model: [dict(row) for row in results[model]] for model in selected_models
     }
     dataset_ids = {
         row.get("tuning_dataset_artifact_id")
@@ -133,14 +134,14 @@ def write_selection_lock(
         raise ValueError("all tuning rows must share one tuning dataset artifact ID")
     payload: dict[str, object] = {
         "schema_version": 1,
-        "plan_hash": _plan_hash(),
+        "plan_hash": _plan_hash(selected_models),
         "tuning_dataset_artifact_id": next(iter(dataset_ids)),
         "seed": 2026,
         "sampling_count": 5,
         "results": normalized_results,
         "selected": {
             model: select_candidate(normalized_results[model])
-            for model in MODERN_MODELS
+            for model in selected_models
         },
     }
     lock = {

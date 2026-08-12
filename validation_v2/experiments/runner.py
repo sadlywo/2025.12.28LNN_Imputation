@@ -89,11 +89,21 @@ class ExternalDataPreparation:
 
     manifest_rows: tuple[dict[str, str], ...]
     recordings_by_split: dict[str, tuple[Recording, ...]]
-    scaler: RobustTrainScaler
+    scalers: dict[str, RobustTrainScaler]
     split_content: bytes
     split_hash: str
     scaler_content: bytes
     scaler_hash: str
+
+    @property
+    def scaler(self) -> RobustTrainScaler:
+        """Keep the legacy single-dataset API while rejecting ambiguous use."""
+
+        if len(self.scalers) != 1:
+            raise ValueError(
+                "joint data has one train-only scaler per dataset; use scalers"
+            )
+        return next(iter(self.scalers.values()))
 
 
 class _BaselineCheckpoint(nn.Module):
@@ -291,8 +301,49 @@ def discover_dataset_pairs(
     ]
 
 
+def _split_ratios(config: Mapping[str, Any]) -> tuple[float, float, float]:
+    raw = config.get("split_ratios", (0.7, 0.15, 0.15))
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)) or len(raw) != 3:
+        raise ValueError("split_ratios must contain train, validation, and test")
+    ratios = tuple(float(value) for value in raw)
+    if any(value <= 0.0 for value in ratios) or not np.isclose(sum(ratios), 1.0):
+        raise ValueError("split_ratios must be positive and sum to one")
+    return ratios  # type: ignore[return-value]
+
+
+def _dataset_sources(
+    config: Mapping[str, Any], repository_root: Path
+) -> tuple[tuple[str, Path], ...]:
+    configured = config.get("datasets")
+    if configured is None:
+        if config.get("data_root") is None:
+            raise ValueError("configure either data_root or datasets")
+        root = Path(str(config["data_root"]))
+        if not root.is_absolute():
+            root = repository_root / root
+        return ((str(config.get("dataset_name", "oxiod")), root.resolve()),)
+    if config.get("data_root") is not None or config.get("dataset_name") is not None:
+        raise ValueError("datasets cannot be combined with data_root or dataset_name")
+    if not isinstance(configured, Sequence) or isinstance(configured, (str, bytes)):
+        raise ValueError("datasets must be a non-empty list")
+    sources: list[tuple[str, Path]] = []
+    for item in configured:
+        if not isinstance(item, Mapping) or set(item) != {"name", "data_root"}:
+            raise ValueError("each dataset requires exactly name and data_root")
+        name = str(item["name"])
+        get_dataset_adapter(name)
+        root = Path(str(item["data_root"]))
+        if not root.is_absolute():
+            root = repository_root / root
+        sources.append((name, root.resolve()))
+    if not sources or len({name for name, _ in sources}) != len(sources):
+        raise ValueError("datasets must be non-empty and have unique names")
+    return tuple(sources)
+
+
 def resolve_protocol_records(
-    pairs: Sequence[Mapping[str, str]], protocol: str, *, seed: int
+    pairs: Sequence[Mapping[str, str]], protocol: str, *, seed: int,
+    split_ratios: tuple[float, float, float] = (0.7, 0.15, 0.15),
 ) -> list[dict[str, str]]:
     """Assign every discovered file to one deterministic recording-level split."""
 
@@ -315,15 +366,16 @@ def resolve_protocol_records(
         rng = np.random.default_rng(_record_seed(seed, f"split:{scenario}"))
         order = rng.permutation(len(group)).tolist()
         if held_out:
-            validation_count = max(1, int(round(0.15 * len(group))))
+            validation_fraction = split_ratios[1] / sum(split_ratios[:2])
+            validation_count = max(1, int(round(validation_fraction * len(group))))
             validation_indices = set(order[:validation_count])
             for index, item in enumerate(group):
                 split_by_id[item["recording_id"]] = (
                     "validation" if index in validation_indices else "train"
                 )
         else:
-            validation_count = max(1, int(round(0.15 * len(group))))
-            test_count = max(1, int(round(0.15 * len(group))))
+            validation_count = max(1, int(round(split_ratios[1] * len(group))))
+            test_count = max(1, int(round(split_ratios[2] * len(group))))
             if validation_count + test_count >= len(group):
                 validation_count = test_count = 1
             validation_indices = set(order[:validation_count])
@@ -350,7 +402,8 @@ def resolve_protocol_records(
 def resolve_configured_records(
     config: Mapping[str, Any],
     *,
-    data_root: Path,
+    data_root: Path | None = None,
+    repository_root: Path | None = None,
     protocol: str,
     training_seed: int,
 ) -> list[dict[str, Any]]:
@@ -359,18 +412,47 @@ def resolve_configured_records(
     del training_seed
     configured = config.get("recordings")
     if configured is not None:
+        if config.get("datasets") is not None:
+            raise ValueError("joint datasets use adapter discovery, not recordings")
         if not isinstance(configured, list):
             raise ValueError("recordings must be a list when supplied")
-        return [dict(item) for item in configured]
+        dataset_name = str(config.get("dataset_name", "oxiod"))
+        if data_root is not None:
+            source_root = data_root.resolve()
+        else:
+            source_root = _dataset_sources(
+                config, Path(repository_root or Path.cwd()).resolve()
+            )[0][1]
+        return [
+            {
+                "dataset": dataset_name,
+                "data_root": str(source_root),
+                **dict(item),
+            }
+            for item in configured
+        ]
     split_seed = config.get("split_seed", 2026)
     if isinstance(split_seed, bool) or not isinstance(split_seed, int):
         raise ValueError("split_seed must be an integer")
-    dataset_name = str(config.get("dataset_name", "oxiod"))
-    return resolve_protocol_records(
-        discover_dataset_pairs(data_root, dataset_name=dataset_name),
-        protocol,
-        seed=split_seed,
-    )
+    base = Path(repository_root or Path.cwd()).resolve()
+    if config.get("datasets") is None and data_root is not None:
+        sources = ((str(config.get("dataset_name", "oxiod")), data_root.resolve()),)
+    else:
+        sources = _dataset_sources(config, base)
+    ratios = _split_ratios(config)
+    resolved: list[dict[str, Any]] = []
+    for dataset_name, source_root in sources:
+        dataset_records = resolve_protocol_records(
+            discover_dataset_pairs(source_root, dataset_name=dataset_name),
+            protocol,
+            seed=split_seed,
+            split_ratios=ratios,
+        )
+        resolved.extend(
+            {"dataset": dataset_name, "data_root": str(source_root), **item}
+            for item in dataset_records
+        )
+    return resolved
 
 
 def resolved_execution_config(
@@ -492,9 +574,29 @@ def _dt(time_s: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(values)
 
 
+def _recording_dataset(recording: Recording) -> str:
+    dataset = recording.metadata.get("dataset")
+    if not isinstance(dataset, str) or not dataset:
+        raise ValueError(f"recording {recording.id} does not declare its dataset")
+    return dataset
+
+
+def _scaler_for(
+    recording: Recording,
+    scalers: RobustTrainScaler | Mapping[str, RobustTrainScaler],
+) -> RobustTrainScaler:
+    if isinstance(scalers, RobustTrainScaler):
+        return scalers
+    dataset = _recording_dataset(recording)
+    try:
+        return scalers[dataset]
+    except KeyError as error:
+        raise ValueError(f"no train-only scaler for dataset {dataset}") from error
+
+
 def _prepared_sequence(
     recording: Recording,
-    scaler: RobustTrainScaler,
+    scalers: RobustTrainScaler | Mapping[str, RobustTrainScaler],
     *,
     maximum: int | None,
     rate: float,
@@ -509,6 +611,7 @@ def _prepared_sequence(
     np.ndarray,
     Any | None,
 ]:
+    scaler = _scaler_for(recording, scalers)
     time_s, physical = _slice_recording(recording, maximum)
     irregular_result = None
     if requested_irregularity is not None:
@@ -542,7 +645,7 @@ def _prepared_sequence(
 
 def _windows(
     recordings: Sequence[Recording],
-    scaler: RobustTrainScaler,
+    scalers: RobustTrainScaler | Mapping[str, RobustTrainScaler],
     *,
     seq_len: int,
     maximum_windows: int,
@@ -550,8 +653,21 @@ def _windows(
     seed: int,
     topology: str = "point",
 ) -> list[_Window]:
-    prepared: list[_Window] = []
-    per_record = max(1, (maximum_windows + len(recordings) - 1) // len(recordings))
+    if not recordings:
+        raise ValueError("recordings must not be empty")
+    indexed = list(enumerate(recordings))
+    if isinstance(scalers, Mapping) and len(scalers) > 1:
+        grouped: dict[str, list[tuple[int, Recording]]] = {}
+        for pair in indexed:
+            grouped.setdefault(_recording_dataset(pair[1]), []).append(pair)
+        names = sorted(grouped)
+        quotient, remainder = divmod(maximum_windows, len(names))
+        groups = [
+            (grouped[name], quotient + (index < remainder))
+            for index, name in enumerate(names)
+        ]
+    else:
+        groups = [(indexed, maximum_windows)]
     generators = {
         "point": point_missing,
         "block": contiguous_block,
@@ -559,81 +675,92 @@ def _windows(
     }
     if topology not in generators:
         raise ValueError(f"unsupported missingness topology: {topology}")
-    for recording_index, recording in enumerate(recordings):
-        if len(prepared) >= maximum_windows:
-            break
-        maximum = seq_len * per_record
-        time_s, physical = _slice_recording(recording, maximum)
-        synchronized = synchronize_vicon_to_imu(
-            recording.vicon_time_s,
-            recording.vicon_position_m,
-            recording.vicon_quaternion_xyzw,
-            time_s,
-            frame_metadata={
-                "quaternion_order": "xyzw",
-                "quaternion_frame": "body_to_reference",
-                "euler_order": "xyz",
-            },
-        )
-        vicon_position = torch.from_numpy(
-            synchronized.position_m.astype(np.float32, copy=False)
-        )
-        vicon_rotation = torch.from_numpy(
-            synchronized.rotation_body_to_world.astype(np.float32, copy=False)
-        )
-        vicon_velocity = torch.from_numpy(
-            synchronized.velocity_world_mps.astype(np.float32, copy=False)
-        )
-        normalization_center = torch.from_numpy(
-            scaler.center_.astype(np.float32, copy=True)
-        )
-        normalization_scale = torch.from_numpy(
-            scaler.scale_.astype(np.float32, copy=True)
-        )
-        target = torch.from_numpy(scaler.transform(physical).astype(np.float32))
-        dt = _dt(time_s)
-        batches = make_windows(
-            target,
-            torch.ones_like(target),
-            dt,
-            torch.arange(len(time_s)),
-            torch.from_numpy(time_s),
-            recording.id,
-            window_size=seq_len,
-        )
-        for window_number, batch in enumerate(batches):
-            window_seed = _record_seed(
-                seed,
-                ":".join(
-                    (
-                        "training-window",
-                        recording.id,
-                        str(int(batch.index[0].item())),
-                        str(window_number),
-                        topology,
-                        format(float(rate), ".17g"),
-                    )
-                ),
+    prepared_groups: list[list[_Window]] = []
+    for group, budget in groups:
+        prepared: list[_Window] = []
+        per_record = max(1, (budget + len(group) - 1) // len(group))
+        for recording_index, recording in group:
+            if len(prepared) >= budget:
+                break
+            scaler = _scaler_for(recording, scalers)
+            maximum = seq_len * per_record
+            time_s, physical = _slice_recording(recording, maximum)
+            synchronized = synchronize_vicon_to_imu(
+                recording.vicon_time_s,
+                recording.vicon_position_m,
+                recording.vicon_quaternion_xyzw,
+                time_s,
+                frame_metadata={
+                    "quaternion_order": "xyzw",
+                    "quaternion_frame": "body_to_reference",
+                    "euler_order": "xyz",
+                },
             )
-            mask = generators[topology](batch.target, rate, window_seed).mask
-            feature = build_features(batch.target, mask, batch.dt)
-            positions = batch.index.to(dtype=torch.long)
-            prepared.append(
-                _Window(
-                    feature.values,
-                    batch.target,
-                    mask,
-                    batch.dt,
-                    recording_index=recording_index,
-                    start=int(batch.index[0].item()),
-                    vicon_position_m=vicon_position[positions],
-                    vicon_rotation_body_to_world=vicon_rotation[positions],
-                    vicon_velocity_mps=vicon_velocity[positions],
-                    normalization_center=normalization_center,
-                    normalization_scale=normalization_scale,
+            vicon_position = torch.from_numpy(
+                synchronized.position_m.astype(np.float32, copy=False)
+            )
+            vicon_rotation = torch.from_numpy(
+                synchronized.rotation_body_to_world.astype(np.float32, copy=False)
+            )
+            vicon_velocity = torch.from_numpy(
+                synchronized.velocity_world_mps.astype(np.float32, copy=False)
+            )
+            normalization_center = torch.from_numpy(
+                scaler.center_.astype(np.float32, copy=True)
+            )
+            normalization_scale = torch.from_numpy(
+                scaler.scale_.astype(np.float32, copy=True)
+            )
+            target = torch.from_numpy(scaler.transform(physical).astype(np.float32))
+            dt = _dt(time_s)
+            batches = make_windows(
+                target,
+                torch.ones_like(target),
+                dt,
+                torch.arange(len(time_s)),
+                torch.from_numpy(time_s),
+                recording.id,
+                window_size=seq_len,
+            )
+            for window_number, batch in enumerate(batches):
+                window_seed = _record_seed(
+                    seed,
+                    ":".join(
+                        (
+                            "training-window",
+                            recording.id,
+                            str(int(batch.index[0].item())),
+                            str(window_number),
+                            topology,
+                            format(float(rate), ".17g"),
+                        )
+                    ),
                 )
-            )
-    result = prepared[:maximum_windows]
+                mask = generators[topology](batch.target, rate, window_seed).mask
+                feature = build_features(batch.target, mask, batch.dt)
+                positions = batch.index.to(dtype=torch.long)
+                prepared.append(
+                    _Window(
+                        feature.values,
+                        batch.target,
+                        mask,
+                        batch.dt,
+                        recording_index=recording_index,
+                        start=int(batch.index[0].item()),
+                        vicon_position_m=vicon_position[positions],
+                        vicon_rotation_body_to_world=vicon_rotation[positions],
+                        vicon_velocity_mps=vicon_velocity[positions],
+                        normalization_center=normalization_center,
+                        normalization_scale=normalization_scale,
+                    )
+                )
+        prepared_groups.append(prepared[:budget])
+    result = [
+        group[index]
+        for index in range(max(map(len, prepared_groups), default=0))
+        for group in prepared_groups
+        if index < len(group)
+    ][:maximum_windows]
     if not result:
         raise ValueError("bounded recording slices produced no complete windows")
     return result
@@ -862,21 +989,24 @@ def _epoch_callbacks(
 
 
 def _manifest_rows(
-    records: Sequence[Mapping[str, Any]], data_root: Path, *, dataset_name: str = "oxiod"
+    records: Sequence[Mapping[str, Any]], data_root: Path | None = None, *,
+    dataset_name: str = "oxiod",
 ) -> tuple[list[dict[str, str]], dict[str, Recording]]:
     rows: list[dict[str, str]] = []
     loaded: dict[str, Recording] = {}
     seen_sources: set[Path] = set()
     seen_ids: set[str] = set()
-    adapter = get_dataset_adapter(dataset_name)
     for item in records:
         if not isinstance(item, Mapping):
             raise ValueError("recordings entries must be mappings")
         split = str(item.get("split"))
         if split not in {"train", "validation", "test"}:
             raise ValueError("recording split must be train, validation, or test")
-        imu_path = (data_root / str(item.get("imu"))).resolve()
-        vicon_path = (data_root / str(item.get("vicon"))).resolve()
+        item_dataset = str(item.get("dataset", dataset_name))
+        adapter = get_dataset_adapter(item_dataset)
+        item_root = Path(str(item.get("data_root", data_root or ".")))
+        imu_path = (item_root / str(item.get("imu"))).resolve()
+        vicon_path = (item_root / str(item.get("vicon"))).resolve()
         if imu_path in seen_sources or vicon_path in seen_sources:
             raise ValueError("train/validation/test source files must be disjoint")
         seen_sources.update((imu_path, vicon_path))
@@ -887,6 +1017,7 @@ def _manifest_rows(
         loaded[recording.id] = recording
         rows.append(
             {
+                "dataset": item_dataset,
                 "recording_id": recording.id,
                 "scenario": str(item.get("scenario")),
                 "imu_path": str(imu_path),
@@ -899,12 +1030,25 @@ def _manifest_rows(
     counts = {name: sum(row["split"] == name for row in rows) for name in ("train", "validation", "test")}
     if any(counts[name] == 0 for name in counts):
         raise ValueError("execution requires non-empty train, validation, and test splits")
+    for item_dataset in sorted({row["dataset"] for row in rows}):
+        dataset_counts = {
+            name: sum(
+                row["dataset"] == item_dataset and row["split"] == name
+                for row in rows
+            )
+            for name in ("train", "validation", "test")
+        }
+        if any(value == 0 for value in dataset_counts.values()):
+            raise ValueError(
+                f"dataset {item_dataset} requires non-empty train, validation, and test splits"
+            )
     return rows, loaded
 
 
 def _split_content(rows: Sequence[Mapping[str, str]]) -> bytes:
     columns = (
-        "recording_id", "scenario", "imu_path", "vicon_path", "split", "imu_sha256", "vicon_sha256"
+        "dataset", "recording_id", "scenario", "imu_path", "vicon_path", "split",
+        "imu_sha256", "vicon_sha256"
     )
     from io import StringIO
 
@@ -931,6 +1075,50 @@ def _scaler_content(
     return (canonical_json(value) + "\n").encode("utf-8")
 
 
+def _scalers_content(
+    scalers: Mapping[str, RobustTrainScaler], *, split_hash: str
+) -> bytes:
+    if len(scalers) == 1:
+        name, scaler = next(iter(scalers.items()))
+        return _scaler_content(
+            scaler,
+            split_hash=split_hash,
+            channel_order=get_dataset_adapter(name).channel_names,
+        )
+    value = {
+        "schema_version": 2,
+        "normalization_scope": "per_dataset_train_only",
+        "joint_sampling": "dataset_balanced",
+        "split_hash": split_hash,
+        "datasets": {
+            name: {
+                "center": scaler.center_.tolist(),
+                "scale": scaler.scale_.tolist(),
+                "channel_order": list(get_dataset_adapter(name).channel_names),
+                "training_ids": list(scaler.training_ids),
+                "acceleration_unit": get_dataset_adapter(name).semantics.acceleration_unit,
+                "acceleration_mode": get_dataset_adapter(name).semantics.acceleration_mode,
+            }
+            for name, scaler in sorted(scalers.items())
+        },
+    }
+    return (canonical_json(value) + "\n").encode("utf-8")
+
+
+def _fit_scalers(
+    recordings: Sequence[Recording],
+) -> dict[str, RobustTrainScaler]:
+    grouped: dict[str, list[Recording]] = {}
+    for recording in recordings:
+        grouped.setdefault(_recording_dataset(recording), []).append(recording)
+    return {
+        name: RobustTrainScaler.fit(
+            group, allowed_ids={recording.id for recording in group}
+        )
+        for name, group in sorted(grouped.items())
+    }
+
+
 def prepare_external_data(
     config: Mapping[str, Any],
     *,
@@ -940,20 +1128,13 @@ def prepare_external_data(
 ) -> ExternalDataPreparation:
     """Resolve splits and fit the train-only scaler once for external workers."""
 
-    data_root = Path(str(config.get("data_root")))
-    if not data_root.is_absolute():
-        data_root = repository_root / data_root
     records_config = resolve_configured_records(
         config,
-        data_root=data_root,
+        repository_root=repository_root,
         protocol=protocol,
         training_seed=seed,
     )
-    manifest_rows, loaded = _manifest_rows(
-        records_config,
-        data_root,
-        dataset_name=str(config.get("dataset_name", "oxiod")),
-    )
+    manifest_rows, loaded = _manifest_rows(records_config)
     split_content = _split_content(manifest_rows)
     split_hash = _sha256_bytes(split_content)
     recordings_by_split = {
@@ -965,20 +1146,12 @@ def prepare_external_data(
         for split in ("train", "validation", "test")
     }
     train_recordings = recordings_by_split["train"]
-    scaler = RobustTrainScaler.fit(
-        train_recordings,
-        allowed_ids={recording.id for recording in train_recordings},
-    )
-    adapter = get_dataset_adapter(str(config.get("dataset_name", "oxiod")))
-    scaler_content = _scaler_content(
-        scaler,
-        split_hash=split_hash,
-        channel_order=adapter.channel_names,
-    )
+    scalers = _fit_scalers(train_recordings)
+    scaler_content = _scalers_content(scalers, split_hash=split_hash)
     return ExternalDataPreparation(
         manifest_rows=tuple(dict(row) for row in manifest_rows),
         recordings_by_split=recordings_by_split,
-        scaler=scaler,
+        scalers=scalers,
         split_content=split_content,
         split_hash=split_hash,
         scaler_content=scaler_content,
@@ -988,7 +1161,7 @@ def prepare_external_data(
 
 def prepare_external_windows(
     recordings: Sequence[Recording],
-    scaler: RobustTrainScaler,
+    scaler: RobustTrainScaler | Mapping[str, RobustTrainScaler],
     *,
     seq_len: int,
     maximum_windows: int,
@@ -1020,7 +1193,7 @@ def prepare_external_windows(
 
 def prepare_external_sequence(
     recording: Recording,
-    scaler: RobustTrainScaler,
+    scaler: RobustTrainScaler | Mapping[str, RobustTrainScaler],
     *,
     maximum: int | None,
     rate: float,
@@ -1090,20 +1263,21 @@ def _evaluate_record(
     model: nn.Module,
     device: torch.device,
     scenarios: Mapping[str, str],
-    scaler: RobustTrainScaler,
+    scalers: Mapping[str, RobustTrainScaler],
     maximum: int | None,
     conditions: Sequence[Mapping[str, Any]],
     seed: int,
     trajectory_enabled: bool,
     physics_diagnostics_enabled: bool,
-    acceleration_unit: str,
-    acceleration_mode: str,
     seq_len: int,
     batch_size: int,
 ):
     metadata = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
 
     def callback(recording: Recording, checkpoint: Path) -> list[dict[str, Any]]:
+        dataset = _recording_dataset(recording)
+        scaler = _scaler_for(recording, scalers)
+        semantics = get_dataset_adapter(dataset).semantics
         state = torch.load(checkpoint, map_location=device, weights_only=True)
         model.load_state_dict(state)
         model.to(device).eval()
@@ -1179,8 +1353,8 @@ def _evaluate_record(
                         complete_physical=scaler.inverse_transform(target_values),
                         time_s=time_s,
                         recording=recording,
-                        acceleration_unit=acceleration_unit,
-                        acceleration_mode=acceleration_mode,
+                        acceleration_unit=semantics.acceleration_unit,
+                        acceleration_mode=semantics.acceleration_mode,
                     )
                 )
             if physics_diagnostics_enabled:
@@ -1207,8 +1381,8 @@ def _evaluate_record(
                         synchronized.position_m,
                         synchronized.rotation_body_to_world,
                         synchronized.velocity_world_mps,
-                        acceleration_unit=acceleration_unit,
-                        acceleration_mode=acceleration_mode,
+                        acceleration_unit=semantics.acceleration_unit,
+                        acceleration_mode=semantics.acceleration_mode,
                     )
                 )
             base = {
@@ -1269,7 +1443,7 @@ def run_smoke(
     output_root: Path | None = None,
     requested_device: str | None = None,
 ) -> Mapping[str, Any]:
-    """Run the bounded 2/1/1 OxIOD smoke protocol on real CSV pairs."""
+    """Run a bounded real-data protocol for one or more dataset adapters."""
 
     seed_values = _require(config, "seeds", list)
     if len(seed_values) != 1 or isinstance(seed_values[0], bool):
@@ -1346,34 +1520,38 @@ def run_smoke(
     physics_diagnostics_enabled = objective == "physics_informed" or bool(
         config.get("physics_diagnostics_enabled", False)
     )
-    dataset_name = str(config.get("dataset_name", "oxiod"))
-    adapter = get_dataset_adapter(dataset_name)
-    acceleration_unit = (
-        str(physics_mapping.get("acceleration_unit", adapter.semantics.acceleration_unit))
-        if isinstance(physics_mapping, Mapping)
-        else adapter.semantics.acceleration_unit
-    )
-    acceleration_mode = (
-        str(physics_mapping.get("acceleration_mode", adapter.semantics.acceleration_mode))
-        if isinstance(physics_mapping, Mapping)
-        else adapter.semantics.acceleration_mode
-    )
-    if acceleration_unit != adapter.semantics.acceleration_unit:
+    sources = _dataset_sources(config, repository_root)
+    if len(sources) > 1 and objective == "physics_informed":
         raise ValueError(
-            f"physics acceleration_unit={acceleration_unit!r} conflicts with "
-            f"{dataset_name} adapter semantics {adapter.semantics.acceleration_unit!r}"
+            "joint physics-informed batches are disabled because dataset acceleration "
+            "semantics differ; use reconstruction_only for the joint benchmark"
         )
-    if acceleration_mode != adapter.semantics.acceleration_mode:
-        raise ValueError(
-            f"physics acceleration_mode={acceleration_mode!r} conflicts with "
-            f"{dataset_name} adapter semantics {adapter.semantics.acceleration_mode!r}"
+    if len(sources) == 1:
+        dataset_name = sources[0][0]
+        adapter = get_dataset_adapter(dataset_name)
+        acceleration_unit = (
+            str(physics_mapping.get("acceleration_unit", adapter.semantics.acceleration_unit))
+            if isinstance(physics_mapping, Mapping)
+            else adapter.semantics.acceleration_unit
         )
+        acceleration_mode = (
+            str(physics_mapping.get("acceleration_mode", adapter.semantics.acceleration_mode))
+            if isinstance(physics_mapping, Mapping)
+            else adapter.semantics.acceleration_mode
+        )
+        if acceleration_unit != adapter.semantics.acceleration_unit:
+            raise ValueError(
+                f"physics acceleration_unit={acceleration_unit!r} conflicts with "
+                f"{dataset_name} adapter semantics {adapter.semantics.acceleration_unit!r}"
+            )
+        if acceleration_mode != adapter.semantics.acceleration_mode:
+            raise ValueError(
+                f"physics acceleration_mode={acceleration_mode!r} conflicts with "
+                f"{dataset_name} adapter semantics {adapter.semantics.acceleration_mode!r}"
+            )
     device = _device(requested_device or str(config.get("device", "auto")))
     _set_seed(seed)
 
-    data_root = Path(str(config.get("data_root")))
-    if not data_root.is_absolute():
-        data_root = repository_root / data_root
     destination = output_root or Path(str(config.get("output_root")))
     if not destination.is_absolute():
         destination = repository_root / destination
@@ -1381,15 +1559,11 @@ def run_smoke(
 
     records_config = resolve_configured_records(
         config,
-        data_root=data_root,
+        repository_root=repository_root,
         protocol=str(training_condition.get("protocol", "strict_file")),
         training_seed=seed,
     )
-    manifest_rows, loaded = _manifest_rows(
-        records_config,
-        data_root,
-        dataset_name=dataset_name,
-    )
+    manifest_rows, loaded = _manifest_rows(records_config)
     split_content = _split_content(manifest_rows)
     split_hash = _sha256_bytes(split_content)
     grouped_execution = bool(config.get("_skip_descriptive_summary", False))
@@ -1401,14 +1575,8 @@ def run_smoke(
         split: [loaded[row["recording_id"]] for row in manifest_rows if row["split"] == split]
         for split in ("train", "validation", "test")
     }
-    scaler = RobustTrainScaler.fit(
-        by_split["train"], allowed_ids={recording.id for recording in by_split["train"]}
-    )
-    scaler_content = _scaler_content(
-        scaler,
-        split_hash=split_hash,
-        channel_order=adapter.channel_names,
-    )
+    scalers = _fit_scalers(by_split["train"])
+    scaler_content = _scalers_content(scalers, split_hash=split_hash)
     scaler_hash = _sha256_bytes(scaler_content)
     scaler_name = f"scaler-{scaler_hash}.json" if grouped_execution else "scaler.json"
     _write_stable(destination / scaler_name, scaler_content)
@@ -1418,7 +1586,7 @@ def run_smoke(
     execution_validation_windows = 1 if baseline_group else max_train_windows
     train_batches = _batches(
         _windows(
-            by_split["train"], scaler, seq_len=seq_len,
+            by_split["train"], scalers, seq_len=seq_len,
             maximum_windows=execution_train_windows, rate=rate, seed=seed,
             topology=topology,
         ),
@@ -1426,7 +1594,7 @@ def run_smoke(
     )
     validation_batches = _batches(
         _windows(
-            by_split["validation"], scaler, seq_len=seq_len,
+            by_split["validation"], scalers, seq_len=seq_len,
             maximum_windows=execution_validation_windows, rate=rate, seed=seed,
             topology=topology,
         ),
@@ -1504,14 +1672,12 @@ def run_smoke(
                     model=model,
                     device=device,
                     scenarios=scenarios,
-                    scaler=scaler,
+                    scalers=scalers,
                     maximum=max_eval_samples,
                     conditions=conditions,
                     seed=seed,
                     trajectory_enabled=trajectory_enabled,
                     physics_diagnostics_enabled=physics_diagnostics_enabled,
-                    acceleration_unit=acceleration_unit,
-                    acceleration_mode=acceleration_mode,
                     seq_len=seq_len,
                     batch_size=batch_size,
                 ),

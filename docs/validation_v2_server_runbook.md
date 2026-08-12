@@ -8,12 +8,10 @@ diagnostic only.
 
 ## Current supported execution path
 
-> **Migration gate:** `configs/validation_v2/server_full.yaml` still describes
-> the legacy OxIOD-only formal matrix. The runner and two-GPU operations below
-> are validated, but that configuration does not yet satisfy the requested
-> joint OxIOD + EuRoC MAV + IDOL training protocol. Do not spend a paid formal
-> campaign on it as the final three-dataset paper result; use it only for
-> runner diagnostics until the joint campaign configuration is delivered.
+`configs/validation_v2/server_full.yaml` is the joint OxIOD + EuRoC MAV + IDOL
+formal protocol. Each dataset is split independently at recording-file level,
+normalized with its own training-only robust scaler, and sampled with an equal
+dataset budget before the normalized windows enter one shared model.
 
 The supported runtime is Linux with generic CPython 3.10–3.12 and one or more
 RTX 4090/4090D/5090 GPUs. Every supported Python minor uses the same locked
@@ -25,7 +23,7 @@ The generic runner is the executable scientific contract. Given an exact
 40-character commit, it checks the clean worktree, performs the complete
 preflight, executes a full immutable eight-shard campaign, and controls the
 maximum concurrent worker count. It records provenance, runs the Linux atomic
-race and complete pytest suite, creates and verifies the 175-group/4,095-cell
+race and complete pytest suite, creates and verifies the 25-group/585-cell
 plan, trains every assigned shard, then merges, validates, and summarizes all
 five seeds. The MatPool launcher below is the current operator wrapper around
 that generic runner; it does not replace or weaken any of these checks.
@@ -376,8 +374,8 @@ cp "$PREFLIGHT_DIR/linux-renameat2.txt" "$PREFLIGHT_DIR/pytest-full.txt" "$AUDIT
 
 ## 4. Freeze and verify the eight-shard plan
 
-The dry-run has one header plus 4,095 cells. The plan must say 175 training
-groups, 4,095 cells, and 8 shards.
+The dry-run has one header plus 585 cells. The plan must say 25 training
+groups, 585 cells, and 8 shards.
 
 ```bash
 python -m validation_v2.cli matrix --config "$CONFIG" --dry-run \
@@ -388,8 +386,8 @@ import sys
 
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
 header = json.loads(lines[0])
-assert header["combination_count"] == 4095, header
-assert len(lines) == 4096, len(lines)
+assert header["combination_count"] == 585, header
+assert len(lines) == 586, len(lines)
 PY
 python -m validation_v2.cli shard-plan \
   --config "$CONFIG" --shard-count 8 --output "$PLAN" --device cuda \
@@ -399,8 +397,8 @@ import json
 import sys
 
 plan = json.load(open(sys.argv[1], encoding="utf-8"))
-assert plan["total_groups"] == 175, plan
-assert plan["total_cells"] == 4095, plan
+assert plan["total_groups"] == 25, plan
+assert plan["total_cells"] == 585, plan
 assert plan["shard_count"] == 8, plan
 assert len(plan["shards"]) == 8, plan
 PY

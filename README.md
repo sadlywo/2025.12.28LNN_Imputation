@@ -12,10 +12,9 @@
 - 安全约束：坐标系、单位和 IMU/Vicon 外参未验证前，只允许 `lambda_physics=0`；非零物理权重会自动拒绝运行。
 - 数据集：Oxford Inertial Odometry Dataset、EuRoC MAV Vicon Room 1/2 和 IDOL Building 1/2/3；三者通过统一 adapter contract 接入。
 
-> **迁移状态：** 三个数据集的 adapter 和独立 smoke 链路已经可用，但
-> `configs/validation_v2/server_full.yaml` 仍保留旧的 OxIOD 单数据集正式矩阵。
-> 在三数据集联合采样、联合划分和主表配置完成之前，不要把该配置的结果作为最终
-> 三数据集论文实验。
+> **当前状态：** 三数据集联合训练协议已经接入 `server_full.yaml`：每个数据集独立进行
+> 记录级 80/10/10 划分、使用自身训练集拟合 robust scaler，并以等额窗口预算进入同一
+> 共享模型。完整约定见 [docs/three_dataset_joint_training_protocol.md](docs/three_dataset_joint_training_protocol.md)。
 
 完整设计和改动范围见 [PHYSICS_LOSS_REFACTOR_REPORT.md](PHYSICS_LOSS_REFACTOR_REPORT.md)，
 新数据集字段约定见 [docs/physics_loss_refactor_dataset_contract.md](docs/physics_loss_refactor_dataset_contract.md)。

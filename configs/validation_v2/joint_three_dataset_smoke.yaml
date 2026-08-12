@@ -1,0 +1,32 @@
+datasets:
+  - name: oxiod
+    data_root: Oxford Dataset
+  - name: euroc_mav
+    data_root: datasets/processed/euroc_mav
+  - name: idol
+    data_root: datasets/raw/idol/archives
+split_ratios: [0.8, 0.1, 0.1]
+output_root: results/validation_v2/joint_three_dataset_smoke
+selection_split: validation
+seeds: [2026]
+split_seed: 2026
+seq_len: 30
+batch_size: 3
+epochs: 1
+device: auto
+require_clean_git: false
+models: [bilnn]
+protocols: [strict_file]
+rates: [0.3]
+topologies: [point]
+irregular_cases: []
+objective: reconstruction_only
+kinematic_ablation:
+  name: kinematic_ablation
+  enabled: false
+trajectory_enabled: false
+irregular_sampling_is_value_missing: false
+max_train_windows: 6
+max_eval_samples: 60
+hidden_size: 16
+learning_rate: 0.001

@@ -26,7 +26,17 @@ from validation_v2.experiments.provenance import (
 from validation_v2.experiments.train import select_best_checkpoint
 
 
+LEGACY_SPLIT_COLUMNS = (
+    "recording_id",
+    "scenario",
+    "imu_path",
+    "vicon_path",
+    "split",
+    "imu_sha256",
+    "vicon_sha256",
+)
 SPLIT_COLUMNS = (
+    "dataset",
     "recording_id",
     "scenario",
     "imu_path",
@@ -188,11 +198,12 @@ def _asset_path(root: Path, prefix: str, digest: str, suffix: str, smoke: bool) 
     return path
 
 
-def _validate_split(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+def _validate_split(path: Path) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     try:
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
-            if tuple(reader.fieldnames or ()) != SPLIT_COLUMNS:
+            columns = tuple(reader.fieldnames or ())
+            if columns not in {SPLIT_COLUMNS, LEGACY_SPLIT_COLUMNS}:
                 raise ValueError("split manifest must use the fixed source-traceability schema")
             rows = list(reader)
     except (OSError, UnicodeDecodeError, csv.Error) as error:
@@ -203,7 +214,9 @@ def _validate_split(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     source_paths: set[Path] = set()
     split_by_recording: dict[str, str] = {}
     scenario_by_recording: dict[str, str] = {}
+    dataset_by_recording: dict[str, str] = {}
     for row in rows:
+        dataset = str(row.get("dataset") or "oxiod").strip()
         recording_id = row["recording_id"].strip()
         if not recording_id or recording_id in recording_ids:
             raise ValueError("recording split assignments must be disjoint and uniquely identified")
@@ -216,6 +229,7 @@ def _validate_split(path: Path) -> tuple[dict[str, str], dict[str, str]]:
         if not scenario:
             raise ValueError("split manifest scenario values must be non-empty")
         scenario_by_recording[recording_id] = scenario
+        dataset_by_recording[recording_id] = dataset
         for path_field, hash_field in (("imu_path", "imu_sha256"), ("vicon_path", "vicon_sha256")):
             source = Path(row[path_field]).expanduser()
             if not source.is_absolute():
@@ -229,11 +243,44 @@ def _validate_split(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     present = set(split_by_recording.values())
     if present != {"train", "validation", "test"}:
         raise ValueError("split manifest requires non-empty train, validation, and test splits")
-    return split_by_recording, scenario_by_recording
+    return split_by_recording, scenario_by_recording, dataset_by_recording
 
 
 def _validate_scaler(path: Path, split_hash: str, split: Mapping[str, str]) -> None:
     scaler = _require_mapping(_strict_json(path), path.name)
+    if scaler.get("schema_version") == 2:
+        if set(scaler) != {
+            "schema_version", "normalization_scope", "joint_sampling",
+            "split_hash", "datasets",
+        } or scaler.get("split_hash") != split_hash:
+            raise ValueError("joint scaler schema or split_hash is inconsistent")
+        if scaler.get("normalization_scope") != "per_dataset_train_only":
+            raise ValueError("joint scaler must use per-dataset train-only normalization")
+        datasets = scaler.get("datasets")
+        if not isinstance(datasets, Mapping) or not datasets:
+            raise ValueError("joint scaler datasets must be a non-empty mapping")
+        training_ids: set[str] = set()
+        for dataset_scaler in datasets.values():
+            if not isinstance(dataset_scaler, Mapping):
+                raise ValueError("joint dataset scaler must be a mapping")
+            center = dataset_scaler.get("center")
+            scale = dataset_scaler.get("scale")
+            ids = dataset_scaler.get("training_ids")
+            if (
+                not isinstance(center, list) or len(center) != 6
+                or not isinstance(scale, list) or len(scale) != 6
+                or any(_finite_number(item, "scaler scale") <= 0 for item in scale)
+                or not isinstance(ids, list) or not ids
+            ):
+                raise ValueError("joint dataset scaler arrays or training_ids are invalid")
+            training_ids.update(str(item) for item in ids)
+        expected = {
+            recording_id for recording_id, split_name in split.items()
+            if split_name == "train"
+        }
+        if training_ids != expected:
+            raise ValueError("joint scaler training_ids must equal all train recordings")
+        return
     required = {"center", "scale", "channel_order", "training_ids", "split_hash"}
     if set(scaler) != required or scaler.get("split_hash") != split_hash:
         raise ValueError("scaler schema or split_hash is inconsistent")
@@ -445,7 +492,7 @@ def _validate_run(
     run_dir: Path,
     *,
     smoke: bool,
-    split_cache: dict[str, tuple[dict[str, str], dict[str, str]]],
+    split_cache: dict[str, tuple[dict[str, str], dict[str, str], dict[str, str]]],
     scaler_cache: set[tuple[str, str]],
 ) -> dict[str, Any]:
     manifest = _require_mapping(_strict_json(run_dir / "run.json"), "run.json")
@@ -500,7 +547,7 @@ def _validate_run(
         split_cache[split_hash] = _validate_split(
             _asset_path(root, "split_manifest", split_hash, ".csv", smoke)
         )
-    split, scenario_by_recording = split_cache[split_hash]
+    split, scenario_by_recording, dataset_by_recording = split_cache[split_hash]
     scaler_key = (scaler_hash, split_hash)
     if scaler_key not in scaler_cache:
         _validate_scaler(
@@ -606,7 +653,7 @@ def validate_artifacts(
         raise ValueError(f"artifact root is not a directory: {root}")
     marker, smoke = _validate_marker(root, allow_smoke)
     directories = _run_directories(root, marker)
-    split_cache: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
+    split_cache: dict[str, tuple[dict[str, str], dict[str, str], dict[str, str]]] = {}
     scaler_cache: set[tuple[str, str]] = set()
     validated = [
         _validate_run(

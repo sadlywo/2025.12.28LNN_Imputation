@@ -22,7 +22,11 @@ def test_stage_a_is_strict_file_five_seed_thirteen_condition_campaign():
     assert config.topologies == ("point", "block", "channel")
     assert config.irregular_cases == 1
     assert config.n_sampling_times == 50
-    assert config.models == REFERENCE_MODELS + MODERN_MODELS
+    assert config.models == REFERENCE_MODELS + MODERN_MODELS[:2]
+    assert tuple(item["name"] for item in config.datasets) == (
+        "oxiod", "euroc_mav", "idol"
+    )
+    assert config.split_ratios == (0.8, 0.1, 0.1)
 
 
 def test_smoke_is_bounded_to_one_condition_and_two_samples():
