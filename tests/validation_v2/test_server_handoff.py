@@ -13,7 +13,11 @@ import yaml
 from validation_v2.experiments.evaluate import METRIC_COLUMNS
 from validation_v2.experiments.matrix import enumerate_matrix
 from validation_v2.experiments.provenance import canonical_json, collect_provenance
-from validation_v2.experiments.validate_artifacts import main, validate_artifacts
+from validation_v2.experiments.validate_artifacts import (
+    _validate_split,
+    main,
+    validate_artifacts,
+)
 
 
 TRAJECTORY_METRICS = (
@@ -510,6 +514,79 @@ def test_assets_are_content_addressed_and_source_hashes_are_verified(tmp_path: P
 
     with pytest.raises(ValueError, match="imu_sha256"):
         validate_artifacts(root)
+
+
+def test_split_validator_allows_one_recording_to_share_a_synchronized_source(tmp_path: Path) -> None:
+    source = tmp_path / "joint.feather"
+    source.write_bytes(b"synchronized imu and pose")
+    digest = _sha256(source)
+    manifest = tmp_path / "split.csv"
+    rows = []
+    for recording_id, split in (
+        ("joint-record", "train"),
+        ("validation-record", "validation"),
+        ("test-record", "test"),
+    ):
+        imu = source if recording_id == "joint-record" else tmp_path / f"{recording_id}-imu"
+        vicon = source if recording_id == "joint-record" else tmp_path / f"{recording_id}-vicon"
+        if recording_id != "joint-record":
+            imu.write_bytes(f"imu-{recording_id}".encode())
+            vicon.write_bytes(f"vicon-{recording_id}".encode())
+        rows.append({
+            "recording_id": recording_id,
+            "scenario": "scenario",
+            "imu_path": str(imu),
+            "vicon_path": str(vicon),
+            "split": split,
+            "imu_sha256": digest if imu == source else _sha256(imu),
+            "vicon_sha256": digest if vicon == source else _sha256(vicon),
+        })
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    split, _, _ = _validate_split(manifest)
+
+    assert split == {
+        "joint-record": "train",
+        "validation-record": "validation",
+        "test-record": "test",
+    }
+
+
+def test_split_validator_rejects_a_source_shared_by_different_recordings(tmp_path: Path) -> None:
+    source = tmp_path / "shared.csv"
+    source.write_text("shared\n", encoding="utf-8")
+    digest = _sha256(source)
+    manifest = tmp_path / "split.csv"
+    rows = [
+        {
+            "recording_id": recording_id,
+            "scenario": "scenario",
+            "imu_path": str(source),
+            "vicon_path": str(tmp_path / f"{recording_id}-vicon.csv"),
+            "split": split,
+            "imu_sha256": digest,
+            "vicon_sha256": "",
+        }
+        for recording_id, split in (
+            ("train-record", "train"),
+            ("validation-record", "validation"),
+            ("test-record", "test"),
+        )
+    ]
+    for row in rows:
+        vicon = Path(row["vicon_path"])
+        vicon.write_text(row["recording_id"], encoding="utf-8")
+        row["vicon_sha256"] = _sha256(vicon)
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with pytest.raises(ValueError, match="disjoint across recordings and splits"):
+        _validate_split(manifest)
 
 
 def test_scaler_must_be_train_only_finite_and_positive(tmp_path: Path) -> None:

@@ -994,7 +994,7 @@ def _manifest_rows(
 ) -> tuple[list[dict[str, str]], dict[str, Recording]]:
     rows: list[dict[str, str]] = []
     loaded: dict[str, Recording] = {}
-    seen_sources: set[Path] = set()
+    source_owner: dict[Path, str] = {}
     seen_ids: set[str] = set()
     for item in records:
         if not isinstance(item, Mapping):
@@ -1007,12 +1007,15 @@ def _manifest_rows(
         item_root = Path(str(item.get("data_root", data_root or ".")))
         imu_path = (item_root / str(item.get("imu"))).resolve()
         vicon_path = (item_root / str(item.get("vicon"))).resolve()
-        if imu_path in seen_sources or vicon_path in seen_sources:
-            raise ValueError("train/validation/test source files must be disjoint")
-        seen_sources.update((imu_path, vicon_path))
         recording = adapter.load(imu_path, vicon_path)
         if recording.id in seen_ids:
             raise ValueError("train/validation/test recording ids must be disjoint")
+        for source in {imu_path, vicon_path}:
+            owner = source_owner.setdefault(source, recording.id)
+            if owner != recording.id:
+                raise ValueError(
+                    "train/validation/test source files must be disjoint across recordings"
+                )
         seen_ids.add(recording.id)
         loaded[recording.id] = recording
         rows.append(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Iterable
@@ -45,9 +46,19 @@ def summarize_runs(
         csv_path = manifest_path.parent / "per_record_metrics.csv"
         if not csv_path.is_file():
             raise ValueError(f"missing per_record_metrics.csv for run_id {manifest['run_id']}")
-        frame = pd.read_csv(csv_path)
+        # Keep artifact ingestion in the standard library.  Some cloud images
+        # have a binary-incompatible pandas/numpy stack which can terminate the
+        # process even when pandas' Python CSV engine performs type inference.
+        # The statistical stage below still converts and validates every
+        # numeric field explicitly.
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            columns = list(reader.fieldnames or ())
+            frame = pd.DataFrame(reader, columns=columns)
         if list(frame.columns) != list(PER_RECORD_COLUMNS):
             raise ValueError("per-record metrics must use schema: " + ",".join(PER_RECORD_COLUMNS))
+        for column in ("seed", "requested_fraction", "realized_fraction", "value"):
+            frame[column] = [float(value) for value in frame[column]]
         if not (frame["run_id"].astype(str) == str(manifest["run_id"])).all():
             raise ValueError("CSV run_id does not match run manifest")
         if not (pd.to_numeric(frame["seed"], errors="raise") == int(manifest["seed"])).all():

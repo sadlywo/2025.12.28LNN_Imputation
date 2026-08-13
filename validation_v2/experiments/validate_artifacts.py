@@ -211,7 +211,7 @@ def _validate_split(path: Path) -> tuple[dict[str, str], dict[str, str], dict[st
     if not rows:
         raise ValueError("split manifest must not be empty")
     recording_ids: set[str] = set()
-    source_paths: set[Path] = set()
+    source_owner: dict[Path, tuple[str, str, str]] = {}
     split_by_recording: dict[str, str] = {}
     scenario_by_recording: dict[str, str] = {}
     dataset_by_recording: dict[str, str] = {}
@@ -230,14 +230,17 @@ def _validate_split(path: Path) -> tuple[dict[str, str], dict[str, str], dict[st
             raise ValueError("split manifest scenario values must be non-empty")
         scenario_by_recording[recording_id] = scenario
         dataset_by_recording[recording_id] = dataset
+        recording_identity = (dataset, recording_id, split)
         for path_field, hash_field in (("imu_path", "imu_sha256"), ("vicon_path", "vicon_sha256")):
             source = Path(row[path_field]).expanduser()
             if not source.is_absolute():
                 source = path.parent / source
             source = source.resolve(strict=False)
-            if source in source_paths:
-                raise ValueError("recording source files must be disjoint across splits")
-            source_paths.add(source)
+            owner = source_owner.setdefault(source, recording_identity)
+            if owner != recording_identity:
+                raise ValueError(
+                    "recording source files must be disjoint across recordings and splits"
+                )
             if not source.is_file() or _sha256(source) != row[hash_field]:
                 raise ValueError(f"split manifest {hash_field} does not match source file")
     present = set(split_by_recording.values())

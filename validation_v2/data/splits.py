@@ -105,12 +105,23 @@ def _prepare_index(
             for value in frame[column]
         ]
 
-    all_paths = pd.concat([frame["imu_path"], frame["vicon_path"]], ignore_index=True)
-    if all_paths.duplicated().any():
-        duplicates = sorted(
-            str(path) for path in all_paths[all_paths.duplicated(False)].unique()
+    source_owner: dict[Path, str] = {}
+    duplicate_sources: set[str] = set()
+    for row in frame.itertuples(index=False):
+        recording_id = str(row.recording_id)
+        # A synchronized container may legitimately provide both IMU and pose
+        # for one recording (for example, one IDOL Feather trajectory).  The
+        # leakage boundary is the recording, not the role a file plays inside
+        # that recording.
+        for path in {row.imu_path, row.vicon_path}:
+            owner = source_owner.setdefault(path, recording_id)
+            if owner != recording_id:
+                duplicate_sources.add(str(path))
+    if duplicate_sources:
+        raise ValueError(
+            "a source file is associated with multiple recordings: "
+            f"{sorted(duplicate_sources)}"
         )
-        raise ValueError(f"a source file is associated with multiple recordings: {duplicates}")
     return frame.sort_values("recording_id", kind="stable").reset_index(drop=True)
 
 

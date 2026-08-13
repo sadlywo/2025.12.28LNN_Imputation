@@ -147,6 +147,17 @@ def test_split_accepts_a_sequence_of_mapping_records_and_rejects_missing_files(t
         stratified_file_split(records)
 
 
+def test_split_accepts_one_synchronized_source_for_both_roles(tmp_path):
+    index = _recording_index(tmp_path, {"scenario": 3})
+    index.loc[0, "vicon_path"] = index.loc[0, "imu_path"]
+
+    manifest = stratified_file_split(index)
+
+    row = manifest.loc[manifest["recording_id"] == index.loc[0, "recording_id"]].iloc[0]
+    assert row["imu_path"] == row["vicon_path"]
+    assert row["imu_sha256"] == row["vicon_sha256"]
+
+
 def test_scaler_rejects_any_recording_outside_the_allowed_training_ids():
     train = _recording("train", np.zeros((2, 6)))
     test = _recording("test", np.ones((2, 6)))
